@@ -1,4 +1,6 @@
-from django.contrib.auth.models import User
+from django.contrib.auth import login, logout
+from django.contrib.auth.decorators import login_required
+from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.shortcuts import get_object_or_404, redirect, render
 
 from .models import Answer, CheckQuestion, Meeting, Question, Team
@@ -10,33 +12,39 @@ FAKE_CHECK_QUESTIONS = [
 ]
 
 
-def current_user():
-    # 프로토타입: 이미 로그인한 사용자가 있다고 가정하고 가장 먼저 만든 사용자를 사용한다.
-    return User.objects.order_by("pk").first() or User.objects.create_user("demo")
-
-
 def index(request):
-    user = current_user()
-    return render(request, "meetalign/index.html", {"user": user, "teams": user.teams.all()})
+    teams = request.user.teams.all() if request.user.is_authenticated else []
+    return render(request, "meetalign/index.html", {"teams": teams})
 
 
-# 로그인 관련 페이지는 화면만 남기고 실제 인증은 하지 않는다.
 def signup(request):
     if request.method == "POST":
-        return redirect("index")
-    return render(request, "meetalign/signup.html")
+        form = UserCreationForm(request.POST)
+        if form.is_valid():
+            login(request, form.save())
+            return redirect("index")
+    else:
+        form = UserCreationForm()
+    return render(request, "meetalign/signup.html", {"form": form})
 
 
 def login_view(request):
     if request.method == "POST":
-        return redirect("index")
-    return render(request, "meetalign/login.html")
+        form = AuthenticationForm(request, data=request.POST)
+        if form.is_valid():
+            login(request, form.get_user())
+            return redirect(request.GET.get("next") or "index")
+    else:
+        form = AuthenticationForm(request)
+    return render(request, "meetalign/login.html", {"form": form})
 
 
 def logout_view(request):
+    logout(request)
     return redirect("index")
 
 
+@login_required
 def team_join(request):
     error = ""
     if request.method == "POST":
@@ -45,31 +53,33 @@ def team_join(request):
             if not name or Team.objects.filter(name=name).exists():
                 error = "팀 이름이 비었거나 이미 존재합니다."
             else:
-                Team.objects.create(name=name).members.add(current_user())
+                Team.objects.create(name=name).members.add(request.user)
                 return redirect("index")
         else:
             team = Team.objects.filter(name=name).first()
             if team is None:
                 error = "해당 이름의 팀이 없습니다."
             else:
-                team.members.add(current_user())
+                team.members.add(request.user)
                 return redirect("meeting_list", team_id=team.id)
     return render(request, "meetalign/team_join.html", {"error": error})
 
 
 def _team(request, team_id):
-    return get_object_or_404(Team, pk=team_id, members=current_user())
+    return get_object_or_404(Team, pk=team_id, members=request.user)
 
 
 def _meeting(request, meeting_id):
-    return get_object_or_404(Meeting, pk=meeting_id, team__members=current_user())
+    return get_object_or_404(Meeting, pk=meeting_id, team__members=request.user)
 
 
+@login_required
 def meeting_list(request, team_id):
     team = _team(request, team_id)
     return render(request, "meetalign/meeting_list.html", {"team": team, "meetings": team.meetings.all()})
 
 
+@login_required
 def meeting_create(request, team_id):
     team = _team(request, team_id)
     if request.method == "POST" and request.POST.get("title", "").strip():
@@ -78,6 +88,7 @@ def meeting_create(request, team_id):
     return render(request, "meetalign/meeting_create.html", {"team": team})
 
 
+@login_required
 def meeting_detail(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     if request.method == "POST":
@@ -90,10 +101,12 @@ def meeting_detail(request, meeting_id):
     return render(request, "meetalign/meeting_detail.html", {"meeting": meeting})
 
 
+@login_required
 def meeting_result(request, meeting_id):
     return render(request, "meetalign/meeting_result.html", {"meeting": _meeting(request, meeting_id)})
 
 
+@login_required
 def chat(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     mode = request.POST.get("mode") or request.GET.get("mode", "llm")
@@ -107,15 +120,18 @@ def chat(request, meeting_id):
     return render(request, "meetalign/chat.html", {"meeting": meeting, "mode": mode, "reply": reply})
 
 
+@login_required
 def inbox(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     return render(request, "meetalign/inbox.html", {"meeting": meeting, "questions": meeting.questions.all()})
 
 
+@login_required
 def summary(request, meeting_id):
     return render(request, "meetalign/summary.html", {"meeting": _meeting(request, meeting_id)})
 
 
+@login_required
 def answers(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     if request.method == "POST":
@@ -126,12 +142,13 @@ def answers(request, meeting_id):
     return render(request, "meetalign/answers.html", {"meeting": meeting, "questions": meeting.questions.all()})
 
 
+@login_required
 def understanding(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     if not meeting.check_questions.exists():
         for order, text in enumerate(FAKE_CHECK_QUESTIONS):
             CheckQuestion.objects.create(meeting=meeting, text=text, order=order)
-    user = current_user()
+    user = request.user
     questions = list(meeting.check_questions.all())
     if request.method == "POST":
         for question in questions:

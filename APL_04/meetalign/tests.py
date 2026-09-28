@@ -5,25 +5,56 @@ from django.urls import reverse
 from .models import Answer, CheckQuestion, Meeting, Question, Team
 
 
+class AuthTests(TestCase):
+    def test_signup_creates_user_and_logs_in(self):
+        r = self.client.post(reverse("signup"), {
+            "username": "newuser", "password1": "a-str0ng-pw", "password2": "a-str0ng-pw",
+        })
+        self.assertRedirects(r, reverse("index"))
+        self.assertTrue(User.objects.filter(username="newuser").exists())
+        self.assertIn("_auth_user_id", self.client.session)
+
+    def test_signup_rejects_mismatched_passwords(self):
+        r = self.client.post(reverse("signup"), {
+            "username": "newuser", "password1": "a-str0ng-pw", "password2": "different",
+        })
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(User.objects.filter(username="newuser").exists())
+
+    def test_login_with_correct_credentials_succeeds(self):
+        User.objects.create_user("a", password="pw12345!")
+        r = self.client.post(reverse("login"), {"username": "a", "password": "pw12345!"})
+        self.assertRedirects(r, reverse("index"))
+        self.assertIn("_auth_user_id", self.client.session)
+
+    def test_login_with_wrong_password_fails(self):
+        User.objects.create_user("a", password="pw12345!")
+        r = self.client.post(reverse("login"), {"username": "a", "password": "wrong"})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+    def test_logout_clears_session(self):
+        user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(user)
+        self.client.get(reverse("logout"))
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+    def test_protected_pages_redirect_to_login(self):
+        team = Team.objects.create(name="t")
+        r = self.client.get(reverse("meeting_list", args=[team.id]))
+        self.assertRedirects(r, "%s?next=%s" % (reverse("login"), reverse("meeting_list", args=[team.id])))
+
+
 class PrototypeFlowTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
         self.team = Team.objects.create(name="t")
         self.team.members.add(self.user)
         self.meeting = Meeting.objects.create(team=self.team, title="m")
 
     def test_index_public(self):
         self.assertEqual(self.client.get(reverse("index")).status_code, 200)
-
-    def test_login_pages_kept_but_do_nothing(self):
-        for name in ["signup", "login", "logout"]:
-            self.assertRedirects(self.client.post(reverse(name)), reverse("index"))
-        for name in ["signup", "login"]:
-            self.assertEqual(self.client.get(reverse(name)).status_code, 200)
-
-    def test_no_login_needed(self):
-        r = self.client.get(reverse("meeting_list", args=[self.team.id]))
-        self.assertEqual(r.status_code, 200)
 
     def test_team_create_and_join(self):
         self.client.post(reverse("team_join"), {"action": "create", "name": "new"})
@@ -35,10 +66,6 @@ class PrototypeFlowTests(TestCase):
     def test_non_member_forbidden(self):
         meeting = Meeting.objects.create(team=Team.objects.create(name="other"), title="x")
         self.assertEqual(self.client.get(reverse("meeting_detail", args=[meeting.id])).status_code, 404)
-
-    def test_demo_user_created_when_no_users(self):
-        User.objects.all().delete()
-        self.assertContains(self.client.get(reverse("index")), "demo")
 
     def test_meeting_create_and_all_screens(self):
         self.client.post(reverse("meeting_create", args=[self.team.id]), {"title": "x"})
