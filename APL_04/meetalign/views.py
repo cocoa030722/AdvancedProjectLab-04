@@ -1,7 +1,13 @@
 from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404, redirect, render
 
-from .models import Meeting, Question, Team
+from .models import Answer, CheckQuestion, Meeting, Question, Team
+
+# LLM이 실제로 문제를 내기 전까지 쓰는 고정 문항 (구현사항.txt: 실제 기능 구현 안 함)
+FAKE_CHECK_QUESTIONS = [
+    "이번 회의의 핵심 결정 사항은?",
+    "내가 맡은 다음 할 일은?",
+]
 
 
 def current_user():
@@ -121,4 +127,18 @@ def answers(request, meeting_id):
 
 
 def understanding(request, meeting_id):
-    return render(request, "meetalign/understanding.html", {"meeting": _meeting(request, meeting_id)})
+    meeting = _meeting(request, meeting_id)
+    if not meeting.check_questions.exists():
+        for order, text in enumerate(FAKE_CHECK_QUESTIONS):
+            CheckQuestion.objects.create(meeting=meeting, text=text, order=order)
+    user = current_user()
+    questions = list(meeting.check_questions.all())
+    if request.method == "POST":
+        for question in questions:
+            text = request.POST.get("q%d" % question.id, "").strip()
+            if text:
+                Answer.objects.update_or_create(question=question, user=user, defaults={"text": text})
+        return redirect("understanding", meeting_id=meeting.id)
+    my_answers = {a.question_id: a.text for a in Answer.objects.filter(question__meeting=meeting, user=user)}
+    rows = [(q, my_answers.get(q.id, "")) for q in questions]
+    return render(request, "meetalign/understanding.html", {"meeting": meeting, "rows": rows})
