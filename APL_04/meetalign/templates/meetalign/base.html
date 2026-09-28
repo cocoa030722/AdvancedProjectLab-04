@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><title>{% block title %}MeetAlign{% endblock %}</title></head>
+<body>
+<p><a href="{% url 'index' %}">[index]</a></p>
+<div style="border:1px solid #000">
+<b>설계 결정</b>
+<ul>{% block note %}{% endblock %}</ul>
+</div>
+<hr>
+{% block content %}{% endblock %}
+</body>
+</html>

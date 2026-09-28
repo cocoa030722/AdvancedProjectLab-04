@@ -1,0 +1,11 @@
+{% extends "meetalign/base.html" %}
+{% block note %}<li>팀원 누구나 익명 질문을 볼 수 있고, 답변은 3.5 화면에서 한다.</li>{% endblock %}
+{% block content %}
+<h1>{{ meeting.title }} 익명 질문함</h1>
+<p><a href="{% url 'meeting_detail' meeting.id %}">회의로 돌아가기</a></p>
+<ul>
+{% for q in questions %}<li>{{ q.text }}{% if q.answer %} → 답변: {{ q.answer }}{% endif %}</li>
+{% empty %}<li>질문이 없습니다.</li>{% endfor %}
+</ul>
+<p><a href="{% url 'answers' meeting.id %}">질문에 답변하기</a></p>
+{% endblock %}

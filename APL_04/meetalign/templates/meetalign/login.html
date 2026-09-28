@@ -1,0 +1,9 @@
+{% extends "meetalign/base.html" %}
+{% block note %}<li>프로토타입: 화면만 남기고 실제 인증은 하지 않는다. 제출하면 index로 이동한다.</li>{% endblock %}
+{% block content %}
+<h1>로그인</h1>
+<form method="post">{% csrf_token %}
+<p>아이디 <input name="username"></p>
+<p>비밀번호 <input name="password" type="password"></p>
+<button>로그인</button></form>
+{% endblock %}

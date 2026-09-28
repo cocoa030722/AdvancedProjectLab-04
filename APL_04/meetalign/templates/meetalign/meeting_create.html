@@ -1,0 +1,6 @@
+{% extends "meetalign/base.html" %}
+{% block note %}<li>회의는 제목만으로 생성한다.</li>{% endblock %}
+{% block content %}
+<h1>{{ team.name }} 회의 생성</h1>
+<form method="post">{% csrf_token %}<input name="title" placeholder="회의 제목"><button>생성</button></form>
+{% endblock %}

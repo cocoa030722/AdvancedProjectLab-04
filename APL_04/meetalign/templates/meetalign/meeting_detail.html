@@ -1,0 +1,20 @@
+{% extends "meetalign/base.html" %}
+{% block note %}
+<li>녹음 입력은 파일 선택 UI만 제공하며 서버에 저장/처리하지 않는다.</li>
+<li>제출 → 회의록 생성 화면, 종료 → 질문 답변 화면(3.5)으로 이동한다.</li>
+{% endblock %}
+{% block content %}
+<h1>{{ meeting.title }}</h1>
+<a href="{% url 'meeting_list' meeting.team_id %}">회의 목록으로 돌아가기</a>
+<form method="post" enctype="multipart/form-data">{% csrf_token %}
+<p>회의 녹음: <input type="file" name="recording" accept="audio/*"></p>
+<button name="action" value="submit">제출</button>
+<button name="action" value="end">종료</button>
+</form>
+<ul>
+<li><a href="{% url 'chat' meeting.id %}">대화창</a></li>
+<li><a href="{% url 'inbox' meeting.id %}">익명 질문함</a></li>
+<li><a href="{% url 'summary' meeting.id %}">회의 요약</a></li>
+<li><a href="{% url 'understanding' meeting.id %}">이해도 검증</a></li>
+</ul>
+{% endblock %}
