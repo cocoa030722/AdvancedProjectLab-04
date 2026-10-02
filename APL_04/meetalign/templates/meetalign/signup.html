@@ -1,9 +1,10 @@
 {% extends "meetalign/base.html" %}
-{% block note %}<li>프로토타입: 화면만 남기고 실제 가입은 하지 않는다. 제출하면 index로 이동한다.</li>{% endblock %}
+{% block note %}<li>Django 기본 인증(자체 로그인)으로 가입/로그인 상태를 실제로 유지한다.</li>{% endblock %}
 {% block content %}
 <h1>회원가입</h1>
+{% if form.errors %}<ul>{% for field in form %}{% for error in field.errors %}<li>{{ error }}</li>{% endfor %}{% endfor %}</ul>{% endif %}
 <form method="post">{% csrf_token %}
-<p>아이디 <input name="username"></p>
+<p>아이디 <input name="username" value="{{ form.username.value|default:'' }}"></p>
 <p>비밀번호 <input name="password1" type="password"></p>
 <p>비밀번호 확인 <input name="password2" type="password"></p>
 <button>가입</button></form>
