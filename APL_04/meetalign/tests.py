@@ -1,5 +1,8 @@
+import tempfile
+
 from django.contrib.auth.models import User
-from django.test import TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from .models import Answer, CheckQuestion, Meeting, Question, Team
@@ -84,6 +87,15 @@ class PrototypeFlowTests(TestCase):
                              reverse("answers", args=[self.meeting.id]))
         self.meeting.refresh_from_db()
         self.assertTrue(self.meeting.ended)
+
+    @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+    def test_recording_upload_is_saved(self):
+        url = reverse("meeting_detail", args=[self.meeting.id])
+        file = SimpleUploadedFile("test.mp3", b"fake audio bytes", content_type="audio/mpeg")
+        self.client.post(url, {"action": "submit", "recording": file})
+        self.meeting.refresh_from_db()
+        self.assertTrue(self.meeting.recording)
+        self.assertIn("test", self.meeting.recording.name)
 
     def test_anonymous_question_and_answer(self):
         self.client.post(reverse("chat", args=[self.meeting.id]), {"mode": "anon", "text": "why?"})

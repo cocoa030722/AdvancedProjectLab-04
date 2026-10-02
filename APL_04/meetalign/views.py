@@ -92,7 +92,11 @@ def meeting_create(request, team_id):
 def meeting_detail(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     if request.method == "POST":
-        # 녹음 파일은 저장/처리하지 않는다 (목업)
+        recording = request.FILES.get("recording")
+        if recording:
+            meeting.recording = recording
+            meeting.save()
+        # STT/LLM 처리는 아직 없음 (다음 작업 대상). 파일만 실제로 저장한다.
         if request.POST.get("action") == "end":
             meeting.ended = True
             meeting.save()
