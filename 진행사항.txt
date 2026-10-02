@@ -64,6 +64,12 @@ default_auto_field를 BigAutoField로 명시했다. 이게 없으면 Django 버�
   BigAutoField로 통일 (apps.py 수정에 맞춰 스키마도 맞춤)
 - 0004_meeting_recording.py: Meeting에 recording(FileField) 추가
 
+※ 주의: 새 마이그레이션 받으면(git pull 등) 서버 켜기 전에 꼭
+  `python manage.py migrate` 먼저 돌릴 것. 안 돌리면 기존 DB 파일
+  (db.sqlite3)에 새 필드가 없어서 "no such column" 에러가 난다.
+  (manage.py test는 매번 새 DB를 만들어서 이 문제가 안 생기지만,
+  실제로 서버 켜서 쓸 땐 기존 DB 파일을 그대로 쓰기 때문에 발생함)
+
 
 5. meetalign/templates/meetalign/
 ----------------------
@@ -105,8 +111,8 @@ PR 히스토리
 #2 → #3 실제 로그인 구현 (처음엔 중간 브랜치로 잘못 머지됐다가, #3로 main에
    다시 올려서 반영함)
 #4 모델 PK 타입 불일치 수정 (apps.py, 마이그레이션)
-(커밋됨, PR 전) 녹음파일 실제 저장 (models/views/settings/urls/템플릿) —
-   브랜치에 커밋만 해두고 PR은 나중에 올릴 예정
+#5 녹음파일 실제 저장 (models/views/settings/urls/템플릿) — 머지 전 반드시
+   `python manage.py migrate` 먼저 돌릴 것 (위 마이그레이션 섹션 주의 참고)
 
 
 아직 안 된 것 (다음 작업 후보, 우선순위 순)
