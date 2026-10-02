@@ -15,6 +15,8 @@ class Meeting(models.Model):
     title = models.CharField(max_length=200)
     created_at = models.DateTimeField(auto_now_add=True)
     ended = models.BooleanField(default=False)
+    # STT/LLM 처리는 아직 없음. 지금은 파일을 실제로 저장하는 것까지만 한다.
+    recording = models.FileField(upload_to="recordings/", blank=True, null=True)
 
     def __str__(self):
         return self.title
