@@ -1,11 +1,13 @@
 {% extends "meetalign/base.html" %}
-{% block note %}<li>개별 이해도 검증: 고정된 가짜 문항이며 채점/저장하지 않는다.</li>{% endblock %}
+{% block note %}<li>개별 이해도 검증: 질문은 지금은 고정 문항(추후 LLM이 생성)이지만, 답변은 사용자별로 저장되어 나중에 팀원 간 비교에 쓰인다.</li>{% endblock %}
 {% block content %}
 <h1>{{ meeting.title }} 이해도 검증</h1>
 <p><a href="{% url 'meeting_detail' meeting.id %}">회의로 돌아가기</a></p>
-<form>
-<p>1. 이번 회의의 핵심 결정 사항은? <input name="q1"></p>
-<p>2. 내가 맡은 다음 할 일은? <input name="q2"></p>
-<button type="button">제출 (동작 안 함)</button>
+<form method="post">{% csrf_token %}
+{% for q, ans in rows %}
+<p>{{ forloop.counter }}. {{ q.text }}<br>
+<input name="q{{ q.id }}" value="{{ ans }}"></p>
+{% endfor %}
+<button>답변 저장</button>
 </form>
 {% endblock %}

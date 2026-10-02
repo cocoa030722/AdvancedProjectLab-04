@@ -2,7 +2,7 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 from django.urls import reverse
 
-from .models import Meeting, Question, Team
+from .models import Answer, CheckQuestion, Meeting, Question, Team
 
 
 class PrototypeFlowTests(TestCase):
@@ -79,3 +79,32 @@ class PrototypeFlowTests(TestCase):
         for name in ["meeting_result", "chat", "inbox", "summary", "answers", "understanding"]:
             r = self.client.get(reverse(name, args=[self.meeting.id]))
             self.assertContains(r, back, msg_prefix=name)
+
+    def test_understanding_creates_fixed_questions_once(self):
+        self.client.get(reverse("understanding", args=[self.meeting.id]))
+        self.client.get(reverse("understanding", args=[self.meeting.id]))
+        self.assertEqual(CheckQuestion.objects.filter(meeting=self.meeting).count(), 2)
+
+    def test_understanding_saves_and_prefills_answer(self):
+        self.client.get(reverse("understanding", args=[self.meeting.id]))
+        q = CheckQuestion.objects.filter(meeting=self.meeting).first()
+        self.client.post(reverse("understanding", args=[self.meeting.id]), {"q%d" % q.id: "내 답변"})
+        self.assertEqual(Answer.objects.get(question=q, user=self.user).text, "내 답변")
+        r = self.client.get(reverse("understanding", args=[self.meeting.id]))
+        self.assertContains(r, "내 답변")
+
+    def test_understanding_resubmit_updates_not_duplicates(self):
+        self.client.get(reverse("understanding", args=[self.meeting.id]))
+        q = CheckQuestion.objects.filter(meeting=self.meeting).first()
+        self.client.post(reverse("understanding", args=[self.meeting.id]), {"q%d" % q.id: "첫 답변"})
+        self.client.post(reverse("understanding", args=[self.meeting.id]), {"q%d" % q.id: "수정된 답변"})
+        self.assertEqual(Answer.objects.filter(question=q, user=self.user).count(), 1)
+        self.assertEqual(Answer.objects.get(question=q, user=self.user).text, "수정된 답변")
+
+    def test_same_question_can_hold_different_users_answers(self):
+        # 핵심 검증: 같은 질문에 팀원마다 답이 따로 저장돼야 이해도 비교가 가능하다.
+        other = User.objects.create_user("b")
+        question = CheckQuestion.objects.create(meeting=self.meeting, text="Q")
+        Answer.objects.create(question=question, user=self.user, text="A의 이해")
+        Answer.objects.create(question=question, user=other, text="B의 이해")
+        self.assertEqual(question.answers.count(), 2)
