@@ -4,32 +4,82 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}MeetAlign{% endblock %}</title>
+{% block head %}{% endblock %}
 <style>
-  :root { --ink:#1f2937; --muted:#6b7280; --line:#e5e7eb; --brand:#2f5bea; --bg:#f7f8fb; --danger:#b42318; }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif; color:var(--ink); background:var(--bg); line-height:1.6; }
-  header.topbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 20px; background:#fff; border-bottom:1px solid var(--line); }
-  header.topbar .brand { font-weight:700; color:var(--ink); text-decoration:none; font-size:1.05rem; }
-  header.topbar nav { display:flex; gap:12px; align-items:center; font-size:.92rem; color:var(--muted); }
-  main.container { max-width:760px; margin:24px auto; padding:0 16px; }
-  .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
-  h1 { font-size:1.45rem; margin:0 0 12px; }
-  h2 { font-size:1.1rem; margin:18px 0 8px; }
-  a { color:var(--brand); }
+  :root {
+    --ink:#1b2430; --muted:#6b7585; --line:#e3e7ee; --soft:#f5f7fa;
+    --brand:#3b5bdb; --brand-soft:#eef2ff; --ok:#2b8a3e; --ok-soft:#ebfbee;
+    --warn:#b45309; --warn-soft:#fff7e6; --danger:#c92a2a; --danger-soft:#fff5f5;
+    --radius:12px;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif;
+    color:var(--ink); background:var(--soft); line-height:1.6; font-size:15px; }
+  a { color:var(--brand); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  header.topbar { position:sticky; top:0; z-index:1; display:flex; align-items:center; justify-content:space-between;
+    gap:12px; padding:12px 24px; background:#fff; border-bottom:1px solid var(--line); }
+  header.topbar .brand { font-weight:800; color:var(--ink); font-size:1.05rem; letter-spacing:-.2px; }
+  header.topbar .brand:hover { text-decoration:none; }
+  header.topbar nav { display:flex; gap:14px; align-items:center; font-size:.9rem; color:var(--muted); }
+  header.topbar nav a { color:var(--muted); }
+  main.container { max-width:780px; margin:28px auto 48px; padding:0 16px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:var(--radius); padding:22px; margin-bottom:16px; }
+  .page-head { margin:4px 0 16px; }
+  .page-head .crumb { font-size:.85rem; color:var(--muted); margin-bottom:2px; }
+  h1 { font-size:1.4rem; margin:0; letter-spacing:-.3px; }
+  h2 { font-size:1.05rem; margin:22px 0 10px; }
   p { margin:8px 0; }
-  ul { padding-left:20px; }
+  ul.plain { list-style:none; padding:0; margin:0; }
+  ul.plain > li + li { margin-top:8px; }
+  .item { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:14px 16px;
+    border:1px solid var(--line); border-radius:10px; background:#fff; }
+  .item:hover { border-color:#c7d2fe; }
+  .item .title { font-weight:600; color:var(--ink); }
+  .item .meta { font-size:.85rem; color:var(--muted); }
+  .muted { color:var(--muted); font-size:.9rem; }
+  .empty { text-align:center; color:var(--muted); padding:28px 12px; border:1px dashed #cfd6e0; border-radius:10px; }
+  .badge { display:inline-block; font-size:.75rem; font-weight:600; padding:2px 8px; border-radius:999px; margin-left:6px; vertical-align:middle; }
+  .badge.ended { background:#eceff3; color:#4b5563; }
+  .badge.due { background:var(--danger-soft); color:var(--danger); }
+  .badge.processing { background:var(--brand-soft); color:var(--brand); }
+  .badge.done { background:var(--ok-soft); color:var(--ok); }
+  .badge.failed { background:var(--danger-soft); color:var(--danger); }
+  .notice, .error { padding:12px 14px; border-radius:10px; margin:12px 0; font-size:.92rem; }
+  .notice { background:var(--warn-soft); color:var(--warn); border:1px solid #ffe2a8; }
+  .error { background:var(--danger-soft); color:var(--danger); border:1px solid #ffc9c9; }
+  .success { background:var(--ok-soft); color:var(--ok); border:1px solid #c3f0cc; padding:12px 14px; border-radius:10px; margin:12px 0; }
+  .field { display:flex; flex-direction:column; gap:6px; margin:14px 0; }
+  .field label, .field > span { font-size:.88rem; font-weight:600; color:#374151; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   input[type=text], input:not([type]), input[type=password], input[type=date], input[type=file] {
-    padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; font-size:.95rem; max-width:100%; background:#fff; }
-  input[type=file] { padding:6px; }
-  input:focus { outline:2px solid #c7d7fe; border-color:var(--brand); }
-  button { padding:8px 14px; border:1px solid var(--brand); background:var(--brand); color:#fff; border-radius:8px; font-size:.92rem; cursor:pointer; margin-top:4px; }
-  button:hover { filter:brightness(1.05); }
-  button[name=action][value=end] { background:#fff; color:var(--brand); }
-  form { margin:12px 0; }
-  .msg-error, p > b:only-child { color:var(--danger); }
-  details.devnote { margin:0 0 16px; color:var(--muted); font-size:.85rem; }
+    padding:9px 11px; border:1px solid #cfd6e0; border-radius:8px; font-size:.95rem; width:100%; max-width:100%; background:#fff; font-family:inherit; }
+  input[type=file] { padding:7px; }
+  input:focus { outline:3px solid #dbe4ff; border-color:var(--brand); }
+  .btn, button { display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:9px 16px; border:1px solid var(--brand);
+    background:var(--brand); color:#fff; border-radius:8px; font-size:.92rem; font-weight:600; cursor:pointer; font-family:inherit; text-decoration:none; }
+  .btn:hover, button:hover { filter:brightness(1.06); text-decoration:none; }
+  .btn.secondary, button.secondary { background:#fff; color:var(--brand); }
+  .btn.ghost { background:transparent; color:var(--muted); border-color:transparent; }
+  .btn.danger, button.danger { background:#fff; color:var(--danger); border-color:#ffc9c9; }
+  .tabs { display:inline-flex; background:#eef0f4; border-radius:9px; padding:3px; gap:3px; margin:8px 0 14px; }
+  .tabs a { padding:6px 14px; border-radius:7px; font-size:.9rem; color:var(--muted); }
+  .tabs a.on { background:#fff; color:var(--ink); font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,.06); text-decoration:none; }
+  .bubble { padding:12px 14px; border-radius:12px; background:var(--soft); border:1px solid var(--line); margin-top:12px; white-space:pre-wrap; }
+  .record { white-space:pre-wrap; background:var(--soft); border:1px solid var(--line); border-radius:10px; padding:14px 16px; font-size:.95rem; }
+  details { margin-top:12px; }
+  details summary { cursor:pointer; color:var(--muted); font-size:.9rem; }
+  .spinner { width:14px; height:14px; border:2px solid #c7d2fe; border-top-color:var(--brand); border-radius:50%; display:inline-block; animation:spin .9s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  details.devnote { margin:0 0 14px; color:var(--muted); font-size:.82rem; }
   details.devnote summary { cursor:pointer; }
-  @media (max-width: 520px) { header.topbar { flex-direction:column; align-items:flex-start; } }
+  details.devnote ul { margin:6px 0 0; }
+  @media (max-width:560px) {
+    header.topbar { flex-direction:column; align-items:flex-start; padding:12px 16px; }
+    main.container { margin-top:18px; }
+    .card { padding:16px; }
+    .item { flex-direction:column; align-items:flex-start; }
+  }
 </style>
 </head>
 <body>
@@ -50,9 +100,7 @@
     <summary>설계 메모</summary>
     <ul>{% block note %}{% endblock %}</ul>
   </details>
-  <section class="card">
-    {% block content %}{% endblock %}
-  </section>
+  {% block content %}{% endblock %}
 </main>
 </body>
 </html>
