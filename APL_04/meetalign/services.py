@@ -45,6 +45,19 @@ def check_questions(meeting):
     return lines[:2] or list(FAKE_CHECK_QUESTIONS)
 
 
+def summarize(transcript):
+    if not (_enabled() and transcript):
+        return transcript
+    prompt = (
+        "다음은 회의 녹음의 전사본이다. 한국어로만, 아래 형식으로 정리하라. 전사본에 없는 내용은 쓰지 마라.\n"
+        "[안건]\n- ...\n[결정 사항]\n- ...\n[할 일]\n- ...\n\n전사본:\n" + transcript
+    )
+    try:
+        return _generate(prompt)
+    except OSError:
+        return transcript
+
+
 def chat_reply(meeting, text):
     if not (_enabled() and meeting.record):
         return "(가짜 LLM 응답) '%s'에 대한 답변입니다." % text

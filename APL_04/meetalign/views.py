@@ -134,7 +134,8 @@ def meeting_detail(request, meeting_id):
             meeting.save()
             transcript = services.transcribe(meeting.recording.path)
             if transcript is not None:
-                meeting.record = transcript
+                meeting.transcript = transcript
+                meeting.record = services.summarize(transcript)
                 meeting.save()
         if request.POST.get("action") == "end":
             meeting.ended = True

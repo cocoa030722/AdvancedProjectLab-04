@@ -24,6 +24,7 @@ class Meeting(models.Model):
     recording = models.FileField(upload_to="recordings/", blank=True, null=True)
     # 회의록(전사+요약). 지금은 저장 자리만 있고, 채우는 건 STT/LLM 작업에서 한다.
     record = models.TextField(blank=True)
+    transcript = models.TextField(blank=True)
 
     def __str__(self):
         return self.title
