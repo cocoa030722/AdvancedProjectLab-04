@@ -92,7 +92,7 @@ class PrototypeFlowTests(TestCase):
         self.assertRedirects(self.client.post(url, {"action": "submit"}),
                              reverse("meeting_result", args=[self.meeting.id]))
         self.assertRedirects(self.client.post(url, {"action": "end"}),
-                             reverse("answers", args=[self.meeting.id]))
+                             reverse("understanding", args=[self.meeting.id]))
         self.meeting.refresh_from_db()
         self.assertTrue(self.meeting.ended)
 
@@ -174,7 +174,7 @@ class PrototypeFlowTests(TestCase):
         question = CheckQuestion.objects.filter(meeting=self.meeting).first()
         Answer.objects.create(question=question, user=self.user, text="A안")
         Answer.objects.create(question=question, user=other, text="B안")
-        r = self.client.get(reverse("understanding", args=[self.meeting.id]))
+        r = self.client.get(reverse("verification", args=[self.meeting.id]))
         self.assertContains(r, "b: B안")
         self.assertContains(r, "a: A안")
         self.assertNotContains(r, "엇갈린 답변이 없습니다.")
@@ -185,7 +185,7 @@ class PrototypeFlowTests(TestCase):
         question = CheckQuestion.objects.filter(meeting=self.meeting).first()
         Answer.objects.create(question=question, user=self.user, text="같은 답")
         Answer.objects.create(question=question, user=other, text="같은 답")
-        r = self.client.get(reverse("understanding", args=[self.meeting.id]))
+        r = self.client.get(reverse("verification", args=[self.meeting.id]))
         self.assertContains(r, "엇갈린 답변이 없습니다.")
 
     def test_d1_banner_shown_when_deadline_is_tomorrow(self):
@@ -450,7 +450,7 @@ class SemanticDiscrepancyTests(TestCase):
     def test_view_uses_llm_verdict(self):
         self._answer("이메일 로그인", "메일로 로그인")
         with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="일치"):
-            r = self.client.get(reverse("understanding", args=[self.meeting.id]))
+            r = self.client.get(reverse("verification", args=[self.meeting.id]))
         self.assertContains(r, "엇갈린 답변이 없습니다.")
 
 
@@ -586,3 +586,53 @@ class StuckAndFileAccessTests(TestCase):
 
     def test_no_recording_returns_404(self):
         self.assertEqual(self.client.get(reverse("recording_file", args=[self.meeting.id])).status_code, 404)
+
+
+class DesignAlignmentTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user, record="결정: A안")
+
+    def test_verification_page_is_separate_from_answer_page(self):
+        r = self.client.get(reverse("understanding", args=[self.meeting.id]))
+        self.assertNotContains(r, "엇갈린 답변이 없습니다.")
+        self.assertContains(r, reverse("verification", args=[self.meeting.id]))
+        self.assertEqual(self.client.get(reverse("verification", args=[self.meeting.id])).status_code, 200)
+
+    def test_record_download_returns_text_for_members(self):
+        r = self.client.get(reverse("record_file", args=[self.meeting.id]))
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("attachment", r["Content-Disposition"])
+        self.assertEqual(r.content.decode("utf-8"), "결정: A안")
+
+    def test_record_download_404_when_empty_or_outsider(self):
+        self.meeting.record = ""
+        self.meeting.save()
+        self.assertEqual(self.client.get(reverse("record_file", args=[self.meeting.id])).status_code, 404)
+        self.meeting.record = "결정"
+        self.meeting.save()
+        outsider = User.objects.create_user("c", password="pw12345!")
+        client = Client()
+        client.force_login(outsider)
+        self.assertEqual(client.get(reverse("record_file", args=[self.meeting.id])).status_code, 404)
+
+    def test_result_page_shows_download_button_when_done(self):
+        self.meeting.processing_status = Meeting.STATUS_DONE
+        self.meeting.save()
+        r = self.client.get(reverse("meeting_result", args=[self.meeting.id]))
+        self.assertContains(r, "회의록 다운로드")
+        self.assertContains(r, reverse("record_file", args=[self.meeting.id]))
+
+    def test_main_page_banner_lists_meetings_due_tomorrow(self):
+        self.meeting.deadline = timezone.localdate() + timedelta(days=1)
+        self.meeting.save()
+        r = self.client.get(reverse("index"))
+        self.assertContains(r, "내일 마감인 회의")
+        self.assertContains(r, self.meeting.title)
+
+    def test_main_page_has_no_banner_when_not_due(self):
+        r = self.client.get(reverse("index"))
+        self.assertNotContains(r, "내일 마감인 회의")
