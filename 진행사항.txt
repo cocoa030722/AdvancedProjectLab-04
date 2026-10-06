@@ -6,7 +6,9 @@
 1. meetalign/models.py
 ----------------------
 - Team: 팀 (name, members — User와 M2M)
-- Meeting: 회의 (team FK, title, created_at, ended, recording)
+- Meeting: 회의 (team FK, title, created_at, ended, recording, record)
+  record는 회의록 텍스트 저장 자리(TextField). 지금은 값을 채우는 기능이 없고,
+  STT/LLM 작업에서 채움. summary 화면은 이 값을 그대로 보여주거나 없으면 안내문을 띄움.
   recording은 실제로 업로드된 녹음파일을 저장하는 FileField. STT/LLM 처리는
   아직 없고, 파일을 서버에 실제로 남기는 것까지만 구현됨.
 - Question: 익명 질문 (meeting FK, text, answer) — 작성자는 저장하지 않는다.
@@ -63,6 +65,7 @@ default_auto_field를 BigAutoField로 명시했다. 이게 없으면 Django 버�
 - 0003_alter_answer_id_alter_checkquestion_id.py: 위 두 모델의 PK 타입을
   BigAutoField로 통일 (apps.py 수정에 맞춰 스키마도 맞춤)
 - 0004_meeting_recording.py: Meeting에 recording(FileField) 추가
+- 0005_meeting_record.py: Meeting에 record(TextField) 추가
 
 ※ 주의: 새 마이그레이션 받으면(git pull 등) 서버 켜기 전에 꼭
   `python manage.py migrate` 먼저 돌릴 것. 안 돌리면 기존 DB 파일
@@ -81,7 +84,9 @@ default_auto_field를 BigAutoField로 명시했다. 이게 없으면 Django 버�
   저장되고, 다시 들어오면 저장된 답이 미리 채워진다.
 - meeting_detail.html
   업로드된 녹음파일이 있으면 파일명을 화면에 표시한다.
-- 그 외(chat, inbox, summary, meeting_result, meeting_list, meeting_create,
+- summary.html
+  고정 가짜 요약 문구 대신 meeting.record 값을 보여주고, 없으면 안내문을 띄운다.
+- 그 외(chat, inbox, meeting_result, meeting_list, meeting_create,
   team_join) 템플릿은 아직 목업 단계 그대로 — 화면 흐름과 뼈대만 있고 실제
   콘텐츠(LLM 결과 등)는 가짜/고정값이다.
 
@@ -102,7 +107,7 @@ default_auto_field를 BigAutoField로 명시했다. 이게 없으면 Django 버�
   생성·답변, 이해도 검증 질문 자동 생성(중복 생성 안 됨), 답변 저장·재제출 시
   수정되는지, 같은 질문에 여러 사용자가 각자 답변을 가질 수 있는지(핵심 검증),
   녹음파일 업로드 시 실제로 저장되는지
-- 총 20개, 전부 통과
+- 총 22개, 전부 통과 (회의록 필드 테스트 2개 추가: 저장된 값 표시, 없을 때 안내문)
 
 
 PR 히스토리
@@ -117,13 +122,12 @@ PR 히스토리
 
 아직 안 된 것 (다음 작업 후보, 우선순위 순)
 ----------------------
-1. Meeting에 회의록 저장용 필드 추가 (지금은 DB에 저장할 자리 자체가 없음)
-2. STT 연동 (녹음 → 텍스트)
-3. LLM으로 회의록 생성 (summary/meeting_result가 지금 고정 텍스트)
-4. 이해도 검증 질문 자동 생성 (지금 고정 2문항 → LLM이 전사본 기반으로 생성)
-5. 불일치 탐지 로직 — 팀원별 Answer와 회의록을 비교해서 다르게 이해한 부분을
+1. STT 연동 (녹음 → 텍스트)
+2. LLM으로 회의록 생성 (meeting.record를 채움, 지금은 값 입력 경로가 없음)
+3. 이해도 검증 질문 자동 생성 (지금 고정 2문항 → LLM이 전사본 기반으로 생성)
+4. 불일치 탐지 로직 — 팀원별 Answer와 회의록을 비교해서 다르게 이해한 부분을
    짚어주는 것. 이 프로젝트의 핵심 기능인데 아직 손도 안 댐.
-6. 익명 질문/LLM 채팅 응답 실제화 (지금 고정 가짜 응답)
-7. D-1 리마인더 알림
-8. 배포용 설정 정리 (SECRET_KEY, DEBUG, ALLOWED_HOSTS를 환경변수로 분리) —
+5. 익명 질문/LLM 채팅 응답 실제화 (지금 고정 가짜 응답)
+6. D-1 리마인더 알림
+7. 배포용 설정 정리 (SECRET_KEY, DEBUG, ALLOWED_HOSTS를 환경변수로 분리) —
    지금은 로컬 개발 단계라 급하지 않음
