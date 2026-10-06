@@ -1,8 +1,8 @@
 {% extends "meetalign/base.html" %}
-{% block note %}<li>LLM 요약은 고정된 가짜 텍스트이다.</li>{% endblock %}
+{% block note %}<li>회의록은 meeting.record에 저장된 값을 그대로 보여준다. 저장값을 채우는 건 아직 없음(STT/LLM 작업 대상).</li>{% endblock %}
 {% block content %}
 <h1>{{ meeting.title }} 회의 요약</h1>
 <p><a href="{% url 'meeting_detail' meeting.id %}">회의로 돌아가기</a></p>
-<p>(가짜 요약) 안건 논의, 결정 사항, 다음 할 일이 여기에 표시됩니다.</p>
+{% if meeting.record %}<p>{{ meeting.record|linebreaksbr }}</p>{% else %}<p>아직 생성된 회의록이 없습니다.</p>{% endif %}
 <p><a href="{% url 'understanding' meeting.id %}">이해도 검증</a></p>
 {% endblock %}

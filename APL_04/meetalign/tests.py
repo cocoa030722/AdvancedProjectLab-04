@@ -97,6 +97,16 @@ class PrototypeFlowTests(TestCase):
         self.assertTrue(self.meeting.recording)
         self.assertIn("test", self.meeting.recording.name)
 
+    def test_summary_shows_saved_record(self):
+        self.meeting.record = "결정: A안으로 진행"
+        self.meeting.save()
+        r = self.client.get(reverse("summary", args=[self.meeting.id]))
+        self.assertContains(r, "결정: A안으로 진행")
+
+    def test_summary_without_record_shows_fallback(self):
+        r = self.client.get(reverse("summary", args=[self.meeting.id]))
+        self.assertContains(r, "아직 생성된 회의록이 없습니다.")
+
     def test_anonymous_question_and_answer(self):
         self.client.post(reverse("chat", args=[self.meeting.id]), {"mode": "anon", "text": "why?"})
         q = Question.objects.get()
