@@ -1,6 +1,7 @@
 import os
+import sys
 import tempfile
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from datetime import timedelta
 
 from django.contrib.auth.models import User
@@ -265,3 +266,40 @@ class LocalLLMTests(TestCase):
         with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate") as gen:
             self.assertEqual(services.check_questions(self.meeting), services.FAKE_CHECK_QUESTIONS)
         gen.assert_not_called()
+
+
+class LocalSTTTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
+
+    def test_transcribe_is_skipped_without_model_env(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(services.transcribe("/nonexistent.wav"))
+
+    def test_transcribe_passes_model_and_korean_language(self):
+        fake = MagicMock()
+        fake.transcribe.return_value = {"text": " 안녕하세요 "}
+        with patch.dict(os.environ, {"MLX_WHISPER_MODEL": "mlx-community/whisper-large-v3-turbo"}), patch.dict(sys.modules, {"mlx_whisper": fake}):
+            self.assertEqual(services.transcribe("/x.wav"), "안녕하세요")
+        fake.transcribe.assert_called_once_with("/x.wav", path_or_hf_repo="mlx-community/whisper-large-v3-turbo", language="ko")
+
+    @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+    def test_upload_without_model_leaves_record_empty(self):
+        with patch.dict(os.environ, {}, clear=True):
+            file = SimpleUploadedFile("a.wav", b"RIFF", content_type="audio/wav")
+            self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.record, "")
+        self.assertTrue(self.meeting.recording)
+
+    @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+    def test_upload_with_model_fills_record_with_transcript(self):
+        file = SimpleUploadedFile("a.wav", b"RIFF", content_type="audio/wav")
+        with patch.object(services, "transcribe", return_value="전사된 회의 내용"):
+            self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.record, "전사된 회의 내용")
