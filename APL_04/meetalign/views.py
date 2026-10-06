@@ -83,7 +83,8 @@ def meeting_list(request, team_id):
 def meeting_create(request, team_id):
     team = _team(request, team_id)
     if request.method == "POST" and request.POST.get("title", "").strip():
-        meeting = Meeting.objects.create(team=team, title=request.POST["title"].strip())
+        deadline = request.POST.get("deadline") or None
+        meeting = Meeting.objects.create(team=team, title=request.POST["title"].strip(), deadline=deadline)
         return redirect("meeting_detail", meeting_id=meeting.id)
     return render(request, "meetalign/meeting_create.html", {"team": team})
 

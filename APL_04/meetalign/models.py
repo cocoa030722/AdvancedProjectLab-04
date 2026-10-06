@@ -1,5 +1,8 @@
+from datetime import timedelta
+
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 
 class Team(models.Model):
@@ -15,6 +18,7 @@ class Meeting(models.Model):
     title = models.CharField(max_length=200)
     created_at = models.DateTimeField(auto_now_add=True)
     ended = models.BooleanField(default=False)
+    deadline = models.DateField(null=True, blank=True)
     # STT/LLM 처리는 아직 없음. 지금은 파일을 실제로 저장하는 것까지만 한다.
     recording = models.FileField(upload_to="recordings/", blank=True, null=True)
     # 회의록(전사+요약). 지금은 저장 자리만 있고, 채우는 건 STT/LLM 작업에서 한다.
@@ -22,6 +26,10 @@ class Meeting(models.Model):
 
     def __str__(self):
         return self.title
+
+    @property
+    def is_due_tomorrow(self):
+        return self.deadline is not None and self.deadline - timezone.localdate() == timedelta(days=1)
 
 
 class Question(models.Model):

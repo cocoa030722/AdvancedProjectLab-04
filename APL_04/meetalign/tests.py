@@ -1,9 +1,11 @@
 import tempfile
+from datetime import timedelta
 
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 from .models import Answer, CheckQuestion, Meeting, Question, Team
 
@@ -177,3 +179,19 @@ class PrototypeFlowTests(TestCase):
         Answer.objects.create(question=question, user=other, text="같은 답")
         r = self.client.get(reverse("understanding", args=[self.meeting.id]))
         self.assertContains(r, "엇갈린 답변이 없습니다.")
+
+    def test_d1_banner_shown_when_deadline_is_tomorrow(self):
+        self.meeting.deadline = timezone.localdate() + timedelta(days=1)
+        self.meeting.save()
+        self.assertContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "마감 D-1")
+        self.assertContains(self.client.get(reverse("meeting_list", args=[self.team.id])), "[D-1 마감]")
+
+    def test_no_banner_when_deadline_further_away(self):
+        self.meeting.deadline = timezone.localdate() + timedelta(days=3)
+        self.meeting.save()
+        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
+        self.assertNotContains(r, "마감 D-1")
+
+    def test_meeting_create_saves_deadline(self):
+        self.client.post(reverse("meeting_create", args=[self.team.id]), {"title": "d", "deadline": "2030-01-02"})
+        self.assertEqual(str(Meeting.objects.get(title="d").deadline), "2030-01-02")
