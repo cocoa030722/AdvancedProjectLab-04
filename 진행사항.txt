@@ -49,8 +49,13 @@
   지금은 문자열 비교(strip 후). 나중에 LLM 의미 비교 + 회의록 대조로 교체할 자리.
 
 - meetalign/services.py (LLM 연결 지점)
-  check_questions / chat_reply / is_consistent. 지금은 현재 동작(고정 문항, 가짜 응답, 문자열 비교)을
-  그대로 돌려준다. 제공자가 정해지면 이 함수들만 바꾸면 된다.
+  OLLAMA_MODEL 환경변수가 있으면 로컬 Ollama(OLLAMA_URL, 기본 http://127.0.0.1:11434)를 호출한다.
+  회의록(record)이 있을 때만 질문 생성과 회의록 기반 답변을 하고, 없거나 환경변수가 없으면 기존
+  가짜 동작을 그대로 쓴다. Ollama 연결이 실패하면 가짜 문항 또는 안내 문구로 대체된다.
+  is_consistent(불일치 비교)는 아직 문자열 비교다.
+  실행 방법 (로컬 모델 qwen2.5:7b 기준, 맥북 16GB에서 답변 약 2~3초):
+    ollama serve                      # 별도 터미널, 실행 상태 유지
+    cd APL_04 && OLLAMA_MODEL=qwen2.5:7b ../.venv/bin/python manage.py runserver
 
 - chat (대화창)
   mode=anon이면 Question을 익명으로 생성, mode=llm이면 고정된 가짜 응답 문자열을
@@ -122,7 +127,7 @@ default_auto_field를 BigAutoField로 명시했다. 이게 없으면 Django 버�
   생성·답변, 이해도 검증 질문 자동 생성(중복 생성 안 됨), 답변 저장·재제출 시
   수정되는지, 같은 질문에 여러 사용자가 각자 답변을 가질 수 있는지(핵심 검증),
   녹음파일 업로드 시 실제로 저장되는지
-- 총 31개, 전부 통과 (주최자 권한 테스트 4개 포함)
+- 총 36개, 전부 통과 (주최자 권한 4개, 로컬 LLM 연결 5개 포함)
 
 
 PR 히스토리

@@ -1,4 +1,6 @@
+import os
 import tempfile
+from unittest.mock import patch
 from datetime import timedelta
 
 from django.contrib.auth.models import User
@@ -7,6 +9,7 @@ from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
+from . import services
 from .models import Answer, CheckQuestion, Meeting, Question, Team
 
 
@@ -226,3 +229,39 @@ class PrototypeFlowTests(TestCase):
         member = self._member_client()
         member.post(reverse("chat", args=[self.meeting.id]), {"mode": "anon", "text": "hi"})
         self.assertEqual(Question.objects.filter(meeting=self.meeting).count(), 1)
+
+
+class LocalLLMTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user, record="결정: A안으로 진행")
+
+    def test_disabled_without_model_env_keeps_fake_behavior(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIn("(가짜 LLM 응답)", services.chat_reply(self.meeting, "q"))
+            self.assertEqual(services.check_questions(self.meeting), services.FAKE_CHECK_QUESTIONS)
+
+    def test_chat_reply_sends_record_as_context(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="A안입니다") as gen:
+            reply = services.chat_reply(self.meeting, "무엇을 정했나?")
+        self.assertEqual(reply, "A안입니다")
+        self.assertIn("결정: A안으로 진행", gen.call_args[0][0])
+        self.assertIn("무엇을 정했나?", gen.call_args[0][0])
+
+    def test_check_questions_from_llm_lines(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="질문1\n\n질문2\n질문3"):
+            self.assertEqual(services.check_questions(self.meeting), ["질문1", "질문2"])
+
+    def test_llm_failure_falls_back(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", side_effect=OSError("down")):
+            self.assertIn("LLM 연결 실패", services.chat_reply(self.meeting, "q"))
+            self.assertEqual(services.check_questions(self.meeting), services.FAKE_CHECK_QUESTIONS)
+
+    def test_no_record_uses_fake_even_when_enabled(self):
+        self.meeting.record = ""
+        self.meeting.save()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate") as gen:
+            self.assertEqual(services.check_questions(self.meeting), services.FAKE_CHECK_QUESTIONS)
+        gen.assert_not_called()
