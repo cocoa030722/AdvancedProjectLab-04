@@ -1,15 +1,11 @@
 from django.contrib.auth import login, logout
+from django.core.exceptions import PermissionDenied
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.shortcuts import get_object_or_404, redirect, render
 
+from . import services
 from .models import Answer, CheckQuestion, Meeting, Question, Team
-
-# LLM이 실제로 문제를 내기 전까지 쓰는 고정 문항 (구현사항.txt: 실제 기능 구현 안 함)
-FAKE_CHECK_QUESTIONS = [
-    "이번 회의의 핵심 결정 사항은?",
-    "내가 맡은 다음 할 일은?",
-]
 
 
 def index(request):
@@ -84,7 +80,7 @@ def meeting_create(request, team_id):
     team = _team(request, team_id)
     if request.method == "POST" and request.POST.get("title", "").strip():
         deadline = request.POST.get("deadline") or None
-        meeting = Meeting.objects.create(team=team, title=request.POST["title"].strip(), deadline=deadline)
+        meeting = Meeting.objects.create(team=team, title=request.POST["title"].strip(), deadline=deadline, host=request.user)
         return redirect("meeting_detail", meeting_id=meeting.id)
     return render(request, "meetalign/meeting_create.html", {"team": team})
 
@@ -121,13 +117,20 @@ def chat(request, meeting_id):
         if mode == "anon":
             Question.objects.create(meeting=meeting, text=text)
         else:
-            reply = "(가짜 LLM 응답) '%s'에 대한 답변입니다." % text
+            reply = services.chat_reply(meeting, text)
     return render(request, "meetalign/chat.html", {"meeting": meeting, "mode": mode, "reply": reply})
+
+
+def _require_host(meeting, user):
+    # 주최자가 없는(이 기능 도입 전에 만든) 회의는 팀원 누구나 허용한다.
+    if meeting.host_id is not None and meeting.host_id != user.id:
+        raise PermissionDenied
 
 
 @login_required
 def inbox(request, meeting_id):
     meeting = _meeting(request, meeting_id)
+    _require_host(meeting, request.user)
     return render(request, "meetalign/inbox.html", {"meeting": meeting, "questions": meeting.questions.all()})
 
 
@@ -139,6 +142,7 @@ def summary(request, meeting_id):
 @login_required
 def answers(request, meeting_id):
     meeting = _meeting(request, meeting_id)
+    _require_host(meeting, request.user)
     if request.method == "POST":
         question = get_object_or_404(Question, pk=request.POST.get("question_id"), meeting=meeting)
         question.answer = request.POST.get("answer", "").strip()
@@ -148,11 +152,10 @@ def answers(request, meeting_id):
 
 
 def _find_discrepancies(meeting):
-    # 지금은 답변 문자열이 다르면 불일치로 본다. LLM 의미 비교로 교체할 자리.
     found = []
     for question in meeting.check_questions.all():
         answers = list(question.answers.select_related("user"))
-        if len({a.text.strip() for a in answers}) > 1:
+        if not services.is_consistent([a.text for a in answers]):
             found.append((question, answers))
     return found
 
@@ -161,7 +164,7 @@ def _find_discrepancies(meeting):
 def understanding(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     if not meeting.check_questions.exists():
-        for order, text in enumerate(FAKE_CHECK_QUESTIONS):
+        for order, text in enumerate(services.check_questions(meeting)):
             CheckQuestion.objects.create(meeting=meeting, text=text, order=order)
     user = request.user
     questions = list(meeting.check_questions.all())

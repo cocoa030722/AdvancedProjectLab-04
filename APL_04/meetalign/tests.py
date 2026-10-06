@@ -3,7 +3,7 @@ from datetime import timedelta
 
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase, override_settings
+from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
@@ -56,7 +56,7 @@ class PrototypeFlowTests(TestCase):
         self.client.force_login(self.user)
         self.team = Team.objects.create(name="t")
         self.team.members.add(self.user)
-        self.meeting = Meeting.objects.create(team=self.team, title="m")
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
 
     def test_index_public(self):
         self.assertEqual(self.client.get(reverse("index")).status_code, 200)
@@ -195,3 +195,34 @@ class PrototypeFlowTests(TestCase):
     def test_meeting_create_saves_deadline(self):
         self.client.post(reverse("meeting_create", args=[self.team.id]), {"title": "d", "deadline": "2030-01-02"})
         self.assertEqual(str(Meeting.objects.get(title="d").deadline), "2030-01-02")
+
+    def _member_client(self):
+        other = User.objects.create_user("member", password="pw12345!")
+        self.team.members.add(other)
+        client = Client()
+        client.force_login(other)
+        return client
+
+    def test_meeting_create_sets_host_to_creator(self):
+        self.client.post(reverse("meeting_create", args=[self.team.id]), {"title": "h"})
+        self.assertEqual(Meeting.objects.get(title="h").host, self.user)
+
+    def test_non_host_cannot_open_inbox_or_answer(self):
+        member = self._member_client()
+        self.assertEqual(member.get(reverse("inbox", args=[self.meeting.id])).status_code, 403)
+        q = Question.objects.create(meeting=self.meeting, text="why?")
+        r = member.post(reverse("answers", args=[self.meeting.id]), {"question_id": q.id, "answer": "x"})
+        self.assertEqual(r.status_code, 403)
+        q.refresh_from_db()
+        self.assertEqual(q.answer, "")
+
+    def test_meeting_without_host_stays_open_to_members(self):
+        self.meeting.host = None
+        self.meeting.save()
+        member = self._member_client()
+        self.assertEqual(member.get(reverse("inbox", args=[self.meeting.id])).status_code, 200)
+
+    def test_members_can_still_send_anonymous_question(self):
+        member = self._member_client()
+        member.post(reverse("chat", args=[self.meeting.id]), {"mode": "anon", "text": "hi"})
+        self.assertEqual(Question.objects.filter(meeting=self.meeting).count(), 1)

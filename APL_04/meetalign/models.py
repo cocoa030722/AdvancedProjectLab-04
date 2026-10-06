@@ -19,6 +19,7 @@ class Meeting(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     ended = models.BooleanField(default=False)
     deadline = models.DateField(null=True, blank=True)
+    host = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="hosted_meetings")
     # STT/LLM 처리는 아직 없음. 지금은 파일을 실제로 저장하는 것까지만 한다.
     recording = models.FileField(upload_to="recordings/", blank=True, null=True)
     # 회의록(전사+요약). 지금은 저장 자리만 있고, 채우는 건 STT/LLM 작업에서 한다.
