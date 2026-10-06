@@ -71,5 +71,18 @@ def chat_reply(meeting, text):
         return "(LLM 연결 실패: Ollama가 실행 중인지 확인하세요)"
 
 
-def is_consistent(texts):
-    return len({t.strip() for t in texts}) <= 1
+def is_consistent(texts, record="", question=""):
+    if len({t.strip() for t in texts}) <= 1:
+        return True
+    if not (_enabled() and record and question):
+        return False
+    prompt = (
+        "회의록과 질문, 그리고 팀원들의 답변이 주어진다. 답변들이 회의록에 비추어 같은 내용을 가리키면 '일치', "
+        "서로 다르게 이해한 부분이 있으면 '불일치'라고만 답하라. 반드시 한국어로만 답하라.\n\n"
+        "회의록:\n" + record + "\n\n질문: " + question + "\n\n답변:\n" + "\n".join("- " + t for t in texts)
+    )
+    try:
+        verdict = _generate(prompt)
+    except OSError:
+        return False
+    return "불일치" not in verdict

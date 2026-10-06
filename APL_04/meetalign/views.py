@@ -202,7 +202,7 @@ def _find_discrepancies(meeting):
     found = []
     for question in meeting.check_questions.all():
         answers = list(question.answers.select_related("user"))
-        if not services.is_consistent([a.text for a in answers]):
+        if not services.is_consistent([a.text for a in answers], record=meeting.record, question=question.text):
             found.append((question, answers))
     return found
 

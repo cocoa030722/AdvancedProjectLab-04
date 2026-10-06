@@ -403,3 +403,46 @@ class MeetingSummaryTests(TestCase):
         r = self.client.get(reverse("summary", args=[self.meeting.id]))
         self.assertContains(r, "전사 원문 보기")
         self.assertContains(r, "전사 원문 내용")
+
+
+class SemanticDiscrepancyTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.other = User.objects.create_user("b", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user, self.other)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user, record="결정: 로그인은 이메일만")
+        self.question = CheckQuestion.objects.create(meeting=self.meeting, text="로그인 범위는?")
+
+    def _answer(self, a, b):
+        Answer.objects.create(question=self.question, user=self.user, text=a)
+        Answer.objects.create(question=self.question, user=self.other, text=b)
+
+    def test_identical_answers_are_consistent_without_llm(self):
+        self._answer("이메일", "이메일")
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate") as gen:
+            self.assertTrue(services.is_consistent(["이메일", "이메일"], record="r", question="q"))
+        gen.assert_not_called()
+
+    def test_llm_accepts_different_wording_with_same_meaning(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="일치"):
+            self.assertTrue(services.is_consistent(["이메일 로그인", "메일로 로그인"], record="r", question="q"))
+
+    def test_llm_flags_different_understanding(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="불일치"):
+            self.assertFalse(services.is_consistent(["이메일 로그인", "소셜 로그인 포함"], record="r", question="q"))
+
+    def test_without_llm_different_wording_is_flagged(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(services.is_consistent(["이메일 로그인", "메일로 로그인"], record="r", question="q"))
+
+    def test_llm_error_falls_back_to_flagged(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", side_effect=OSError("down")):
+            self.assertFalse(services.is_consistent(["a", "b"], record="r", question="q"))
+
+    def test_view_uses_llm_verdict(self):
+        self._answer("이메일 로그인", "메일로 로그인")
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="일치"):
+            r = self.client.get(reverse("understanding", args=[self.meeting.id]))
+        self.assertContains(r, "엇갈린 답변이 없습니다.")
