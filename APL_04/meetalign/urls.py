@@ -12,6 +12,7 @@ urlpatterns = [
     path("teams/<int:team_id>/meetings/new/", views.meeting_create, name="meeting_create"),
     path("meetings/<int:meeting_id>/", views.meeting_detail, name="meeting_detail"),
     path("meetings/<int:meeting_id>/result/", views.meeting_result, name="meeting_result"),
+    path("meetings/<int:meeting_id>/recording/", views.recording_file, name="recording_file"),
     path("meetings/<int:meeting_id>/chat/", views.chat, name="chat"),
     path("meetings/<int:meeting_id>/inbox/", views.inbox, name="inbox"),
     path("meetings/<int:meeting_id>/summary/", views.summary, name="summary"),

@@ -8,7 +8,7 @@
 {% if error %}<p><b>{{ error }}</b></p>{% endif %}
 <a href="{% url 'meeting_list' meeting.team_id %}">회의 목록으로 돌아가기</a>
 {% if meeting.is_due_tomorrow %}<p><b>마감 D-1: 내일 마감입니다.</b></p>{% endif %}
-{% if meeting.recording %}<p>업로드된 녹음: {{ meeting.recording.name }}</p>{% endif %}
+{% if meeting.recording %}<p>업로드된 녹음: <a href="{% url 'recording_file' meeting.id %}">받기</a></p>{% endif %}
 <form method="post" enctype="multipart/form-data">{% csrf_token %}
 <p>회의 녹음: <input type="file" name="recording" accept="audio/*"></p>
 <button name="action" value="submit">제출</button>

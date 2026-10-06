@@ -1,13 +1,58 @@
 <!doctype html>
 <html lang="ko">
-<head><meta charset="utf-8"><title>{% block title %}MeetAlign{% endblock %}</title></head>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}MeetAlign{% endblock %}</title>
+<style>
+  :root { --ink:#1f2937; --muted:#6b7280; --line:#e5e7eb; --brand:#2f5bea; --bg:#f7f8fb; --danger:#b42318; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif; color:var(--ink); background:var(--bg); line-height:1.6; }
+  header.topbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 20px; background:#fff; border-bottom:1px solid var(--line); }
+  header.topbar .brand { font-weight:700; color:var(--ink); text-decoration:none; font-size:1.05rem; }
+  header.topbar nav { display:flex; gap:12px; align-items:center; font-size:.92rem; color:var(--muted); }
+  main.container { max-width:760px; margin:24px auto; padding:0 16px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+  h1 { font-size:1.45rem; margin:0 0 12px; }
+  h2 { font-size:1.1rem; margin:18px 0 8px; }
+  a { color:var(--brand); }
+  p { margin:8px 0; }
+  ul { padding-left:20px; }
+  input[type=text], input:not([type]), input[type=password], input[type=date], input[type=file] {
+    padding:8px 10px; border:1px solid #d1d5db; border-radius:8px; font-size:.95rem; max-width:100%; background:#fff; }
+  input[type=file] { padding:6px; }
+  input:focus { outline:2px solid #c7d7fe; border-color:var(--brand); }
+  button { padding:8px 14px; border:1px solid var(--brand); background:var(--brand); color:#fff; border-radius:8px; font-size:.92rem; cursor:pointer; margin-top:4px; }
+  button:hover { filter:brightness(1.05); }
+  button[name=action][value=end] { background:#fff; color:var(--brand); }
+  form { margin:12px 0; }
+  .msg-error, p > b:only-child { color:var(--danger); }
+  details.devnote { margin:0 0 16px; color:var(--muted); font-size:.85rem; }
+  details.devnote summary { cursor:pointer; }
+  @media (max-width: 520px) { header.topbar { flex-direction:column; align-items:flex-start; } }
+</style>
+</head>
 <body>
-<p><a href="{% url 'index' %}">[index]</a></p>
-<div style="border:1px solid #000">
-<b>설계 결정</b>
-<ul>{% block note %}{% endblock %}</ul>
-</div>
-<hr>
-{% block content %}{% endblock %}
+<header class="topbar">
+  <a class="brand" href="{% url 'index' %}">MeetAlign</a>
+  <nav>
+    {% if user.is_authenticated %}
+      <span>{{ user.username }}</span>
+      <a href="{% url 'logout' %}">로그아웃</a>
+    {% else %}
+      <a href="{% url 'login' %}">로그인</a>
+      <a href="{% url 'signup' %}">회원가입</a>
+    {% endif %}
+  </nav>
+</header>
+<main class="container">
+  <details class="devnote">
+    <summary>설계 메모</summary>
+    <ul>{% block note %}{% endblock %}</ul>
+  </details>
+  <section class="card">
+    {% block content %}{% endblock %}
+  </section>
+</main>
 </body>
 </html>

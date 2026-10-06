@@ -2,6 +2,7 @@ import os
 
 from django.contrib.auth import login, logout
 from django.core.exceptions import PermissionDenied
+from django.http import FileResponse, Http404
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.shortcuts import get_object_or_404, redirect, render
@@ -131,8 +132,7 @@ def meeting_detail(request, meeting_id):
             return render(request, "meetalign/meeting_detail.html", {"meeting": meeting, "error": error})
         if recording:
             meeting.recording = recording
-            meeting.processing_status = Meeting.STATUS_PROCESSING
-            meeting.save()
+            meeting.save(update_fields=["recording"])
             tasks.start_processing(meeting.id)
         if request.POST.get("action") == "end":
             Meeting.objects.filter(pk=meeting.pk).update(ended=True)
@@ -144,7 +144,16 @@ def meeting_detail(request, meeting_id):
 @login_required
 def meeting_result(request, meeting_id):
     meeting = _meeting(request, meeting_id)
+    tasks.recover_stuck(meeting)
     return render(request, "meetalign/meeting_result.html", {"meeting": meeting})
+
+
+@login_required
+def recording_file(request, meeting_id):
+    meeting = _meeting(request, meeting_id)
+    if not meeting.recording:
+        raise Http404
+    return FileResponse(meeting.recording.open("rb"), filename=os.path.basename(meeting.recording.name))
 
 
 @login_required

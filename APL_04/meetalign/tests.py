@@ -505,6 +505,8 @@ class BackgroundProcessingTests(TestCase):
     def test_result_page_shows_processing_message_and_refresh(self):
         self.meeting.processing_status = Meeting.STATUS_PROCESSING
         self.meeting.save()
+        tasks._active.add(self.meeting.id)
+        self.addCleanup(tasks._active.discard, self.meeting.id)
         r = self.client.get(reverse("meeting_result", args=[self.meeting.id]))
         self.assertContains(r, "http-equiv=\"refresh\"")
         self.assertContains(r, "녹음을 전사하고")
@@ -535,3 +537,52 @@ class BackgroundProcessingTests(TestCase):
         with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch("urllib.request.urlopen", side_effect=fake_urlopen):
             services._generate("hi")
         self.assertEqual(captured["body"]["options"]["num_ctx"], 16384)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
+class StuckAndFileAccessTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
+
+    def test_processing_without_live_worker_is_marked_failed(self):
+        self.meeting.processing_status = Meeting.STATUS_PROCESSING
+        self.meeting.save()
+        r = self.client.get(reverse("meeting_result", args=[self.meeting.id]))
+        self.assertContains(r, "녹음 처리에 실패했습니다.")
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_FAILED)
+
+    def test_processing_with_live_worker_is_left_alone(self):
+        self.meeting.processing_status = Meeting.STATUS_PROCESSING
+        self.meeting.save()
+        tasks._active.add(self.meeting.id)
+        self.addCleanup(tasks._active.discard, self.meeting.id)
+        self.client.get(reverse("meeting_result", args=[self.meeting.id]))
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_PROCESSING)
+
+    def test_recording_download_requires_login(self):
+        self.meeting.recording.save("a.wav", SimpleUploadedFile("a.wav", b"RIFF"), save=True)
+        self.client.logout()
+        r = self.client.get(reverse("recording_file", args=[self.meeting.id]))
+        self.assertEqual(r.status_code, 302)
+
+    def test_member_can_download_recording(self):
+        self.meeting.recording.save("a.wav", SimpleUploadedFile("a.wav", b"RIFFDATA"), save=True)
+        r = self.client.get(reverse("recording_file", args=[self.meeting.id]))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(b"".join(r.streaming_content), b"RIFFDATA")
+
+    def test_outsider_cannot_download_recording(self):
+        self.meeting.recording.save("a.wav", SimpleUploadedFile("a.wav", b"RIFF"), save=True)
+        outsider = User.objects.create_user("c", password="pw12345!")
+        client = Client()
+        client.force_login(outsider)
+        self.assertEqual(client.get(reverse("recording_file", args=[self.meeting.id])).status_code, 404)
+
+    def test_no_recording_returns_404(self):
+        self.assertEqual(self.client.get(reverse("recording_file", args=[self.meeting.id])).status_code, 404)
