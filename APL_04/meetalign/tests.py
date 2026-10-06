@@ -10,7 +10,7 @@ from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from . import services
+from . import services, views
 from .models import Answer, CheckQuestion, Meeting, Question, Team
 
 
@@ -303,3 +303,64 @@ class LocalSTTTests(TestCase):
             self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
         self.meeting.refresh_from_db()
         self.assertEqual(self.meeting.record, "전사된 회의 내용")
+
+
+class SecurityFixTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
+
+    def _login_with_next(self, next_url):
+        self.client.logout()
+        return self.client.post(reverse("login") + "?next=" + next_url, {"username": "a", "password": "pw12345!"})
+
+    def test_login_ignores_external_next_url(self):
+        self.assertRedirects(self._login_with_next("https://evil.example/"), reverse("index"), fetch_redirect_response=False)
+
+    def test_login_follows_internal_next_url(self):
+        target = reverse("meeting_list", args=[self.team.id])
+        self.assertRedirects(self._login_with_next(target), target, fetch_redirect_response=False)
+
+    def test_invalid_deadline_is_rejected_with_message(self):
+        for raw in ["not-a-date", "2030-13-01"]:
+            r = self.client.post(reverse("meeting_create", args=[self.team.id]), {"title": "bad", "deadline": raw})
+            self.assertEqual(r.status_code, 200)
+            self.assertContains(r, "마감일 형식이 올바르지 않습니다.")
+        self.assertFalse(Meeting.objects.filter(title="bad").exists())
+
+    @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+    def test_unsupported_recording_format_is_rejected(self):
+        file = SimpleUploadedFile("evil.exe", b"MZ", content_type="application/octet-stream")
+        r = self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
+        self.assertContains(r, "지원하지 않는 녹음 형식")
+        self.meeting.refresh_from_db()
+        self.assertFalse(self.meeting.recording)
+
+    @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+    def test_oversized_recording_is_rejected(self):
+        file = SimpleUploadedFile("a.wav", b"RIFF", content_type="audio/wav")
+        with patch.object(views, "MAX_RECORDING_BYTES", 2):
+            r = self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
+        self.assertContains(r, "너무 큽니다")
+        self.meeting.refresh_from_db()
+        self.assertFalse(self.meeting.recording)
+
+    def test_anonymous_question_blocked_after_meeting_ends(self):
+        self.meeting.ended = True
+        self.meeting.save()
+        r = self.client.post(reverse("chat", args=[self.meeting.id]), {"mode": "anon", "text": "late"})
+        self.assertContains(r, "종료된 회의에는 익명 질문을 보낼 수 없습니다.")
+        self.assertFalse(Question.objects.filter(meeting=self.meeting).exists())
+
+    @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+    def test_recording_blocked_after_meeting_ends(self):
+        self.meeting.ended = True
+        self.meeting.save()
+        file = SimpleUploadedFile("a.wav", b"RIFF", content_type="audio/wav")
+        r = self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
+        self.assertContains(r, "종료된 회의에는 녹음을 올릴 수 없습니다.")
+        self.meeting.refresh_from_db()
+        self.assertFalse(self.meeting.recording)

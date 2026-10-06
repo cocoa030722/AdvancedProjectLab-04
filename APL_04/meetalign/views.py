@@ -1,11 +1,18 @@
+import os
+
 from django.contrib.auth import login, logout
 from django.core.exceptions import PermissionDenied
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils.dateparse import parse_date
+from django.utils.http import url_has_allowed_host_and_scheme
 
 from . import services
 from .models import Answer, CheckQuestion, Meeting, Question, Team
+
+ALLOWED_RECORDING_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm", ".mp4", ".flac"}
+MAX_RECORDING_BYTES = 500 * 1024 * 1024
 
 
 def index(request):
@@ -29,7 +36,10 @@ def login_view(request):
         form = AuthenticationForm(request, data=request.POST)
         if form.is_valid():
             login(request, form.get_user())
-            return redirect(request.GET.get("next") or "index")
+            next_url = request.GET.get("next", "")
+            if url_has_allowed_host_and_scheme(next_url, allowed_hosts={request.get_host()}, require_https=request.is_secure()):
+                return redirect(next_url)
+            return redirect("index")
     else:
         form = AuthenticationForm(request)
     return render(request, "meetalign/login.html", {"form": form})
@@ -75,21 +85,50 @@ def meeting_list(request, team_id):
     return render(request, "meetalign/meeting_list.html", {"team": team, "meetings": team.meetings.all()})
 
 
+def _parse_deadline(raw):
+    if not raw:
+        return None, None
+    try:
+        parsed = parse_date(raw)
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        return None, "마감일 형식이 올바르지 않습니다."
+    return parsed, None
+
+
+def _recording_error(recording):
+    if os.path.splitext(recording.name)[1].lower() not in ALLOWED_RECORDING_EXTENSIONS:
+        return "지원하지 않는 녹음 형식입니다 (mp3, m4a, wav, ogg, webm, mp4, flac)."
+    if recording.size > MAX_RECORDING_BYTES:
+        return "녹음 파일이 너무 큽니다 (500MB 이하만 가능)."
+    return None
+
+
 @login_required
 def meeting_create(request, team_id):
     team = _team(request, team_id)
+    error = None
     if request.method == "POST" and request.POST.get("title", "").strip():
-        deadline = request.POST.get("deadline") or None
-        meeting = Meeting.objects.create(team=team, title=request.POST["title"].strip(), deadline=deadline, host=request.user)
-        return redirect("meeting_detail", meeting_id=meeting.id)
-    return render(request, "meetalign/meeting_create.html", {"team": team})
+        deadline, error = _parse_deadline(request.POST.get("deadline", "").strip())
+        if error is None:
+            meeting = Meeting.objects.create(team=team, title=request.POST["title"].strip(), deadline=deadline, host=request.user)
+            return redirect("meeting_detail", meeting_id=meeting.id)
+    return render(request, "meetalign/meeting_create.html", {"team": team, "error": error})
 
 
 @login_required
 def meeting_detail(request, meeting_id):
     meeting = _meeting(request, meeting_id)
+    error = None
     if request.method == "POST":
         recording = request.FILES.get("recording")
+        if recording and meeting.ended:
+            error = "종료된 회의에는 녹음을 올릴 수 없습니다."
+        elif recording:
+            error = _recording_error(recording)
+        if error:
+            return render(request, "meetalign/meeting_detail.html", {"meeting": meeting, "error": error})
         if recording:
             meeting.recording = recording
             meeting.save()
@@ -115,13 +154,17 @@ def chat(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     mode = request.POST.get("mode") or request.GET.get("mode", "llm")
     reply = ""
+    error = None
     if request.method == "POST" and request.POST.get("text", "").strip():
         text = request.POST["text"].strip()
         if mode == "anon":
-            Question.objects.create(meeting=meeting, text=text)
+            if meeting.ended:
+                error = "종료된 회의에는 익명 질문을 보낼 수 없습니다."
+            else:
+                Question.objects.create(meeting=meeting, text=text)
         else:
             reply = services.chat_reply(meeting, text)
-    return render(request, "meetalign/chat.html", {"meeting": meeting, "mode": mode, "reply": reply})
+    return render(request, "meetalign/chat.html", {"meeting": meeting, "mode": mode, "reply": reply, "error": error})
 
 
 def _require_host(meeting, user):
