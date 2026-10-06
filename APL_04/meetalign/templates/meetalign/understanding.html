@@ -1,15 +1,20 @@
 {% extends "meetalign/base.html" %}
-{% block note %}<li>개별 이해도 검증: 질문은 지금은 고정 문항(추후 LLM이 생성)이지만, 답변은 사용자별로 저장되어 나중에 팀원 간 비교에 쓰인다.</li>{% endblock %}
+{% block note %}<li>이해도 검증(3.5): 질문에 각자 답한다. 답변은 사용자별로 저장되어 팀원 간 비교에 쓰인다.</li>{% endblock %}
 {% block content %}
-<h1>{{ meeting.title }} 이해도 검증</h1>
-<p><a href="{% url 'meeting_detail' meeting.id %}">회의로 돌아가기</a></p>
-<form method="post">{% csrf_token %}
-{% for q, ans in rows %}
-<p>{{ forloop.counter }}. {{ q.text }}<br>
-<input name="q{{ q.id }}" value="{{ ans }}"></p>
-{% empty %}<p>아직 질문이 없습니다. 회의록이 만들어지면 질문이 생성됩니다.</p>
-{% endfor %}
-<button>답변 저장</button>
-</form>
-<p><a href="{% url 'verification' meeting.id %}">이해도 검증 결과 보기</a></p>
+<div class="card">
+  <div class="page-head">
+    <div class="crumb"><a href="{% url 'meeting_detail' meeting.id %}">{{ meeting.title }}</a></div>
+    <h1>이해도 질문에 답하기</h1>
+  </div>
+  <form method="post">{% csrf_token %}
+    {% for q, ans in rows %}
+      <div class="field"><label for="q{{ q.id }}">{{ forloop.counter }}. {{ q.text }}</label>
+        <input id="q{{ q.id }}" name="q{{ q.id }}" value="{{ ans }}" placeholder="내가 이해한 내용을 적어 주세요"></div>
+    {% empty %}
+      <div class="empty">아직 질문이 없습니다. 회의록이 만들어지면 질문이 생성됩니다.</div>
+    {% endfor %}
+    {% if rows %}<div class="row" style="margin-top:8px"><button>답변 저장</button></div>{% endif %}
+  </form>
+  <p class="muted" style="margin-top:18px"><a href="{% url 'verification' meeting.id %}">이해도 검증 결과 보기 (3.6)</a></p>
+</div>
 {% endblock %}

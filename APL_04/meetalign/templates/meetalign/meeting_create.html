@@ -1,7 +1,15 @@
 {% extends "meetalign/base.html" %}
-{% block note %}<li>회의는 제목만으로 생성한다.</li>{% endblock %}
+{% block note %}<li>회의는 제목과 마감일로 만든다. 마감일은 선택 사항이다.</li>{% endblock %}
 {% block content %}
-<h1>{{ team.name }} 회의 생성</h1>
-{% if error %}<p><b>{{ error }}</b></p>{% endif %}
-<form method="post">{% csrf_token %}<input name="title" placeholder="회의 제목"> 마감일 <input type="date" name="deadline"><button>생성</button></form>
+<div class="card" style="max-width:520px">
+  <div class="page-head"><div class="crumb"><a href="{% url 'meeting_list' team.id %}">{{ team.name }}</a></div><h1>회의 만들기</h1></div>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post">{% csrf_token %}
+    <div class="field"><label for="title">회의 제목</label>
+      <input id="title" name="title" placeholder="예: 로그인 화면 시안 회의"></div>
+    <div class="field"><label for="deadline">마감일 (선택)</label>
+      <input id="deadline" type="date" name="deadline"></div>
+    <div class="row" style="margin-top:6px"><button type="submit">회의 만들기</button></div>
+  </form>
+</div>
 {% endblock %}
