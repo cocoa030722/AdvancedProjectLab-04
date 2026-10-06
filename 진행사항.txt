@@ -6,7 +6,9 @@
 1. meetalign/models.py
 ----------------------
 - Team: 팀 (name, members — User와 M2M)
-- Meeting: 회의 (team FK, title, created_at, ended, deadline, recording, record)
+- Meeting: 회의 (team FK, title, created_at, ended, deadline, host, recording, record)
+  host는 주최자(회의를 만든 사람, 기본값). 익명 질문함(inbox)과 답변(answers)은 주최자만 쓸 수 있다.
+  host가 비어 있는 옛날 회의는 팀원 누구나 쓸 수 있게 열어둔다.
   deadline은 마감일(DateField, 선택). is_due_tomorrow 속성이 마감 하루 전이면 True.
   회의 목록에 [D-1 마감], 회의 상세에 마감 안내문을 띄운다. 실제 알림 발송은 없음.
   record는 회의록 텍스트 저장 자리(TextField). 지금은 값을 채우는 기능이 없고,
@@ -45,6 +47,10 @@
 - _find_discrepancies (불일치 탐지 틀)
   질문별로 팀원 답변이 서로 다르면 묶어서 understanding 화면 하단에 보여준다.
   지금은 문자열 비교(strip 후). 나중에 LLM 의미 비교 + 회의록 대조로 교체할 자리.
+
+- meetalign/services.py (LLM 연결 지점)
+  check_questions / chat_reply / is_consistent. 지금은 현재 동작(고정 문항, 가짜 응답, 문자열 비교)을
+  그대로 돌려준다. 제공자가 정해지면 이 함수들만 바꾸면 된다.
 
 - chat (대화창)
   mode=anon이면 Question을 익명으로 생성, mode=llm이면 고정된 가짜 응답 문자열을
@@ -103,6 +109,9 @@ default_auto_field를 BigAutoField로 명시했다. 이게 없으면 Django 버�
   사용자를 로그인 페이지로 보낼 수 있도록. MEDIA_URL, MEDIA_ROOT 추가 — 업로드된
   녹음파일이 실제로 저장될 경로.
 - urls.py: DEBUG일 때 media 파일을 서빙하도록 추가 (로컬 개발용).
+- 배포 설정: SECRET_KEY(DJANGO_SECRET_KEY), DEBUG(DJANGO_DEBUG, 기본 1=켜짐),
+  ALLOWED_HOSTS(DJANGO_ALLOWED_HOSTS, 쉼표 구분, 기본 localhost,127.0.0.1) 환경변수로 분리.
+  배포할 때는 DJANGO_DEBUG=0 과 실제 SECRET_KEY를 꼭 설정할 것.
 
 
 7. meetalign/tests.py
@@ -113,7 +122,7 @@ default_auto_field를 BigAutoField로 명시했다. 이게 없으면 Django 버�
   생성·답변, 이해도 검증 질문 자동 생성(중복 생성 안 됨), 답변 저장·재제출 시
   수정되는지, 같은 질문에 여러 사용자가 각자 답변을 가질 수 있는지(핵심 검증),
   녹음파일 업로드 시 실제로 저장되는지
-- 총 27개, 전부 통과 (D-1 마감 테스트 3개 포함)
+- 총 31개, 전부 통과 (주최자 권한 테스트 4개 포함)
 
 
 PR 히스토리
@@ -128,11 +137,11 @@ PR 히스토리
 
 아직 안 된 것 (다음 작업 후보, 우선순위 순)
 ----------------------
-1. STT 연동 (녹음 → 텍스트)
-2. LLM으로 회의록 생성 (meeting.record를 채움, 지금은 값 입력 경로가 없음)
-3. 이해도 검증 질문 자동 생성 (지금 고정 2문항 → LLM이 전사본 기반으로 생성)
-4. 불일치 탐지 로직 (틀은 완료, 문자열 비교만 됨 / 남은 것: 회의록과 의미 비교하는 LLM 로직)
+1. STT 연동 (녹음 → 텍스트) — API 제공자 결정 필요
+2. LLM으로 회의록 생성 (meeting.record를 채움) — API 제공자 결정 필요
+3. 이해도 검증 질문 자동 생성 — services.check_questions 교체 (지금 고정 2문항)
+4. 불일치 탐지 의미 비교 — services.is_consistent 교체 (지금 문자열 비교)
    (핵심 기능: 팀원별 답변과 회의록을 비교해 다르게 이해한 부분을 짚어주는 것)
-5. 익명 질문/LLM 채팅 응답 실제화 (지금 고정 가짜 응답)
-6. 배포용 설정 정리 (SECRET_KEY, DEBUG, ALLOWED_HOSTS를 환경변수로 분리) —
-   지금은 로컬 개발 단계라 급하지 않음
+5. 익명 질문 LLM 채팅 — services.chat_reply 교체 (지금 고정 가짜 응답)
+
+※ 3~5번은 meetalign/services.py의 함수를 실제 API 호출로 바꾸면 된다. 호출하는 쪽은 이미 연결돼 있다.
