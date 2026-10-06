@@ -364,3 +364,42 @@ class SecurityFixTests(TestCase):
         self.assertContains(r, "종료된 회의에는 녹음을 올릴 수 없습니다.")
         self.meeting.refresh_from_db()
         self.assertFalse(self.meeting.recording)
+
+
+class MeetingSummaryTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
+
+    def test_summarize_returns_transcript_when_llm_disabled(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(services.summarize("원문"), "원문")
+
+    def test_summarize_uses_llm_output(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="[결정 사항]\n- A안") as gen:
+            self.assertEqual(services.summarize("원문"), "[결정 사항]\n- A안")
+        self.assertIn("원문", gen.call_args[0][0])
+
+    def test_summarize_falls_back_to_transcript_on_failure(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", side_effect=OSError("down")):
+            self.assertEqual(services.summarize("원문"), "원문")
+
+    @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+    def test_upload_stores_transcript_and_summary(self):
+        file = SimpleUploadedFile("a.wav", b"RIFF", content_type="audio/wav")
+        with patch.object(services, "transcribe", return_value="원문 전사"), \
+             patch.object(services, "summarize", return_value="요약본"):
+            self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.transcript, "원문 전사")
+        self.assertEqual(self.meeting.record, "요약본")
+
+    def test_summary_page_shows_transcript_details(self):
+        self.meeting.transcript = "전사 원문 내용"
+        self.meeting.save()
+        r = self.client.get(reverse("summary", args=[self.meeting.id]))
+        self.assertContains(r, "전사 원문 보기")
+        self.assertContains(r, "전사 원문 내용")

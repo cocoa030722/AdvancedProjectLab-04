@@ -53,6 +53,10 @@
   회의록(record)이 있을 때만 질문 생성과 회의록 기반 답변을 하고, 없거나 환경변수가 없으면 기존
   가짜 동작을 그대로 쓴다. Ollama 연결이 실패하면 가짜 문항 또는 안내 문구로 대체된다.
   is_consistent(불일치 비교)는 아직 문자열 비교다.
+- meetalign/services.py의 summarize (회의록 요약)
+  OLLAMA_MODEL이 켜져 있으면 전사본을 [안건], [결정 사항], [할 일] 형식으로 정리해 회의록(record)에 넣는다.
+  꺼져 있거나 실패하면 전사 원문을 그대로 쓴다. 전사 원문은 transcript 필드에 따로 저장한다(0008).
+  summary 화면에서 '전사 원문 보기'로 원문을 확인할 수 있다.
 - meetalign/services.py의 transcribe (STT)
   MLX_WHISPER_MODEL 환경변수가 있을 때만 로컬 mlx-whisper로 녹음을 한국어 전사한다.
   녹음을 올리면 전사 결과가 meeting.record에 저장된다(지금은 전사문 그대로, 요약은 다음 단계).
@@ -137,7 +141,7 @@ default_auto_field를 BigAutoField로 명시했다. 이게 없으면 Django 버�
   생성·답변, 이해도 검증 질문 자동 생성(중복 생성 안 됨), 답변 저장·재제출 시
   수정되는지, 같은 질문에 여러 사용자가 각자 답변을 가질 수 있는지(핵심 검증),
   녹음파일 업로드 시 실제로 저장되는지
-- 총 47개, 전부 통과 (주최자 권한 4개, 로컬 LLM 연결 5개, STT 4개, 보안·입력 검증 7개 포함)
+- 총 52개, 전부 통과 (주최자 권한 4개, 로컬 LLM 연결 5개, STT 4개, 보안·입력 검증 7개 포함)
 
 
 PR 히스토리
@@ -152,10 +156,9 @@ PR 히스토리
 
 아직 안 된 것 (다음 작업 후보, 우선순위 순)
 ----------------------
-1. 회의록 요약 생성 (지금은 전사문 그대로 record에 저장, LLM으로 요약 정리 필요)
-2. 이해도 검증 질문 자동 생성 — services.check_questions 교체 (지금 고정 2문항)
-3. 불일치 탐지 의미 비교 — services.is_consistent 교체 (지금 문자열 비교)
+1. 이해도 검증 질문 자동 생성 — services.check_questions 교체 (지금 고정 2문항)
+2. 불일치 탐지 의미 비교 — services.is_consistent 교체 (지금 문자열 비교)
    (핵심 기능: 팀원별 답변과 회의록을 비교해 다르게 이해한 부분을 짚어주는 것)
-4. 익명 질문 LLM 채팅 — services.chat_reply 교체 (지금 고정 가짜 응답)
+3. 익명 질문 LLM 채팅 — services.chat_reply 교체 (지금 고정 가짜 응답)
 
 ※ 3~5번은 meetalign/services.py의 함수를 실제 API 호출로 바꾸면 된다. 호출하는 쪽은 이미 연결돼 있다.
