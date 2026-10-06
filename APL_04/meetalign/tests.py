@@ -157,3 +157,23 @@ class PrototypeFlowTests(TestCase):
         Answer.objects.create(question=question, user=self.user, text="A의 이해")
         Answer.objects.create(question=question, user=other, text="B의 이해")
         self.assertEqual(question.answers.count(), 2)
+
+    def test_discrepancy_flagged_when_answers_differ(self):
+        self.client.get(reverse("understanding", args=[self.meeting.id]))
+        other = User.objects.create_user("b")
+        question = CheckQuestion.objects.filter(meeting=self.meeting).first()
+        Answer.objects.create(question=question, user=self.user, text="A안")
+        Answer.objects.create(question=question, user=other, text="B안")
+        r = self.client.get(reverse("understanding", args=[self.meeting.id]))
+        self.assertContains(r, "b: B안")
+        self.assertContains(r, "a: A안")
+        self.assertNotContains(r, "엇갈린 답변이 없습니다.")
+
+    def test_no_discrepancy_when_answers_match(self):
+        self.client.get(reverse("understanding", args=[self.meeting.id]))
+        other = User.objects.create_user("b")
+        question = CheckQuestion.objects.filter(meeting=self.meeting).first()
+        Answer.objects.create(question=question, user=self.user, text="같은 답")
+        Answer.objects.create(question=question, user=other, text="같은 답")
+        r = self.client.get(reverse("understanding", args=[self.meeting.id]))
+        self.assertContains(r, "엇갈린 답변이 없습니다.")
