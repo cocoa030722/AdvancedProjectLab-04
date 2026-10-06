@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -10,7 +11,7 @@ from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from . import services, views
+from . import services, tasks, views
 from .models import Answer, CheckQuestion, Meeting, Question, Team
 
 
@@ -54,6 +55,7 @@ class AuthTests(TestCase):
         self.assertRedirects(r, "%s?next=%s" % (reverse("login"), reverse("meeting_list", args=[team.id])))
 
 
+@override_settings(BACKGROUND_RECORDING=False)
 class PrototypeFlowTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user("a", password="pw12345!")
@@ -270,6 +272,7 @@ class LocalLLMTests(TestCase):
         gen.assert_not_called()
 
 
+@override_settings(BACKGROUND_RECORDING=False)
 class LocalSTTTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user("a", password="pw12345!")
@@ -368,6 +371,7 @@ class SecurityFixTests(TestCase):
         self.assertFalse(self.meeting.recording)
 
 
+@override_settings(BACKGROUND_RECORDING=False)
 class MeetingSummaryTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user("a", password="pw12345!")
@@ -470,3 +474,64 @@ class QuestionTimingTests(TestCase):
             self.client.get(reverse("understanding", args=[self.meeting.id]))
             self.client.get(reverse("understanding", args=[self.meeting.id]))
         self.assertEqual(list(CheckQuestion.objects.filter(meeting=self.meeting).values_list("text", flat=True)), ["질문1", "질문2"])
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
+class BackgroundProcessingTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
+
+    def _upload(self):
+        file = SimpleUploadedFile("a.wav", b"RIFF", content_type="audio/wav")
+        return self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
+
+    def test_upload_marks_processing_then_done(self):
+        with patch.object(services, "transcribe", return_value="전사"), patch.object(services, "summarize", return_value="요약"):
+            self._upload()
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_DONE)
+        self.assertEqual(self.meeting.record, "요약")
+
+    def test_failure_marks_failed(self):
+        with patch.object(services, "transcribe", side_effect=RuntimeError("boom")):
+            self._upload()
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_FAILED)
+
+    def test_result_page_shows_processing_message_and_refresh(self):
+        self.meeting.processing_status = Meeting.STATUS_PROCESSING
+        self.meeting.save()
+        r = self.client.get(reverse("meeting_result", args=[self.meeting.id]))
+        self.assertContains(r, "http-equiv=\"refresh\"")
+        self.assertContains(r, "녹음을 전사하고")
+
+    def test_background_mode_starts_a_thread_instead_of_running_inline(self):
+        with override_settings(BACKGROUND_RECORDING=True), patch.object(tasks.threading, "Thread") as thread, \
+             patch.object(tasks, "process_recording") as inline:
+            tasks.start_processing(self.meeting.id)
+        thread.assert_called_once()
+        thread.return_value.start.assert_called_once()
+        inline.assert_not_called()
+
+    def test_ollama_request_sets_context_window(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self):
+                return b'{"response": "ok"}'
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            services._generate("hi")
+        self.assertEqual(captured["body"]["options"]["num_ctx"], 16384)

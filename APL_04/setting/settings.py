@@ -138,6 +138,8 @@ MAILERS = {
 }
 
 
+BACKGROUND_RECORDING = True
+
 LOGIN_URL = 'login'
 LOGIN_REDIRECT_URL = 'index'
 LOGOUT_REDIRECT_URL = 'index'
