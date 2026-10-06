@@ -6,7 +6,9 @@
 1. meetalign/models.py
 ----------------------
 - Team: 팀 (name, members — User와 M2M)
-- Meeting: 회의 (team FK, title, created_at, ended, recording, record)
+- Meeting: 회의 (team FK, title, created_at, ended, deadline, recording, record)
+  deadline은 마감일(DateField, 선택). is_due_tomorrow 속성이 마감 하루 전이면 True.
+  회의 목록에 [D-1 마감], 회의 상세에 마감 안내문을 띄운다. 실제 알림 발송은 없음.
   record는 회의록 텍스트 저장 자리(TextField). 지금은 값을 채우는 기능이 없고,
   STT/LLM 작업에서 채움. summary 화면은 이 값을 그대로 보여주거나 없으면 안내문을 띄움.
   recording은 실제로 업로드된 녹음파일을 저장하는 FileField. STT/LLM 처리는
@@ -111,7 +113,7 @@ default_auto_field를 BigAutoField로 명시했다. 이게 없으면 Django 버�
   생성·답변, 이해도 검증 질문 자동 생성(중복 생성 안 됨), 답변 저장·재제출 시
   수정되는지, 같은 질문에 여러 사용자가 각자 답변을 가질 수 있는지(핵심 검증),
   녹음파일 업로드 시 실제로 저장되는지
-- 총 24개, 전부 통과 (회의록 필드 테스트 2개, 불일치 탐지 테스트 2개 포함)
+- 총 27개, 전부 통과 (D-1 마감 테스트 3개 포함)
 
 
 PR 히스토리
@@ -132,6 +134,5 @@ PR 히스토리
 4. 불일치 탐지 로직 (틀은 완료, 문자열 비교만 됨 / 남은 것: 회의록과 의미 비교하는 LLM 로직)
    (핵심 기능: 팀원별 답변과 회의록을 비교해 다르게 이해한 부분을 짚어주는 것)
 5. 익명 질문/LLM 채팅 응답 실제화 (지금 고정 가짜 응답)
-6. D-1 리마인더 알림
-7. 배포용 설정 정리 (SECRET_KEY, DEBUG, ALLOWED_HOSTS를 환경변수로 분리) —
+6. 배포용 설정 정리 (SECRET_KEY, DEBUG, ALLOWED_HOSTS를 환경변수로 분리) —
    지금은 로컬 개발 단계라 급하지 않음

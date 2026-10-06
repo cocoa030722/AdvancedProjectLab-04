@@ -4,7 +4,7 @@
 <h1>{{ team.name }} 회의 목록</h1>
 <p><a href="{% url 'meeting_create' team.id %}">회의 생성</a></p>
 <ul>
-{% for m in meetings %}<li><a href="{% url 'meeting_detail' m.id %}">{{ m.title }}</a>{% if m.ended %} (종료){% endif %}</li>
+{% for m in meetings %}<li><a href="{% url 'meeting_detail' m.id %}">{{ m.title }}</a>{% if m.ended %} (종료){% endif %}{% if m.is_due_tomorrow %} [D-1 마감]{% endif %}</li>
 {% empty %}<li>회의가 없습니다.</li>{% endfor %}
 </ul>
 {% endblock %}
