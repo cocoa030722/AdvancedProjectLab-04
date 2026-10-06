@@ -7,6 +7,7 @@
 {% for q, ans in rows %}
 <p>{{ forloop.counter }}. {{ q.text }}<br>
 <input name="q{{ q.id }}" value="{{ ans }}"></p>
+{% empty %}<p>아직 질문이 없습니다. 회의록이 만들어지면 질문이 생성됩니다.</p>
 {% endfor %}
 <button>답변 저장</button>
 </form>

@@ -210,7 +210,7 @@ def _find_discrepancies(meeting):
 @login_required
 def understanding(request, meeting_id):
     meeting = _meeting(request, meeting_id)
-    if not meeting.check_questions.exists():
+    if meeting.record and not meeting.check_questions.exists():
         for order, text in enumerate(services.check_questions(meeting)):
             CheckQuestion.objects.create(meeting=meeting, text=text, order=order)
     user = request.user
