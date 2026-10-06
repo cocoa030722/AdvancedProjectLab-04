@@ -13,6 +13,7 @@
 <input name="text"><button>전송</button>
 </form>
 {% if reply %}<p>{{ reply }}</p>{% endif %}
-{% if mode == "anon" and request.method == "POST" %}<p>익명 질문이 전송되었습니다.</p>{% endif %}
+{% if error %}<p><b>{{ error }}</b></p>{% endif %}
+{% if mode == "anon" and request.method == "POST" and not error %}<p>익명 질문이 전송되었습니다.</p>{% endif %}
 <p><a href="{% url 'inbox' meeting.id %}">익명 질문 받는 화면</a></p>
 {% endblock %}
