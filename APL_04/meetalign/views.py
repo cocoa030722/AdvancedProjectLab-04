@@ -1,11 +1,13 @@
 import os
+from datetime import timedelta
 
 from django.contrib.auth import login, logout
 from django.core.exceptions import PermissionDenied
-from django.http import FileResponse, Http404
+from django.http import FileResponse, Http404, HttpResponse
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.utils.http import url_has_allowed_host_and_scheme
 
@@ -18,7 +20,10 @@ MAX_RECORDING_BYTES = 500 * 1024 * 1024
 
 def index(request):
     teams = request.user.teams.all() if request.user.is_authenticated else []
-    return render(request, "meetalign/index.html", {"teams": teams})
+    due_soon = []
+    if request.user.is_authenticated:
+        due_soon = Meeting.objects.filter(team__members=request.user, deadline=timezone.localdate() + timedelta(days=1)).select_related("team")
+    return render(request, "meetalign/index.html", {"teams": teams, "due_soon": due_soon})
 
 
 def signup(request):
@@ -136,7 +141,7 @@ def meeting_detail(request, meeting_id):
             tasks.start_processing(meeting.id)
         if request.POST.get("action") == "end":
             Meeting.objects.filter(pk=meeting.pk).update(ended=True)
-            return redirect("answers", meeting_id=meeting.id)
+            return redirect("understanding", meeting_id=meeting.id)
         return redirect("meeting_result", meeting_id=meeting.id)
     return render(request, "meetalign/meeting_detail.html", {"meeting": meeting})
 
@@ -229,8 +234,23 @@ def understanding(request, meeting_id):
         return redirect("understanding", meeting_id=meeting.id)
     my_answers = {a.question_id: a.text for a in Answer.objects.filter(question__meeting=meeting, user=user)}
     rows = [(q, my_answers.get(q.id, "")) for q in questions]
-    return render(request, "meetalign/understanding.html", {
+    return render(request, "meetalign/understanding.html", {"meeting": meeting, "rows": rows})
+
+
+@login_required
+def verification(request, meeting_id):
+    meeting = _meeting(request, meeting_id)
+    return render(request, "meetalign/verification.html", {
         "meeting": meeting,
-        "rows": rows,
         "discrepancies": _find_discrepancies(meeting),
     })
+
+
+@login_required
+def record_file(request, meeting_id):
+    meeting = _meeting(request, meeting_id)
+    if not meeting.record:
+        raise Http404
+    response = HttpResponse(meeting.record, content_type="text/plain; charset=utf-8")
+    response["Content-Disposition"] = 'attachment; filename="meeting_record.txt"'
+    return response

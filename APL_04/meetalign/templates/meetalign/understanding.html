@@ -11,12 +11,5 @@
 {% endfor %}
 <button>답변 저장</button>
 </form>
-<h2>답변이 엇갈린 질문</h2>
-{% if discrepancies %}
-<ul>
-{% for q, answers in discrepancies %}<li>{{ q.text }}
-<ul>{% for a in answers %}<li>{{ a.user.username }}: {{ a.text }}</li>{% endfor %}</ul></li>
-{% endfor %}
-</ul>
-{% else %}<p>엇갈린 답변이 없습니다.</p>{% endif %}
+<p><a href="{% url 'verification' meeting.id %}">이해도 검증 결과 보기</a></p>
 {% endblock %}

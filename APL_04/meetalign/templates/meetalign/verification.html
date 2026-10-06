@@ -1,0 +1,14 @@
+{% extends "meetalign/base.html" %}
+{% block note %}<li>이해도 검증 결과: 팀원 답변이 서로 다른 질문을 보여준다. 차단하지 않고 참고용으로만 표시한다.</li>{% endblock %}
+{% block content %}
+<h1>{{ meeting.title }} 이해도 검증 결과</h1>
+<p><a href="{% url 'understanding' meeting.id %}">질문 답변으로 돌아가기</a></p>
+{% if discrepancies %}
+<h2>답변이 엇갈린 질문</h2>
+<ul>
+{% for q, answers in discrepancies %}<li>{{ q.text }}
+<ul>{% for a in answers %}<li>{{ a.user.username }}: {{ a.text }}</li>{% endfor %}</ul></li>
+{% endfor %}
+</ul>
+{% else %}<p>엇갈린 답변이 없습니다.</p>{% endif %}
+{% endblock %}

@@ -9,6 +9,12 @@
 <p>{{ user.username }} 님</p>
 <p><a href="{% url 'logout' %}">로그아웃</a></p>
 <p><a href="{% url 'team_join' %}">팀 생성/참여</a></p>
+{% if due_soon %}
+<h2>내일 마감인 회의</h2>
+<ul>
+{% for m in due_soon %}<li><b>[D-1 마감]</b> {{ m.team.name }} - <a href="{% url 'meeting_detail' m.id %}">{{ m.title }}</a></li>{% endfor %}
+</ul>
+{% endif %}
 <h2>내 팀</h2>
 <ul>
 {% for team in teams %}<li>{{ team.name }} - <a href="{% url 'meeting_list' team.id %}">회의 목록</a></li>
