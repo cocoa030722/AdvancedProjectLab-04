@@ -15,8 +15,22 @@
   </div>
   {% if meeting.is_due_tomorrow %}<div class="notice"><b>마감 D-1:</b> 내일 마감입니다.</div>{% endif %}
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
-  {% if meeting.recording %}
-    <p class="muted">업로드된 녹음 · <a href="{% url 'recording_file' meeting.id %}">받기</a></p>
+  {% if meeting.recordings.all %}
+    <h2 style="margin-top:0">업로드된 녹음 ({{ meeting.recordings.count }})</h2>
+    <ul class="plain" style="margin-bottom:18px">
+    {% for rec in meeting.recordings.all %}
+      <li class="item">
+        <div>
+          <span class="title">{{ rec.filename }}</span>
+          {% if rec.status == "processing" %}<span class="badge processing">전사 중</span>
+          {% elif rec.status == "done" %}<span class="badge done">완료</span>
+          {% else %}<span class="badge failed">실패</span>{% endif %}
+          <div class="meta">{{ rec.created_at|date:"Y.m.d H:i" }}</div>
+        </div>
+        <a class="btn secondary" href="{% url 'recording_file' meeting.id rec.id %}">받기</a>
+      </li>
+    {% endfor %}
+    </ul>
   {% endif %}
   {% if meeting.ended %}
     <div class="notice">회의가 종료되었습니다. 녹음 업로드와 익명 질문은 더 이상 받지 않습니다. 이해도 질문에 답해 주세요.</div>

@@ -3,6 +3,7 @@ from datetime import timedelta
 
 from django.contrib.auth import login, logout
 from django.core.exceptions import PermissionDenied
+from django.db import IntegrityError, transaction
 from django.http import FileResponse, Http404, HttpResponse
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
@@ -12,7 +13,7 @@ from django.utils.dateparse import parse_date
 from django.utils.http import url_has_allowed_host_and_scheme
 
 from . import services, tasks
-from .models import Answer, CheckQuestion, Meeting, Question, Team
+from .models import Answer, CheckQuestion, Meeting, Question, Recording, Team
 
 ALLOWED_RECORDING_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm", ".mp4", ".flac"}
 MAX_RECORDING_BYTES = 500 * 1024 * 1024
@@ -136,9 +137,8 @@ def meeting_detail(request, meeting_id):
         if error:
             return render(request, "meetalign/meeting_detail.html", {"meeting": meeting, "error": error})
         if recording:
-            meeting.recording = recording
-            meeting.save(update_fields=["recording"])
-            tasks.start_processing(meeting.id)
+            added = Recording.objects.create(meeting=meeting, file=recording, status=Recording.STATUS_PROCESSING)
+            tasks.start_processing(added.id)
         if request.POST.get("action") == "end":
             Meeting.objects.filter(pk=meeting.pk).update(ended=True)
             return redirect("understanding", meeting_id=meeting.id)
@@ -154,11 +154,10 @@ def meeting_result(request, meeting_id):
 
 
 @login_required
-def recording_file(request, meeting_id):
+def recording_file(request, meeting_id, recording_id):
     meeting = _meeting(request, meeting_id)
-    if not meeting.recording:
-        raise Http404
-    return FileResponse(meeting.recording.open("rb"), filename=os.path.basename(meeting.recording.name))
+    recording = get_object_or_404(Recording, pk=recording_id, meeting=meeting)
+    return FileResponse(recording.file.open("rb"), filename=recording.filename)
 
 
 @login_required
@@ -223,7 +222,11 @@ def understanding(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     if meeting.record and not meeting.check_questions.exists():
         for order, text in enumerate(services.check_questions(meeting)):
-            CheckQuestion.objects.create(meeting=meeting, text=text, order=order)
+            try:
+                with transaction.atomic():
+                    CheckQuestion.objects.create(meeting=meeting, text=text, order=order)
+            except IntegrityError:
+                break
     user = request.user
     questions = list(meeting.check_questions.all())
     if request.method == "POST":
@@ -240,9 +243,17 @@ def understanding(request, meeting_id):
 @login_required
 def verification(request, meeting_id):
     meeting = _meeting(request, meeting_id)
+    members = list(meeting.team.members.all())
+    pending = []
+    for question in meeting.check_questions.all():
+        answered = set(question.answers.values_list("user_id", flat=True))
+        missing = [member for member in members if member.id not in answered]
+        if missing:
+            pending.append((question, missing))
     return render(request, "meetalign/verification.html", {
         "meeting": meeting,
         "discrepancies": _find_discrepancies(meeting),
+        "pending": pending,
     })
 
 
