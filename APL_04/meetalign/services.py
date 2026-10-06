@@ -1,4 +1,4 @@
-"""LLM 연결 지점. OLLAMA_MODEL 환경변수가 있을 때만 로컬 Ollama를 호출하고, 없으면 현재 동작(고정 문항, 가짜 응답)을 그대로 쓴다."""
+"""LLM/STT 연결 지점. OLLAMA_MODEL이나 MLX_WHISPER_MODEL 환경변수가 있을 때만 로컬 모델을 쓰고, 없으면 현재 동작을 그대로 쓴다."""
 
 import json
 import os
@@ -14,6 +14,14 @@ TIMEOUT_SECONDS = 120
 
 def _enabled():
     return bool(os.environ.get("OLLAMA_MODEL"))
+
+
+def transcribe(recording_path):
+    model = os.environ.get("MLX_WHISPER_MODEL")
+    if not model:
+        return None
+    import mlx_whisper
+    return mlx_whisper.transcribe(recording_path, path_or_hf_repo=model, language="ko")["text"].strip()
 
 
 def _generate(prompt):

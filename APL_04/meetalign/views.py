@@ -93,7 +93,10 @@ def meeting_detail(request, meeting_id):
         if recording:
             meeting.recording = recording
             meeting.save()
-        # STT/LLM 처리는 아직 없음 (다음 작업 대상). 파일만 실제로 저장한다.
+            transcript = services.transcribe(meeting.recording.path)
+            if transcript is not None:
+                meeting.record = transcript
+                meeting.save()
         if request.POST.get("action") == "end":
             meeting.ended = True
             meeting.save()
