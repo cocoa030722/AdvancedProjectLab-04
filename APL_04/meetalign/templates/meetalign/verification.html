@@ -21,5 +21,16 @@
   {% else %}
     <div class="success">엇갈린 답변이 없습니다.</div>
   {% endif %}
+  {% if pending %}
+    <h2>아직 답하지 않은 팀원</h2>
+    <ul class="plain">
+    {% for q, missing in pending %}
+      <li class="item" style="display:block">
+        <div class="title">{{ q.text }}</div>
+        <div class="meta">{% for member in missing %}{{ member.username }}{% if not forloop.last %}, {% endif %}{% endfor %}</div>
+      </li>
+    {% endfor %}
+    </ul>
+  {% endif %}
 </div>
 {% endblock %}

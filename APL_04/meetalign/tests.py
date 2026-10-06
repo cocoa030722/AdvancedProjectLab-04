@@ -7,12 +7,13 @@ from datetime import timedelta
 
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import IntegrityError, transaction
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
 from . import services, tasks, views
-from .models import Answer, CheckQuestion, Meeting, Question, Team
+from .models import Answer, CheckQuestion, Meeting, Question, Recording, Team
 
 
 class AuthTests(TestCase):
@@ -102,8 +103,7 @@ class PrototypeFlowTests(TestCase):
         file = SimpleUploadedFile("test.mp3", b"fake audio bytes", content_type="audio/mpeg")
         self.client.post(url, {"action": "submit", "recording": file})
         self.meeting.refresh_from_db()
-        self.assertTrue(self.meeting.recording)
-        self.assertIn("test", self.meeting.recording.name)
+        self.assertIn("test", Recording.objects.get(meeting=self.meeting).file.name)
 
     def test_summary_shows_saved_record(self):
         self.meeting.record = "결정: A안으로 진행"
@@ -299,7 +299,7 @@ class LocalSTTTests(TestCase):
             self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
         self.meeting.refresh_from_db()
         self.assertEqual(self.meeting.record, "")
-        self.assertTrue(self.meeting.recording)
+        self.assertTrue(Recording.objects.filter(meeting=self.meeting).exists())
 
     @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
     def test_upload_with_model_fills_record_with_transcript(self):
@@ -342,7 +342,7 @@ class SecurityFixTests(TestCase):
         r = self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
         self.assertContains(r, "지원하지 않는 녹음 형식")
         self.meeting.refresh_from_db()
-        self.assertFalse(self.meeting.recording)
+        self.assertFalse(Recording.objects.filter(meeting=self.meeting).exists())
 
     @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
     def test_oversized_recording_is_rejected(self):
@@ -351,7 +351,7 @@ class SecurityFixTests(TestCase):
             r = self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
         self.assertContains(r, "너무 큽니다")
         self.meeting.refresh_from_db()
-        self.assertFalse(self.meeting.recording)
+        self.assertFalse(Recording.objects.filter(meeting=self.meeting).exists())
 
     def test_anonymous_question_blocked_after_meeting_ends(self):
         self.meeting.ended = True
@@ -368,7 +368,7 @@ class SecurityFixTests(TestCase):
         r = self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": file})
         self.assertContains(r, "종료된 회의에는 녹음을 올릴 수 없습니다.")
         self.meeting.refresh_from_db()
-        self.assertFalse(self.meeting.recording)
+        self.assertFalse(Recording.objects.filter(meeting=self.meeting).exists())
 
 
 @override_settings(BACKGROUND_RECORDING=False)
@@ -512,9 +512,10 @@ class BackgroundProcessingTests(TestCase):
         self.assertContains(r, "녹음을 전사하고")
 
     def test_background_mode_starts_a_thread_instead_of_running_inline(self):
+        rec = Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("a.wav", b"RIFF"), status=Recording.STATUS_PROCESSING)
         with override_settings(BACKGROUND_RECORDING=True), patch.object(tasks.threading, "Thread") as thread, \
              patch.object(tasks, "process_recording") as inline:
-            tasks.start_processing(self.meeting.id)
+            tasks.start_processing(rec.id)
         thread.assert_called_once()
         thread.return_value.start.assert_called_once()
         inline.assert_not_called()
@@ -549,43 +550,50 @@ class StuckAndFileAccessTests(TestCase):
         self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
 
     def test_processing_without_live_worker_is_marked_failed(self):
+        rec = Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("a.wav", b"RIFF"), status=Recording.STATUS_PROCESSING)
         self.meeting.processing_status = Meeting.STATUS_PROCESSING
         self.meeting.save()
         r = self.client.get(reverse("meeting_result", args=[self.meeting.id]))
         self.assertContains(r, "녹음 처리에 실패했습니다.")
+        rec.refresh_from_db()
+        self.assertEqual(rec.status, Recording.STATUS_FAILED)
         self.meeting.refresh_from_db()
         self.assertEqual(self.meeting.processing_status, Meeting.STATUS_FAILED)
 
     def test_processing_with_live_worker_is_left_alone(self):
+        rec = Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("a.wav", b"RIFF"), status=Recording.STATUS_PROCESSING)
         self.meeting.processing_status = Meeting.STATUS_PROCESSING
         self.meeting.save()
-        tasks._active.add(self.meeting.id)
-        self.addCleanup(tasks._active.discard, self.meeting.id)
+        tasks._active.add(rec.id)
+        self.addCleanup(tasks._active.discard, rec.id)
         self.client.get(reverse("meeting_result", args=[self.meeting.id]))
-        self.meeting.refresh_from_db()
-        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_PROCESSING)
+        rec.refresh_from_db()
+        self.assertEqual(rec.status, Recording.STATUS_PROCESSING)
+
+    def _make_recording(self, name, content):
+        return Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile(name, content), status=Recording.STATUS_DONE)
 
     def test_recording_download_requires_login(self):
-        self.meeting.recording.save("a.wav", SimpleUploadedFile("a.wav", b"RIFF"), save=True)
+        rec = self._make_recording("a.wav", b"RIFF")
         self.client.logout()
-        r = self.client.get(reverse("recording_file", args=[self.meeting.id]))
+        r = self.client.get(reverse("recording_file", args=[self.meeting.id, rec.id]))
         self.assertEqual(r.status_code, 302)
 
     def test_member_can_download_recording(self):
-        self.meeting.recording.save("a.wav", SimpleUploadedFile("a.wav", b"RIFFDATA"), save=True)
-        r = self.client.get(reverse("recording_file", args=[self.meeting.id]))
+        rec = self._make_recording("a.wav", b"RIFFDATA")
+        r = self.client.get(reverse("recording_file", args=[self.meeting.id, rec.id]))
         self.assertEqual(r.status_code, 200)
         self.assertEqual(b"".join(r.streaming_content), b"RIFFDATA")
 
     def test_outsider_cannot_download_recording(self):
-        self.meeting.recording.save("a.wav", SimpleUploadedFile("a.wav", b"RIFF"), save=True)
+        rec = self._make_recording("a.wav", b"RIFF")
         outsider = User.objects.create_user("c", password="pw12345!")
         client = Client()
         client.force_login(outsider)
-        self.assertEqual(client.get(reverse("recording_file", args=[self.meeting.id])).status_code, 404)
+        self.assertEqual(client.get(reverse("recording_file", args=[self.meeting.id, rec.id])).status_code, 404)
 
-    def test_no_recording_returns_404(self):
-        self.assertEqual(self.client.get(reverse("recording_file", args=[self.meeting.id])).status_code, 404)
+    def test_unknown_recording_returns_404(self):
+        self.assertEqual(self.client.get(reverse("recording_file", args=[self.meeting.id, 99999])).status_code, 404)
 
 
 class DesignAlignmentTests(TestCase):
@@ -636,3 +644,76 @@ class DesignAlignmentTests(TestCase):
     def test_main_page_has_no_banner_when_not_due(self):
         r = self.client.get(reverse("index"))
         self.assertNotContains(r, "내일 마감인 회의")
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
+class FollowupTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.other = User.objects.create_user("b", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user, self.other)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user, record="결정: A안")
+
+    def test_duplicate_check_question_order_is_rejected_by_db(self):
+        CheckQuestion.objects.create(meeting=self.meeting, text="q1", order=0)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            CheckQuestion.objects.create(meeting=self.meeting, text="q2", order=0)
+
+    def test_understanding_does_not_duplicate_existing_questions(self):
+        CheckQuestion.objects.create(meeting=self.meeting, text="기존", order=0)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="새1\n새2"):
+            self.client.get(reverse("understanding", args=[self.meeting.id]))
+        self.assertEqual(CheckQuestion.objects.filter(meeting=self.meeting, order=0).count(), 1)
+
+    def test_verification_lists_members_who_have_not_answered(self):
+        question = CheckQuestion.objects.create(meeting=self.meeting, text="Q", order=0)
+        Answer.objects.create(question=question, user=self.user, text="답")
+        r = self.client.get(reverse("verification", args=[self.meeting.id]))
+        self.assertContains(r, "아직 답하지 않은 팀원")
+        self.assertContains(r, "b")
+
+    def test_second_upload_keeps_the_first_recording(self):
+        self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": SimpleUploadedFile("a.wav", b"RIFF1")})
+        self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "recording": SimpleUploadedFile("b.wav", b"RIFF2")})
+        recs = list(Recording.objects.filter(meeting=self.meeting))
+        self.assertEqual(len(recs), 2)
+        self.assertTrue(all(os.path.exists(r.file.path) for r in recs))
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
+class MultipleRecordingsTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
+
+    def test_transcripts_of_all_recordings_are_joined_in_order(self):
+        first = Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("1.wav", b"R"), status=Recording.STATUS_PROCESSING)
+        second = Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("2.wav", b"R"), status=Recording.STATUS_PROCESSING)
+        with patch.object(services, "transcribe", side_effect=["앞부분 전사", "뒷부분 전사"]):
+            tasks.process_recording(first.id)
+            tasks.process_recording(second.id)
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.transcript, "앞부분 전사\n\n뒷부분 전사")
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_DONE)
+
+    def test_meeting_stays_processing_while_any_recording_is_running(self):
+        done = Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("1.wav", b"R"), status=Recording.STATUS_PROCESSING)
+        Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("2.wav", b"R"), status=Recording.STATUS_PROCESSING)
+        with patch.object(services, "transcribe", return_value="끝난 전사"):
+            tasks.process_recording(done.id)
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_PROCESSING)
+
+    def test_failed_recording_does_not_block_others(self):
+        bad = Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("1.wav", b"R"), status=Recording.STATUS_PROCESSING)
+        good = Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("2.wav", b"R"), status=Recording.STATUS_PROCESSING)
+        with patch.object(services, "transcribe", side_effect=[RuntimeError("boom"), "좋은 전사"]):
+            tasks.process_recording(bad.id)
+            tasks.process_recording(good.id)
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.transcript, "좋은 전사")
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_DONE)

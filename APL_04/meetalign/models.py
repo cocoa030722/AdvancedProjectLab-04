@@ -1,3 +1,4 @@
+import os
 from datetime import timedelta
 
 from django.conf import settings
@@ -24,8 +25,6 @@ class Meeting(models.Model):
     ended = models.BooleanField(default=False)
     deadline = models.DateField(null=True, blank=True)
     host = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="hosted_meetings")
-    # STT/LLM 처리는 아직 없음. 지금은 파일을 실제로 저장하는 것까지만 한다.
-    recording = models.FileField(upload_to="recordings/", blank=True, null=True)
     # 회의록(전사+요약). 지금은 저장 자리만 있고, 채우는 건 STT/LLM 작업에서 한다.
     record = models.TextField(blank=True)
     transcript = models.TextField(blank=True)
@@ -37,6 +36,28 @@ class Meeting(models.Model):
     @property
     def is_due_tomorrow(self):
         return self.deadline is not None and self.deadline - timezone.localdate() == timedelta(days=1)
+
+
+class Recording(models.Model):
+    STATUS_PROCESSING = "processing"
+    STATUS_DONE = "done"
+    STATUS_FAILED = "failed"
+
+    meeting = models.ForeignKey(Meeting, on_delete=models.CASCADE, related_name="recordings")
+    file = models.FileField(upload_to="recordings/")
+    transcript = models.TextField(blank=True)
+    status = models.CharField(max_length=20, default=STATUS_PROCESSING)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    @property
+    def filename(self):
+        return os.path.basename(self.file.name)
+
+    def __str__(self):
+        return self.filename
 
 
 class Question(models.Model):
@@ -59,6 +80,7 @@ class CheckQuestion(models.Model):
 
     class Meta:
         ordering = ["order", "id"]
+        constraints = [models.UniqueConstraint(fields=["meeting", "order"], name="unique_check_question_order")]
 
     def __str__(self):
         return self.text[:30]
