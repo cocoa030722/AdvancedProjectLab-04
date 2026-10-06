@@ -146,6 +146,16 @@ def answers(request, meeting_id):
     return render(request, "meetalign/answers.html", {"meeting": meeting, "questions": meeting.questions.all()})
 
 
+def _find_discrepancies(meeting):
+    # 지금은 답변 문자열이 다르면 불일치로 본다. LLM 의미 비교로 교체할 자리.
+    found = []
+    for question in meeting.check_questions.all():
+        answers = list(question.answers.select_related("user"))
+        if len({a.text.strip() for a in answers}) > 1:
+            found.append((question, answers))
+    return found
+
+
 @login_required
 def understanding(request, meeting_id):
     meeting = _meeting(request, meeting_id)
@@ -162,4 +172,8 @@ def understanding(request, meeting_id):
         return redirect("understanding", meeting_id=meeting.id)
     my_answers = {a.question_id: a.text for a in Answer.objects.filter(question__meeting=meeting, user=user)}
     rows = [(q, my_answers.get(q.id, "")) for q in questions]
-    return render(request, "meetalign/understanding.html", {"meeting": meeting, "rows": rows})
+    return render(request, "meetalign/understanding.html", {
+        "meeting": meeting,
+        "rows": rows,
+        "discrepancies": _find_discrepancies(meeting),
+    })
