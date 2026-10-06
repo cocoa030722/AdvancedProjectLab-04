@@ -60,7 +60,7 @@ class PrototypeFlowTests(TestCase):
         self.client.force_login(self.user)
         self.team = Team.objects.create(name="t")
         self.team.members.add(self.user)
-        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user, record="회의록 내용")
 
     def test_index_public(self):
         self.assertEqual(self.client.get(reverse("index")).status_code, 200)
@@ -110,6 +110,8 @@ class PrototypeFlowTests(TestCase):
         self.assertContains(r, "결정: A안으로 진행")
 
     def test_summary_without_record_shows_fallback(self):
+        self.meeting.record = ""
+        self.meeting.save()
         r = self.client.get(reverse("summary", args=[self.meeting.id]))
         self.assertContains(r, "아직 생성된 회의록이 없습니다.")
 
@@ -446,3 +448,25 @@ class SemanticDiscrepancyTests(TestCase):
         with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="일치"):
             r = self.client.get(reverse("understanding", args=[self.meeting.id]))
         self.assertContains(r, "엇갈린 답변이 없습니다.")
+
+
+class QuestionTimingTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
+
+    def test_no_questions_are_created_before_record_exists(self):
+        r = self.client.get(reverse("understanding", args=[self.meeting.id]))
+        self.assertEqual(CheckQuestion.objects.filter(meeting=self.meeting).count(), 0)
+        self.assertContains(r, "회의록이 만들어지면 질문이 생성됩니다.")
+
+    def test_questions_are_created_once_record_exists(self):
+        self.meeting.record = "결정: A안"
+        self.meeting.save()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="질문1\n질문2"):
+            self.client.get(reverse("understanding", args=[self.meeting.id]))
+            self.client.get(reverse("understanding", args=[self.meeting.id]))
+        self.assertEqual(list(CheckQuestion.objects.filter(meeting=self.meeting).values_list("text", flat=True)), ["질문1", "질문2"])
