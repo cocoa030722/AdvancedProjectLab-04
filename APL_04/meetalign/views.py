@@ -8,7 +8,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.dateparse import parse_date
 from django.utils.http import url_has_allowed_host_and_scheme
 
-from . import services
+from . import services, tasks
 from .models import Answer, CheckQuestion, Meeting, Question, Team
 
 ALLOWED_RECORDING_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm", ".mp4", ".flac"}
@@ -131,15 +131,11 @@ def meeting_detail(request, meeting_id):
             return render(request, "meetalign/meeting_detail.html", {"meeting": meeting, "error": error})
         if recording:
             meeting.recording = recording
+            meeting.processing_status = Meeting.STATUS_PROCESSING
             meeting.save()
-            transcript = services.transcribe(meeting.recording.path)
-            if transcript is not None:
-                meeting.transcript = transcript
-                meeting.record = services.summarize(transcript)
-                meeting.save()
+            tasks.start_processing(meeting.id)
         if request.POST.get("action") == "end":
-            meeting.ended = True
-            meeting.save()
+            Meeting.objects.filter(pk=meeting.pk).update(ended=True)
             return redirect("answers", meeting_id=meeting.id)
         return redirect("meeting_result", meeting_id=meeting.id)
     return render(request, "meetalign/meeting_detail.html", {"meeting": meeting})
@@ -147,7 +143,8 @@ def meeting_detail(request, meeting_id):
 
 @login_required
 def meeting_result(request, meeting_id):
-    return render(request, "meetalign/meeting_result.html", {"meeting": _meeting(request, meeting_id)})
+    meeting = _meeting(request, meeting_id)
+    return render(request, "meetalign/meeting_result.html", {"meeting": meeting})
 
 
 @login_required

@@ -25,7 +25,13 @@ def transcribe(recording_path):
 
 
 def _generate(prompt):
-    body = json.dumps({"model": os.environ["OLLAMA_MODEL"], "prompt": prompt, "stream": False}).encode("utf-8")
+    num_ctx = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
+    body = json.dumps({
+        "model": os.environ["OLLAMA_MODEL"],
+        "prompt": prompt,
+        "stream": False,
+        "options": {"num_ctx": num_ctx},
+    }).encode("utf-8")
     request = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         return json.loads(response.read().decode("utf-8"))["response"].strip()

@@ -14,6 +14,10 @@ class Team(models.Model):
 
 
 class Meeting(models.Model):
+    STATUS_PROCESSING = "processing"
+    STATUS_DONE = "done"
+    STATUS_FAILED = "failed"
+
     team = models.ForeignKey(Team, on_delete=models.CASCADE, related_name="meetings")
     title = models.CharField(max_length=200)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -25,6 +29,7 @@ class Meeting(models.Model):
     # 회의록(전사+요약). 지금은 저장 자리만 있고, 채우는 건 STT/LLM 작업에서 한다.
     record = models.TextField(blank=True)
     transcript = models.TextField(blank=True)
+    processing_status = models.CharField(max_length=20, blank=True, default="")
 
     def __str__(self):
         return self.title
