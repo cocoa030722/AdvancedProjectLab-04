@@ -1,59 +1,20 @@
 {% extends "meetalign/base.html" %}
 {% block note %}
-<li>녹음 파일은 실제로 서버에 저장되고, 로그인한 회의 멤버만 받을 수 있다.</li>
-<li>제출 → 회의록 생성 화면, 종료 → 이해도 질문 답변 화면(3.5)으로 이동한다.</li>
+<li>녹음 입력은 파일 선택 UI만 제공하며 서버에 저장/처리하지 않는다.</li>
+<li>제출 → 회의록 생성 화면, 종료 → 질문 답변 화면(3.5)으로 이동한다.</li>
 {% endblock %}
 {% block content %}
-<div class="card">
-  <div class="page-head">
-    <div class="crumb"><a href="{% url 'meeting_list' meeting.team_id %}">회의 목록</a></div>
-    <h1>{{ meeting.title }}
-      {% if meeting.ended %}<span class="badge ended">종료</span>{% endif %}
-      {% if meeting.is_due_tomorrow %}<span class="badge due">마감 D-1</span>{% endif %}
-    </h1>
-    {% if meeting.deadline %}<div class="muted">마감 {{ meeting.deadline|date:"Y.m.d" }}</div>{% endif %}
-  </div>
-  {% if meeting.is_due_tomorrow %}<div class="notice"><b>마감 D-1:</b> 내일 마감입니다.</div>{% endif %}
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
-  {% if meeting.recordings.all %}
-    <h2 style="margin-top:0">업로드된 녹음 ({{ meeting.recordings.count }})</h2>
-    <ul class="plain" style="margin-bottom:18px">
-    {% for rec in meeting.recordings.all %}
-      <li class="item">
-        <div>
-          <span class="title">{{ rec.filename }}</span>
-          {% if rec.status == "processing" %}<span class="badge processing">전사 중</span>
-          {% elif rec.status == "done" %}<span class="badge done">완료</span>
-          {% else %}<span class="badge failed">실패</span>{% endif %}
-          <div class="meta">{{ rec.created_at|date:"Y.m.d H:i" }}</div>
-        </div>
-        <a class="btn secondary" href="{% url 'recording_file' meeting.id rec.id %}">받기</a>
-      </li>
-    {% endfor %}
-    </ul>
-  {% endif %}
-  {% if meeting.ended %}
-    <div class="notice">회의가 종료되었습니다. 녹음 업로드와 익명 질문은 더 이상 받지 않습니다. 이해도 질문에 답해 주세요.</div>
-    <div class="row"><a class="btn" href="{% url 'understanding' meeting.id %}">이해도 질문 답하기</a></div>
-  {% else %}
-  <form method="post" enctype="multipart/form-data">{% csrf_token %}
-    <div class="field"><label for="recording">회의 녹음 파일</label>
-      <input id="recording" type="file" name="recording" accept="audio/*"></div>
-    <div class="row">
-      <button name="action" value="submit">녹음 제출하고 회의록 만들기</button>
-      <button name="action" value="end" class="secondary"
-        onclick="return confirm('회의를 종료할까요? 종료 후에는 녹음 업로드와 익명 질문이 막힙니다.');">회의 종료</button>
-    </div>
-  </form>
-  {% endif %}
-</div>
-<div class="card">
-  <h2 style="margin-top:0">이 회의 둘러보기</h2>
-  <ul class="plain">
-    <li class="item"><span class="title">대화창</span><a class="btn secondary" href="{% url 'chat' meeting.id %}">열기</a></li>
-    <li class="item"><span class="title">익명 질문함</span><a class="btn secondary" href="{% url 'inbox' meeting.id %}">열기</a></li>
-    <li class="item"><span class="title">회의 요약</span><a class="btn secondary" href="{% url 'summary' meeting.id %}">보기</a></li>
-    <li class="item"><span class="title">이해도 검증</span><a class="btn secondary" href="{% url 'understanding' meeting.id %}">답하기</a></li>
-  </ul>
-</div>
+<h1>{{ meeting.title }}</h1>
+<a href="{% url 'meeting_list' meeting.team_id %}">회의 목록으로 돌아가기</a>
+<form method="post" enctype="multipart/form-data">{% csrf_token %}
+<p>회의 녹음: <input type="file" name="recording" accept="audio/*"></p>
+<button name="action" value="submit">제출</button>
+<button name="action" value="end">종료</button>
+</form>
+<ul>
+<li><a href="{% url 'chat' meeting.id %}">대화창</a></li>
+<li><a href="{% url 'inbox' meeting.id %}">익명 질문함</a></li>
+<li><a href="{% url 'summary' meeting.id %}">회의 요약</a></li>
+<li><a href="{% url 'understanding' meeting.id %}">이해도 검증</a></li>
+</ul>
 {% endblock %}

@@ -10,10 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
-import os
 from pathlib import Path
-
-from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -23,16 +20,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-DEBUG = os.environ.get('DJANGO_DEBUG', '1') == '1'
-
-SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
-if not SECRET_KEY:
-    if not DEBUG:
-        raise ImproperlyConfigured('DJANGO_DEBUG=0이면 DJANGO_SECRET_KEY 환경변수가 필요합니다.')
-    SECRET_KEY = 'django-insecure-local-dev-only'
+SECRET_KEY = 'django-insecure-o$=2*@##p51g3&)(t*5(9fgh&0gtvik6+m@m42u=0#cadr5ru0'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-ALLOWED_HOSTS = [h for h in os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if h]
+DEBUG = True
+
+ALLOWED_HOSTS = []
 
 
 # Application definition
@@ -124,9 +117,6 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
-MEDIA_URL = 'media/'
-MEDIA_ROOT = BASE_DIR / 'media'
-
 
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
@@ -138,8 +128,4 @@ MAILERS = {
 }
 
 
-BACKGROUND_RECORDING = True
-
-LOGIN_URL = 'login'
-LOGIN_REDIRECT_URL = 'index'
 LOGOUT_REDIRECT_URL = 'index'

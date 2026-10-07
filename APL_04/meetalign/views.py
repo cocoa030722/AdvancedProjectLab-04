@@ -1,63 +1,36 @@
-import os
-from datetime import timedelta
-
-from django.contrib.auth import login, logout
-from django.core.exceptions import PermissionDenied
-from django.db import IntegrityError, transaction
-from django.http import FileResponse, Http404, HttpResponse
-from django.contrib.auth.decorators import login_required
-from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
+from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404, redirect, render
-from django.utils import timezone
-from django.utils.dateparse import parse_date
-from django.utils.http import url_has_allowed_host_and_scheme
 
-from . import services, tasks
-from .models import Answer, CheckQuestion, Meeting, Question, Recording, Team
+from .models import Meeting, Question, Team
 
-ALLOWED_RECORDING_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm", ".mp4", ".flac"}
-MAX_RECORDING_BYTES = 500 * 1024 * 1024
+
+def current_user():
+    # 프로토타입: 이미 로그인한 사용자가 있다고 가정하고 가장 먼저 만든 사용자를 사용한다.
+    return User.objects.order_by("pk").first() or User.objects.create_user("demo")
 
 
 def index(request):
-    teams = request.user.teams.all() if request.user.is_authenticated else []
-    due_soon = []
-    if request.user.is_authenticated:
-        due_soon = Meeting.objects.filter(team__members=request.user, deadline=timezone.localdate() + timedelta(days=1)).select_related("team")
-    return render(request, "meetalign/index.html", {"teams": teams, "due_soon": due_soon})
+    user = current_user()
+    return render(request, "meetalign/index.html", {"user": user, "teams": user.teams.all()})
 
 
+# 로그인 관련 페이지는 화면만 남기고 실제 인증은 하지 않는다.
 def signup(request):
     if request.method == "POST":
-        form = UserCreationForm(request.POST)
-        if form.is_valid():
-            login(request, form.save())
-            return redirect("index")
-    else:
-        form = UserCreationForm()
-    return render(request, "meetalign/signup.html", {"form": form})
+        return redirect("index")
+    return render(request, "meetalign/signup.html")
 
 
 def login_view(request):
     if request.method == "POST":
-        form = AuthenticationForm(request, data=request.POST)
-        if form.is_valid():
-            login(request, form.get_user())
-            next_url = request.GET.get("next", "")
-            if url_has_allowed_host_and_scheme(next_url, allowed_hosts={request.get_host()}, require_https=request.is_secure()):
-                return redirect(next_url)
-            return redirect("index")
-    else:
-        form = AuthenticationForm(request)
-    return render(request, "meetalign/login.html", {"form": form})
+        return redirect("index")
+    return render(request, "meetalign/login.html")
 
 
 def logout_view(request):
-    logout(request)
     return redirect("index")
 
 
-@login_required
 def team_join(request):
     error = ""
     if request.method == "POST":
@@ -66,140 +39,79 @@ def team_join(request):
             if not name or Team.objects.filter(name=name).exists():
                 error = "팀 이름이 비었거나 이미 존재합니다."
             else:
-                Team.objects.create(name=name).members.add(request.user)
+                Team.objects.create(name=name).members.add(current_user())
                 return redirect("index")
         else:
             team = Team.objects.filter(name=name).first()
             if team is None:
                 error = "해당 이름의 팀이 없습니다."
             else:
-                team.members.add(request.user)
+                team.members.add(current_user())
                 return redirect("meeting_list", team_id=team.id)
     return render(request, "meetalign/team_join.html", {"error": error})
 
 
 def _team(request, team_id):
-    return get_object_or_404(Team, pk=team_id, members=request.user)
+    return get_object_or_404(Team, pk=team_id, members=current_user())
 
 
 def _meeting(request, meeting_id):
-    return get_object_or_404(Meeting, pk=meeting_id, team__members=request.user)
+    return get_object_or_404(Meeting, pk=meeting_id, team__members=current_user())
 
 
-@login_required
 def meeting_list(request, team_id):
     team = _team(request, team_id)
     return render(request, "meetalign/meeting_list.html", {"team": team, "meetings": team.meetings.all()})
 
 
-def _parse_deadline(raw):
-    if not raw:
-        return None, None
-    try:
-        parsed = parse_date(raw)
-    except ValueError:
-        parsed = None
-    if parsed is None:
-        return None, "마감일 형식이 올바르지 않습니다."
-    return parsed, None
-
-
-def _recording_error(recording):
-    if os.path.splitext(recording.name)[1].lower() not in ALLOWED_RECORDING_EXTENSIONS:
-        return "지원하지 않는 녹음 형식입니다 (mp3, m4a, wav, ogg, webm, mp4, flac)."
-    if recording.size > MAX_RECORDING_BYTES:
-        return "녹음 파일이 너무 큽니다 (500MB 이하만 가능)."
-    return None
-
-
-@login_required
 def meeting_create(request, team_id):
     team = _team(request, team_id)
-    error = None
     if request.method == "POST" and request.POST.get("title", "").strip():
-        deadline, error = _parse_deadline(request.POST.get("deadline", "").strip())
-        if error is None:
-            meeting = Meeting.objects.create(team=team, title=request.POST["title"].strip(), deadline=deadline, host=request.user)
-            return redirect("meeting_detail", meeting_id=meeting.id)
-    return render(request, "meetalign/meeting_create.html", {"team": team, "error": error})
+        meeting = Meeting.objects.create(team=team, title=request.POST["title"].strip())
+        return redirect("meeting_detail", meeting_id=meeting.id)
+    return render(request, "meetalign/meeting_create.html", {"team": team})
 
 
-@login_required
 def meeting_detail(request, meeting_id):
     meeting = _meeting(request, meeting_id)
-    error = None
     if request.method == "POST":
-        recording = request.FILES.get("recording")
-        if recording and meeting.ended:
-            error = "종료된 회의에는 녹음을 올릴 수 없습니다."
-        elif recording:
-            error = _recording_error(recording)
-        if error:
-            return render(request, "meetalign/meeting_detail.html", {"meeting": meeting, "error": error})
-        if recording:
-            added = Recording.objects.create(meeting=meeting, file=recording, status=Recording.STATUS_PROCESSING)
-            tasks.start_processing(added.id)
+        # 녹음 파일은 저장/처리하지 않는다 (목업)
         if request.POST.get("action") == "end":
-            Meeting.objects.filter(pk=meeting.pk).update(ended=True)
-            return redirect("understanding", meeting_id=meeting.id)
+            meeting.ended = True
+            meeting.save()
+            return redirect("answers", meeting_id=meeting.id)
         return redirect("meeting_result", meeting_id=meeting.id)
     return render(request, "meetalign/meeting_detail.html", {"meeting": meeting})
 
 
-@login_required
 def meeting_result(request, meeting_id):
-    meeting = _meeting(request, meeting_id)
-    tasks.recover_stuck(meeting)
-    return render(request, "meetalign/meeting_result.html", {"meeting": meeting})
+    return render(request, "meetalign/meeting_result.html", {"meeting": _meeting(request, meeting_id)})
 
 
-@login_required
-def recording_file(request, meeting_id, recording_id):
-    meeting = _meeting(request, meeting_id)
-    recording = get_object_or_404(Recording, pk=recording_id, meeting=meeting)
-    return FileResponse(recording.file.open("rb"), filename=recording.filename)
-
-
-@login_required
 def chat(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     mode = request.POST.get("mode") or request.GET.get("mode", "llm")
     reply = ""
-    error = None
     if request.method == "POST" and request.POST.get("text", "").strip():
         text = request.POST["text"].strip()
         if mode == "anon":
-            if meeting.ended:
-                error = "종료된 회의에는 익명 질문을 보낼 수 없습니다."
-            else:
-                Question.objects.create(meeting=meeting, text=text)
+            Question.objects.create(meeting=meeting, text=text)
         else:
-            reply = services.chat_reply(meeting, text)
-    return render(request, "meetalign/chat.html", {"meeting": meeting, "mode": mode, "reply": reply, "error": error})
+            reply = "(가짜 LLM 응답) '%s'에 대한 답변입니다." % text
+    return render(request, "meetalign/chat.html", {"meeting": meeting, "mode": mode, "reply": reply})
 
 
-def _require_host(meeting, user):
-    # 주최자가 없는(이 기능 도입 전에 만든) 회의는 팀원 누구나 허용한다.
-    if meeting.host_id is not None and meeting.host_id != user.id:
-        raise PermissionDenied
-
-
-@login_required
 def inbox(request, meeting_id):
     meeting = _meeting(request, meeting_id)
-    _require_host(meeting, request.user)
     return render(request, "meetalign/inbox.html", {"meeting": meeting, "questions": meeting.questions.all()})
 
 
-@login_required
 def summary(request, meeting_id):
     return render(request, "meetalign/summary.html", {"meeting": _meeting(request, meeting_id)})
 
 
-@login_required
 def answers(request, meeting_id):
     meeting = _meeting(request, meeting_id)
-    _require_host(meeting, request.user)
     if request.method == "POST":
         question = get_object_or_404(Question, pk=request.POST.get("question_id"), meeting=meeting)
         question.answer = request.POST.get("answer", "").strip()
@@ -208,60 +120,5 @@ def answers(request, meeting_id):
     return render(request, "meetalign/answers.html", {"meeting": meeting, "questions": meeting.questions.all()})
 
 
-def _find_discrepancies(meeting):
-    found = []
-    for question in meeting.check_questions.all():
-        answers = list(question.answers.select_related("user"))
-        if not services.is_consistent([a.text for a in answers], record=meeting.record, question=question.text):
-            found.append((question, answers))
-    return found
-
-
-@login_required
 def understanding(request, meeting_id):
-    meeting = _meeting(request, meeting_id)
-    if meeting.record and not meeting.check_questions.exists():
-        for order, text in enumerate(services.check_questions(meeting)):
-            try:
-                with transaction.atomic():
-                    CheckQuestion.objects.create(meeting=meeting, text=text, order=order)
-            except IntegrityError:
-                break
-    user = request.user
-    questions = list(meeting.check_questions.all())
-    if request.method == "POST":
-        for question in questions:
-            text = request.POST.get("q%d" % question.id, "").strip()
-            if text:
-                Answer.objects.update_or_create(question=question, user=user, defaults={"text": text})
-        return redirect("understanding", meeting_id=meeting.id)
-    my_answers = {a.question_id: a.text for a in Answer.objects.filter(question__meeting=meeting, user=user)}
-    rows = [(q, my_answers.get(q.id, "")) for q in questions]
-    return render(request, "meetalign/understanding.html", {"meeting": meeting, "rows": rows})
-
-
-@login_required
-def verification(request, meeting_id):
-    meeting = _meeting(request, meeting_id)
-    members = list(meeting.team.members.all())
-    pending = []
-    for question in meeting.check_questions.all():
-        answered = set(question.answers.values_list("user_id", flat=True))
-        missing = [member for member in members if member.id not in answered]
-        if missing:
-            pending.append((question, missing))
-    return render(request, "meetalign/verification.html", {
-        "meeting": meeting,
-        "discrepancies": _find_discrepancies(meeting),
-        "pending": pending,
-    })
-
-
-@login_required
-def record_file(request, meeting_id):
-    meeting = _meeting(request, meeting_id)
-    if not meeting.record:
-        raise Http404
-    response = HttpResponse(meeting.record, content_type="text/plain; charset=utf-8")
-    response["Content-Disposition"] = 'attachment; filename="meeting_record.txt"'
-    return response
+    return render(request, "meetalign/understanding.html", {"meeting": _meeting(request, meeting_id)})

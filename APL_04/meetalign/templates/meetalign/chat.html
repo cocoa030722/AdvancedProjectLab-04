@@ -1,30 +1,18 @@
 {% extends "meetalign/base.html" %}
 {% block note %}
 <li>회의마다 대화방이 있으며, 프로젝트 맥락은 각 회의 결과로만 유지한다 (대화 기록은 저장하지 않음).</li>
-<li>익명 질문은 작성자를 저장하지 않는다. 로컬 LLM이 꺼져 있으면 가짜 응답이 나온다.</li>
+<li>익명 질문은 작성자를 저장하지 않는다. LLM 응답은 고정된 가짜 문장이다.</li>
 {% endblock %}
 {% block content %}
-<div class="card">
-  <div class="page-head">
-    <div class="crumb"><a href="{% url 'meeting_detail' meeting.id %}">{{ meeting.title }}</a></div>
-    <h1>대화창</h1>
-  </div>
-  <div class="tabs">
-    <a href="?mode=llm" class="{% if mode != 'anon' %}on{% endif %}">회의 내용에 대해 질문</a>
-    <a href="?mode=anon" class="{% if mode == 'anon' %}on{% endif %}">주최자에게 익명 질문</a>
-  </div>
-  {% if mode == "anon" %}<p class="muted">질문은 작성자 이름 없이 주최자에게 전달됩니다.</p>
-  {% else %}<p class="muted">회의록 내용만 근거로 답합니다. 회의록에 없는 내용은 답하지 않습니다.</p>{% endif %}
-  {% if error %}<div class="error">{{ error }}</div>{% endif %}
-  <form method="post">{% csrf_token %}
-    <input type="hidden" name="mode" value="{{ mode }}">
-    <div class="row">
-      <input name="text" placeholder="{% if mode == 'anon' %}주최자에게 보낼 질문{% else %}회의 내용에 대해 물어보기{% endif %}" style="flex:1">
-      <button>보내기</button>
-    </div>
-  </form>
-  {% if reply %}<div class="bubble">{{ reply }}</div>{% endif %}
-  {% if mode == "anon" and request.method == "POST" and not error %}<div class="success" style="margin-top:12px">익명 질문이 전송되었습니다.</div>{% endif %}
-  <p style="margin-top:18px"><a href="{% url 'inbox' meeting.id %}">익명 질문 받는 화면 (주최자)</a></p>
-</div>
+<h1>{{ meeting.title }} 대화창</h1>
+<p><a href="{% url 'meeting_detail' meeting.id %}">회의로 돌아가기</a></p>
+<p>모드: <b>{% if mode == "anon" %}익명 질문{% else %}LLM 대화{% endif %}</b>
+ | <a href="?mode={% if mode == 'anon' %}llm{% else %}anon{% endif %}">전환</a></p>
+<form method="post">{% csrf_token %}
+<input type="hidden" name="mode" value="{{ mode }}">
+<input name="text"><button>전송</button>
+</form>
+{% if reply %}<p>{{ reply }}</p>{% endif %}
+{% if mode == "anon" and request.method == "POST" %}<p>익명 질문이 전송되었습니다.</p>{% endif %}
+<p><a href="{% url 'inbox' meeting.id %}">익명 질문 받는 화면</a></p>
 {% endblock %}

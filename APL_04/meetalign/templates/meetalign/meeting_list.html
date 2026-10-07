@@ -1,23 +1,10 @@
 {% extends "meetalign/base.html" %}
 {% block note %}<li>회의방은 팀 단위이며, 회의를 선택해 입장한다.</li>{% endblock %}
 {% block content %}
-<div class="card">
-  <div class="page-head"><div class="crumb"><a href="{% url 'index' %}">홈</a></div><h1>{{ team.name }} 회의 목록</h1></div>
-  <ul class="plain">
-  {% for m in meetings %}
-    <li class="item">
-      <div>
-        <a class="title" href="{% url 'meeting_detail' m.id %}">{{ m.title }}</a>
-        {% if m.ended %}<span class="badge ended">종료</span>{% endif %}
-        {% if m.is_due_tomorrow %}<span class="badge due">[D-1 마감]</span>{% endif %}
-        <div class="meta">{{ m.created_at|date:"Y.m.d" }}{% if m.deadline %} · 마감 {{ m.deadline|date:"Y.m.d" }}{% endif %}</div>
-      </div>
-      <a class="btn secondary" href="{% url 'meeting_detail' m.id %}">입장</a>
-    </li>
-  {% empty %}
-    <li class="empty">아직 회의가 없습니다. 첫 회의를 만들어 보세요.</li>
-  {% endfor %}
-  </ul>
-  <div class="row" style="margin-top:16px"><a class="btn" href="{% url 'meeting_create' team.id %}">회의 만들기</a></div>
-</div>
+<h1>{{ team.name }} 회의 목록</h1>
+<p><a href="{% url 'meeting_create' team.id %}">회의 생성</a></p>
+<ul>
+{% for m in meetings %}<li><a href="{% url 'meeting_detail' m.id %}">{{ m.title }}</a>{% if m.ended %} (종료){% endif %}</li>
+{% empty %}<li>회의가 없습니다.</li>{% endfor %}
+</ul>
 {% endblock %}
