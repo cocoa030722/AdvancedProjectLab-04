@@ -1,20 +1,8 @@
 {% extends "meetalign/base.html" %}
-{% block note %}<li>회의록(record)은 로컬 LLM이 전사본을 정리한 요약이다. LLM이 꺼져 있으면 전사 원문이 그대로 들어간다.</li>{% endblock %}
+{% block note %}<li>LLM 요약은 고정된 가짜 텍스트이다.</li>{% endblock %}
 {% block content %}
-<div class="card">
-  <div class="page-head">
-    <div class="crumb"><a href="{% url 'meeting_detail' meeting.id %}">{{ meeting.title }}</a></div>
-    <h1>회의 요약</h1>
-  </div>
-  {% if meeting.record %}
-    <div class="record">{{ meeting.record }}</div>
-    <div class="row" style="margin-top:12px"><a class="btn secondary" href="{% url 'record_file' meeting.id %}">회의록 다운로드</a></div>
-  {% else %}
-    <div class="empty">아직 생성된 회의록이 없습니다.</div>
-  {% endif %}
-  {% if meeting.transcript %}
-    <details><summary>전사 원문 보기</summary><div class="record" style="margin-top:8px">{{ meeting.transcript }}</div></details>
-  {% endif %}
-  <p class="muted" style="margin-top:18px"><a href="{% url 'understanding' meeting.id %}">이해도 질문에 답하기</a></p>
-</div>
+<h1>{{ meeting.title }} 회의 요약</h1>
+<p><a href="{% url 'meeting_detail' meeting.id %}">회의로 돌아가기</a></p>
+<p>(가짜 요약) 안건 논의, 결정 사항, 다음 할 일이 여기에 표시됩니다.</p>
+<p><a href="{% url 'understanding' meeting.id %}">이해도 검증</a></p>
 {% endblock %}

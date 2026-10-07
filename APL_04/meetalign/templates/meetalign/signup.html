@@ -1,18 +1,10 @@
 {% extends "meetalign/base.html" %}
-{% block note %}<li>Django 기본 인증(자체 로그인)으로 가입/로그인 상태를 실제로 유지한다.</li>{% endblock %}
+{% block note %}<li>프로토타입: 화면만 남기고 실제 가입은 하지 않는다. 제출하면 index로 이동한다.</li>{% endblock %}
 {% block content %}
-<div class="card" style="max-width:420px;margin:24px auto">
-  <div class="page-head"><h1>회원가입</h1></div>
-  {% if form.errors %}<div class="error"><ul class="plain">{% for field in form %}{% for error in field.errors %}<li>{{ error }}</li>{% endfor %}{% endfor %}</ul></div>{% endif %}
-  <form method="post">{% csrf_token %}
-    <div class="field"><label for="id_username">아이디</label>
-      <input id="id_username" name="username" value="{{ form.username.value|default:'' }}"></div>
-    <div class="field"><label for="id_password1">비밀번호</label>
-      <input id="id_password1" name="password1" type="password"></div>
-    <div class="field"><label for="id_password2">비밀번호 확인</label>
-      <input id="id_password2" name="password2" type="password"></div>
-    <div class="row" style="margin-top:6px"><button type="submit">가입하기</button></div>
-  </form>
-  <p class="muted" style="margin-top:16px">이미 계정이 있나요? <a href="{% url 'login' %}">로그인</a></p>
-</div>
+<h1>회원가입</h1>
+<form method="post">{% csrf_token %}
+<p>아이디 <input name="username"></p>
+<p>비밀번호 <input name="password1" type="password"></p>
+<p>비밀번호 확인 <input name="password2" type="password"></p>
+<button>가입</button></form>
 {% endblock %}
