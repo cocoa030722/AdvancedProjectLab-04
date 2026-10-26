@@ -506,6 +506,33 @@ PR 히스토리
   있어서 문자열이 아니라 class="pending-badge" 엘리먼트로 판정해야 한다.
 
 
+Groq Whisper API 연동 (브랜치 feature/groq-stt)
+----------------------
+CLOVA 무료 사용량(월 20분)이 너무 적다는 의견이 있어, CLOVA와 로컬 Whisper 사이에
+Groq의 Whisper API를 한 단계 추가했다. Groq는 로컬에서 쓰는 것과 같은 모델
+(whisper-large-v3-turbo)을 빠른 추론 서버에서 돌려주는 곳이라 전사 품질은 그대로고,
+무료 한도만 CLOVA보다 훨씬 넉넉하다(공식 문서 기준 시간당 $0.04, 무료 등급은 계정마다
+콘솔에서 확인).
+
+- services.py: GROQ_API_KEY가 있으면 CLOVA가 없거나·소진됐거나·실패했을 때 Groq를
+  먼저 시도하고, Groq도 실패하면(또는 설정이 없으면) 기존처럼 로컬 Whisper로 넘어간다.
+  우선순위: CLOVA → Groq → 로컬 Whisper → (전부 없으면) 가짜 응답.
+  CLOVA의 _clova_multipart를 그대로 재사용하지 않고 _groq_multipart를 따로 만들었다
+  — 필드 구성이 다르고(Groq는 model/language/response_format/file), 기존 CLOVA
+  테스트가 바이트 단위로 요청 형식을 검증하고 있어서 공통 함수로 합치면 괜히 깨지기
+  쉽다.
+- Groq 쪽은 response_format=text로 받아서 JSON 파싱 없이 응답 바디를 그대로 쓴다.
+  CLOVA와 달리 사용량을 DB에 기록하지 않는다(Gemini/Ollama와 동일하게 앱에서 한도
+  추적을 안 함 — Groq 콘솔에서 직접 확인).
+  화자 구분(diarization)은 Groq API에 없어서 지원하지 않는다 — 화자 구분이 필요한
+  회의는 CLOVA를 계속 써야 한다.
+- stt_status_text()의 "전환 예정" 안내 문구는 Groq가 설정돼 있으면 "Groq Whisper"를,
+  아니면 기존처럼 로컬 엔진 이름을 보여준다(우선순위 1개만 안내 — 3단계를 다 나열하면
+  화면이 길어져서 다음 전환 지점만 보여주는 기존 방식을 유지했다).
+- 모델 변경이 없어 새 마이그레이션은 없다.
+- 테스트 193개 전부 통과 (GroqSTTTests 8개 추가).
+
+
 알려진 이슈
 ----------------------
 - 이해도 검증 결과 화면(verification, 3.6)은 진행자 전용이 아니라 팀원 누구나 볼 수

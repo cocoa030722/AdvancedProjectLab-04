@@ -2,14 +2,14 @@
 
 회의 녹음을 올리면 회의록을 정리하고, 팀원들이 서로 다르게 이해한 부분을 짚어주는 서비스입니다.
 
-- 녹음 업로드(파일 업로드 + 마이크 직접 녹음) → 네이버 CLOVA Speech로 전사 (매월 무료 20분을 다 쓰거나 호출이 실패하면 로컬 Whisper로 자동 전환, Windows/Mac 모두 지원) → 상용 LLM(Gemini API)으로 회의록 요약 (실패 시 로컬 LLM(Ollama)으로 자동 전환)
+- 녹음 업로드(파일 업로드 + 마이크 직접 녹음) → 네이버 CLOVA Speech로 전사 (매월 무료 20분을 다 쓰거나 호출이 실패하면 Groq Whisper API로, 그마저 없거나 실패하면 로컬 Whisper로 자동 전환, Windows/Mac 모두 지원) → 상용 LLM(Gemini API)으로 회의록 요약 (실패 시 로컬 LLM(Ollama)으로 자동 전환)
 - 회의록에서 모호한 표현을 찾아 객관식 이해도 확인 문제를 자동 생성, 주최자가 검토·수정 후 공개
 - 정답과 다른 보기를 고른 팀원이 있으면 불일치로 표시하고 근거 문장을 함께 제시
 - 익명 질문(질문한 본인만 답변을 볼 수 있음), 팀 초대 코드, 다크 모드 등 지원
 
 ## 데이터 프라이버시
 
-회의 녹음 전사(STT)는 네이버 CLOVA Speech를 설정하면 **녹음 파일이 네이버 클라우드 서버로 전송**됩니다. 이번 달 무료 사용량을 다 썼거나 호출이 실패한 녹음, 그리고 CLOVA를 설정하지 않은 경우에는 로컬 Whisper(faster-whisper 또는 mlx-whisper)로 처리되어 녹음 파일이 외부로 나가지 않습니다. 민감한 회의는 CLOVA 설정 없이 로컬 Whisper만으로 실행하는 것을 권장합니다.
+회의 녹음 전사(STT)는 네이버 CLOVA Speech를 설정하면 **녹음 파일이 네이버 클라우드 서버로 전송**되고, Groq를 설정하면(CLOVA 다음 순위) **녹음 파일이 Groq 서버로 전송**됩니다. 이번 달 CLOVA 무료 사용량을 다 썼거나 호출이 실패한 녹음, Groq도 없거나 실패한 녹음, 그리고 둘 다 설정하지 않은 경우에는 로컬 Whisper(faster-whisper 또는 mlx-whisper)로 처리되어 녹음 파일이 외부로 나가지 않습니다. 민감한 회의는 CLOVA·Groq 설정 없이 로컬 Whisper만으로 실행하는 것을 권장합니다.
 
 회의록 요약, 이해도 확인 문제 생성, 대화창 답변은 상용 LLM 서비스(Gemini API)로 처리되며, 실패 시 로컬 모델(Ollama)을 통해 처리됩니다(`OLLAMA_MODEL`을 설정한 경우).
 Gemini를 사용하면 **전사본과 회의록 내용이 Google 서버로 전송**됩니다. 무료 API 키는 입력 데이터가 Google 서비스 개선에 사용될 수 있으므로, 민감한 회의는 Gemini 설정 없이 Ollama만으로 실행하는 것을 권장합니다.
@@ -38,7 +38,8 @@ GEMINI_MODEL=사용할_모델_ID
 OLLAMA_MODEL=qwen2.5:7b               # (선택) Gemini 실패 시 사용할 로컬 모델
 CLOVA_SPEECH_INVOKE_URL=콘솔의_Invoke_URL   # 네이버 클라우드 CLOVA Speech (아래 STT 설정 참고)
 CLOVA_SPEECH_SECRET_KEY=콘솔의_Secret_Key
-FASTER_WHISPER_MODEL=large-v3-turbo        # CLOVA 무료 사용량 소진·실패 시 쓸 로컬 Whisper (Windows 포함 모든 OS)
+GROQ_API_KEY=발급받은_API_키                # (선택) CLOVA 다음 순위. https://console.groq.com 에서 무료 발급
+FASTER_WHISPER_MODEL=large-v3-turbo        # CLOVA·Groq 모두 없거나 실패 시 쓸 로컬 Whisper (Windows 포함 모든 OS)
 ```
 
 프로젝트가 `.env`를 자동으로 읽지 않으므로, 서버 실행 전에 불러옵니다:
@@ -65,6 +66,8 @@ python manage.py runserver
 | `CLOVA_SPEECH_INVOKE_URL`, `CLOVA_SPEECH_SECRET_KEY` | 둘 다 있으면 네이버 CLOVA Speech로 전사. 이번 달 무료 사용량이 남아 있을 때만 호출 |
 | `CLOVA_SPEECH_FREE_MINUTES` | (선택) 한 달에 CLOVA로 보낼 최대 분량(분), 기본 20(Free 플랜 무료 제공량). 유료(Basic) 플랜이면 크게 올려서 사용 |
 | `CLOVA_SPEECH_DIARIZATION` | (선택) `1`이면 화자 구분을 켜서 전사본을 "화자 A: …" 줄로 나눔. Basic 플랜에서는 화자인식이 따로 과금됨 |
+| `GROQ_API_KEY` | (선택) 있으면 CLOVA 무료 사용량 소진·실패 시 Groq의 Whisper API로 전사. 화자 구분은 지원하지 않음 |
+| `GROQ_MODEL` | (선택) 기본 `whisper-large-v3-turbo`. 더 정확하지만 느린 `whisper-large-v3`로 바꿀 수 있음 |
 | `FASTER_WHISPER_MODEL` | 로컬 Whisper(모든 OS). `pip install faster-whisper`, 예: `large-v3-turbo` (첫 전사 때 약 1.6GB 자동 다운로드). ffmpeg 불필요 |
 | `FASTER_WHISPER_DEVICE`, `FASTER_WHISPER_COMPUTE_TYPE` | (선택) 기본 `auto`(NVIDIA GPU가 되면 GPU, 아니면 CPU) / `default`. CPU만 쓸 때는 `int8`이 빠름 |
 | `MLX_WHISPER_MODEL` | (Apple Silicon Mac 전용, 설정 시 faster-whisper보다 우선) `pip install mlx-whisper` + ffmpeg, 예: `mlx-community/whisper-large-v3-turbo` |
@@ -78,8 +81,9 @@ LLM/STT 환경변수를 하나도 설정하지 않으면 자동으로 가짜 응
 전사 엔진은 다음 순서로 고릅니다. 회의 상세 화면의 녹음 업로드 폼에 지금 어떤 엔진이 쓰이는지와 이번 달 CLOVA 무료 사용량이 표시됩니다.
 
 1. **CLOVA Speech** — `CLOVA_SPEECH_INVOKE_URL`과 `CLOVA_SPEECH_SECRET_KEY`가 있고, 이번 달 사용량 + 이 녹음 길이가 `CLOVA_SPEECH_FREE_MINUTES`(기본 20분) 안에 들어올 때
-2. **로컬 Whisper** — CLOVA 무료 사용량을 다 썼거나, CLOVA 호출이 실패했거나(키 오류, 네트워크, 서버 오류), CLOVA를 설정하지 않았을 때. `MLX_WHISPER_MODEL`(Mac) 또는 `FASTER_WHISPER_MODEL`(모든 OS)
-3. 둘 다 없으면 가짜 응답 모드
+2. **Groq Whisper API** — `GROQ_API_KEY`가 있고, CLOVA 무료 사용량을 다 썼거나 CLOVA 호출이 실패했거나 CLOVA를 설정하지 않았을 때
+3. **로컬 Whisper** — 위 둘 다 없거나 둘 다 실패했을 때. `MLX_WHISPER_MODEL`(Mac) 또는 `FASTER_WHISPER_MODEL`(모든 OS)
+4. 셋 다 없으면 가짜 응답 모드
 
 **CLOVA Speech 준비** ([네이버 클라우드 플랫폼](https://www.ncloud.com) 콘솔)
 
@@ -87,6 +91,13 @@ LLM/STT 환경변수를 하나도 설정하지 않으면 자동으로 가짜 응
 2. 만든 도메인의 **빌더 > 설정 > 연동 정보**에서 `Secret Key`와 `Invoke URL`을 복사해 `.env`에 넣습니다.
 3. 무료 제공량은 네이버 클라우드가 15초 단위로 올림해 계산하므로, 이 프로젝트도 같은 단위로 사용량을 기록합니다(`SttUsage` 테이블, 매월 1일 초기화). 길이를 미리 알 수 없는 파일(브라우저 마이크 녹음 등)은 호출 뒤 응답으로 사용량을 기록하므로 마지막 한 건은 한도를 조금 넘길 수 있습니다. 무료 플랜의 정확한 제공량과 초과 시 동작은 콘솔의 요금 안내에서 확인하세요.
 4. 실측(Free 도메인): 24초 음성을 2.5초에 전사했습니다. 다만 합성음 테스트에서 사람 이름 하나가 통째로 빠진 적이 있으니(같은 음성을 Whisper는 정확히 전사), 실제 회의 녹음으로 품질을 한 번 확인해 보세요. 장부(`SttUsage`)는 이 앱이 보낸 호출만 세므로, 콘솔이나 다른 도구로 직접 호출한 분량은 포함되지 않습니다.
+
+**Groq Whisper API 준비** ([console.groq.com](https://console.groq.com))
+
+1. 가입 후 API Keys에서 키를 발급받아 `.env`의 `GROQ_API_KEY`에 넣습니다. 신용카드 등록 없이 바로 쓸 수 있는 무료 등급이 있습니다.
+2. Groq가 호스팅하는 모델도 로컬에서 쓰는 것과 같은 Whisper(large-v3-turbo)라서 전사 품질은 로컬과 동일하고, 다만 계산을 Groq 서버에서 빠르게 처리해 줍니다. 공식 모델 페이지 기준 시간당 과금은 \$0.04이고, 무료 등급 한도는 계정마다 다를 수 있으니 가입 후 콘솔의 Limits 페이지에서 확인하세요.
+3. 화자 구분(diarization)은 지원하지 않습니다 — 화자를 구분해야 하는 회의는 CLOVA(`CLOVA_SPEECH_DIARIZATION=1`)를 계속 쓰세요.
+4. 스트리밍(실시간 자막)은 지원하지 않고 파일을 통째로 보낸 뒤 한 번에 결과를 받는 방식이라, 녹음을 다 올린 뒤 전사하는 이 프로젝트의 구조와는 잘 맞습니다.
 
 **로컬 Whisper 준비 (Windows / Linux / Intel Mac)**
 
