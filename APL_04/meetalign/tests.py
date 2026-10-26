@@ -24,6 +24,7 @@ _MODEL_ENV_VARS = (
     "GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_TIMEOUT", "OLLAMA_MODEL", "MLX_WHISPER_MODEL",
     "FASTER_WHISPER_MODEL", "FASTER_WHISPER_DEVICE", "FASTER_WHISPER_COMPUTE_TYPE",
     "CLOVA_SPEECH_INVOKE_URL", "CLOVA_SPEECH_SECRET_KEY", "CLOVA_SPEECH_FREE_MINUTES", "CLOVA_SPEECH_DIARIZATION",
+    "GROQ_API_KEY", "GROQ_MODEL",
 )
 _saved_model_env = {}
 
@@ -863,6 +864,115 @@ class ClovaSTTTests(TestCase):
             self.assertNotContains(self.client.get(url), "전사 엔진")
         with patch.dict(os.environ, self.CLOVA_ENV, clear=True):
             self.assertContains(self.client.get(url), "전사 엔진: CLOVA Speech · 이번 달 무료 사용량 0/20분")
+
+
+class GroqSTTTests(TestCase):
+    CLOVA_ENV = ClovaSTTTests.CLOVA_ENV
+    GROQ_ENV = {"GROQ_API_KEY": "groq-key-1"}
+    LOCAL_ENV = {"FASTER_WHISPER_MODEL": "large-v3-turbo"}
+    LOCAL_RESULT = MagicMock(returncode=0, stdout=json.dumps("로컬 전사"), stderr="")
+
+    def setUp(self):
+        self.audio = os.path.join(tempfile.mkdtemp(), "회의.wav")
+        with open(self.audio, "wb") as f:
+            f.write(b"RIFF-fake-audio-bytes")
+
+    def _fake_urlopen(self, captured, text):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self):
+                return text.encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["headers"] = dict(request.header_items())
+            captured["body"] = b"".join(request.data)
+            captured["timeout"] = timeout
+            return FakeResponse()
+        return fake_urlopen
+
+    def test_groq_enabled_requires_api_key(self):
+        with patch.dict(os.environ, self.GROQ_ENV, clear=True):
+            self.assertTrue(services._groq_enabled())
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(services._groq_enabled())
+
+    def test_groq_request_format(self):
+        captured = {}
+        with patch.dict(os.environ, self.GROQ_ENV, clear=True), \
+                patch("urllib.request.urlopen", side_effect=self._fake_urlopen(captured, " 안녕하세요, 회의 시작합니다. ")):
+            self.assertEqual(services.transcribe(self.audio), "안녕하세요, 회의 시작합니다.")
+        self.assertEqual(captured["url"], services.GROQ_URL)
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer groq-key-1")
+        self.assertTrue(captured["headers"]["Content-type"].startswith("multipart/form-data; boundary="))
+        self.assertEqual(int(captured["headers"]["Content-length"]), len(captured["body"]))
+        self.assertEqual(captured["timeout"], services.TRANSCRIBE_TIMEOUT_SECONDS)
+        self.assertIn(b'name="model"\r\n\r\nwhisper-large-v3-turbo\r\n', captured["body"])
+        self.assertIn(b'name="language"\r\n\r\nko\r\n', captured["body"])
+        self.assertIn(b'name="response_format"\r\n\r\ntext\r\n', captured["body"])
+        self.assertIn('name="file"; filename="회의.wav"'.encode("utf-8"), captured["body"])
+        self.assertIn(b"\r\n\r\nRIFF-fake-audio-bytes\r\n--", captured["body"])
+
+    def test_groq_model_env_overrides_default(self):
+        captured = {}
+        with patch.dict(os.environ, {**self.GROQ_ENV, "GROQ_MODEL": "whisper-large-v3"}, clear=True), \
+                patch("urllib.request.urlopen", side_effect=self._fake_urlopen(captured, "전사")):
+            services.transcribe(self.audio)
+        self.assertIn(b'name="model"\r\n\r\nwhisper-large-v3\r\n', captured["body"])
+
+    def test_groq_used_when_clova_quota_exhausted(self):
+        SttUsage.objects.create(audio_seconds=20 * 60)
+        with patch.dict(os.environ, {**self.CLOVA_ENV, **self.GROQ_ENV}, clear=True), \
+                patch("urllib.request.urlopen", side_effect=self._fake_urlopen({}, "그록 전사")):
+            self.assertEqual(services.transcribe(self.audio), "그록 전사")
+        self.assertEqual(SttUsage.objects.count(), 1)  # CLOVA 호출이 없었으니 그대로
+
+    def test_groq_used_after_clova_http_error(self):
+        import urllib.error
+        error = urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+        calls = {"n": 0}
+
+        def side_effect(request, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise error
+            return self._fake_urlopen({}, "그록 전사")(request, timeout)
+
+        with patch.dict(os.environ, {**self.CLOVA_ENV, **self.GROQ_ENV}, clear=True), \
+                patch("urllib.request.urlopen", side_effect=side_effect), \
+                patch.object(services, "_audio_duration_seconds", return_value=None), \
+                self.assertLogs(services.logger, "WARNING"):
+            self.assertEqual(services.transcribe(self.audio), "그록 전사")
+        self.assertEqual(calls["n"], 2)
+
+    def test_groq_failure_falls_back_to_local(self):
+        import urllib.error
+        error = urllib.error.HTTPError("u", 500, "Server Error", {}, None)
+        with patch.dict(os.environ, {**self.GROQ_ENV, **self.LOCAL_ENV}, clear=True), \
+                patch("urllib.request.urlopen", side_effect=error), \
+                patch.object(services.subprocess, "run", return_value=self.LOCAL_RESULT) as run, \
+                self.assertLogs(services.logger, "WARNING") as logs:
+            self.assertEqual(services.transcribe(self.audio), "로컬 전사")
+        self.assertEqual(run.call_args[0][0][2], "faster")
+        self.assertIn("Groq Whisper 오류 500", logs.output[0])
+
+    def test_groq_failure_without_local_raises(self):
+        import urllib.error
+        error = urllib.error.HTTPError("u", 500, "Server Error", {}, io.BytesIO(b"rate limited"))
+        with patch.dict(os.environ, self.GROQ_ENV, clear=True), patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(RuntimeError) as ctx:
+                services.transcribe(self.audio)
+        self.assertIn("Groq Whisper 오류 500", str(ctx.exception))
+        self.assertIn("rate limited", str(ctx.exception))
+
+    def test_stt_status_text_prefers_groq_over_local_as_fallback_label(self):
+        with patch.dict(os.environ, {**self.CLOVA_ENV, **self.GROQ_ENV, **self.LOCAL_ENV}, clear=True):
+            self.assertIn("(소진 시 Groq Whisper로 전환)", services.stt_status_text())
+        with patch.dict(os.environ, self.GROQ_ENV, clear=True):
+            self.assertEqual(services.stt_status_text(), "전사 엔진: Groq Whisper")
 
 
 class WhisperWorkerTests(TestCase):

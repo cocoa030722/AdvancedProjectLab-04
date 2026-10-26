@@ -1,8 +1,9 @@
 """LLM/STT 연결 지점. GEMINI_API_KEY와 GEMINI_MODEL이 모두 있으면 Gemini API를, 아니고 OLLAMA_MODEL이 있으면 로컬 Ollama를 LLM으로 쓴다.
 둘 다 설정돼 있으면 Gemini를 먼저 쓰고, Gemini 호출이 실패하면 Ollama로 다시 시도한다.
 STT는 CLOVA_SPEECH_INVOKE_URL과 CLOVA_SPEECH_SECRET_KEY가 모두 있으면 네이버 CLOVA Speech를 쓰되, 이번 달 무료 사용량
-(CLOVA_SPEECH_FREE_MINUTES, 기본 20분)을 다 썼거나 호출이 실패하면 로컬 Whisper(MLX_WHISPER_MODEL 또는 FASTER_WHISPER_MODEL)로
-넘어간다. 해당 환경변수가 없으면 현재(가짜) 동작을 그대로 쓴다."""
+(CLOVA_SPEECH_FREE_MINUTES, 기본 20분)을 다 썼거나 호출이 실패하면 GROQ_API_KEY가 있을 때 Groq의 Whisper API로,
+그마저 없거나 실패하면 로컬 Whisper(MLX_WHISPER_MODEL 또는 FASTER_WHISPER_MODEL)로 넘어간다. 해당 환경변수가 없으면
+현재(가짜) 동작을 그대로 쓴다."""
 
 import json
 import logging
@@ -63,6 +64,14 @@ CLOVA_BILLING_UNIT_SECONDS = 15
 
 def _clova_enabled():
     return bool(os.environ.get("CLOVA_SPEECH_INVOKE_URL") and os.environ.get("CLOVA_SPEECH_SECRET_KEY"))
+
+
+GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_DEFAULT_MODEL = "whisper-large-v3-turbo"
+
+
+def _groq_enabled():
+    return bool(os.environ.get("GROQ_API_KEY"))
 
 
 def _local_stt_engine():
@@ -183,6 +192,52 @@ def _transcribe_clova(path):
     return _clova_text(data, segments, diarize), end_seconds
 
 
+def _groq_multipart(path, model):
+    """urllib에는 multipart 인코더가 없어서 직접 만든다. 녹음 파일(최대 500MB)을 통째로 메모리에 올리지 않도록 본문을
+    머리말 → 파일 조각들 → 꼬리말 순서로 내보내는 제너레이터와, 미리 계산한 Content-Length, Content-Type을 돌려준다."""
+    boundary = uuid.uuid4().hex
+    head = (
+        '--%s\r\nContent-Disposition: form-data; name="model"\r\n\r\n%s\r\n'
+        '--%s\r\nContent-Disposition: form-data; name="language"\r\n\r\nko\r\n'
+        '--%s\r\nContent-Disposition: form-data; name="response_format"\r\n\r\ntext\r\n'
+        '--%s\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\nContent-Type: application/octet-stream\r\n\r\n'
+        % (boundary, model, boundary, boundary, boundary, os.path.basename(path))
+    ).encode("utf-8")
+    tail = ("\r\n--%s--\r\n" % boundary).encode("utf-8")
+
+    def body():
+        yield head
+        with open(path, "rb") as audio:
+            while chunk := audio.read(1024 * 1024):
+                yield chunk
+        yield tail
+
+    return body(), len(head) + os.path.getsize(path) + len(tail), "multipart/form-data; boundary=%s" % boundary
+
+
+def _transcribe_groq(path):
+    """Groq의 OpenAI 호환 Whisper 엔드포인트 호출(로컬 파일 업로드). response_format=text로 받아 전사 텍스트를
+    그대로 돌려준다(JSON 파싱 불필요). CLOVA와 달리 무료 사용량을 앱에서 추적하지 않는다(Groq 콘솔에서 확인).
+    HTTP/네트워크 오류는 이유를 담은 RuntimeError로 올린다."""
+    model = os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL)
+    body, length, content_type = _groq_multipart(path, model)
+    request = urllib.request.Request(
+        GROQ_URL, data=body, method="POST",
+        headers={
+            "Content-Type": content_type, "Content-Length": str(length),
+            "Authorization": "Bearer %s" % os.environ["GROQ_API_KEY"],
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TRANSCRIBE_TIMEOUT_SECONDS) as response:
+            return response.read().decode("utf-8").strip()
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace").strip()[:200] if error.fp is not None else ""
+        raise RuntimeError("Groq Whisper 오류 %d: %s" % (error.code, detail or error.reason)) from error
+    except OSError as error:
+        raise RuntimeError("Groq Whisper 연결 실패: %s" % error) from error
+
+
 def _transcribe_local(recording_path, engine):
     """로컬 Whisper(mlx-whisper 또는 faster-whisper)는 별도 프로세스(whisper_worker.py)로 띄워서 실행한다. Django 개발 서버는
     요청마다 새 스레드를 쓰는데, mlx의 GPU 스트림이 스레드에 묶여 있어서 같은 프로세스 안에서 다른 스레드가 연달아 호출하면
@@ -208,27 +263,38 @@ def _transcribe_local(recording_path, engine):
 
 
 def transcribe(recording_path, recording_id=None):
-    """녹음 파일을 전사한다. CLOVA Speech가 설정돼 있고 이번 달 무료 사용량이 남아 있으면 CLOVA로, 한도를 다 썼거나 CLOVA 호출이
-    실패하면 로컬 Whisper로 전사한다. 로컬 Whisper가 없으면 그 이유를 그대로 올려서 화면에 실패 사유로 보이게 한다.
-    어느 쪽도 설정돼 있지 않으면 None(가짜 동작 유지). recording_id는 사용량 기록에 어떤 녹음이었는지 남기는 용도."""
+    """녹음 파일을 전사한다. 네이버 CLOVA Speech(이번 달 무료 사용량 이내) → Groq Whisper API → 로컬 Whisper 순서로
+    시도하고, 앞 단계가 설정돼 있지 않거나 실패하면 다음 단계로 넘어간다. 아무 것도 설정돼 있지 않으면 None(가짜 동작
+    유지). recording_id는 CLOVA 사용량 기록에 어떤 녹음이었는지 남기는 용도."""
     local = _local_stt_engine()
+    fallback_available = _groq_enabled() or local is not None
+
     if _clova_enabled():
         duration = _audio_duration_seconds(recording_path)
         if _clova_budget_allows(duration):
             try:
                 text, end_seconds = _transcribe_clova(recording_path)
             except RuntimeError as error:
-                if local is None:
+                if not fallback_available:
                     raise
-                logger.warning("%s — %s로 전환합니다", error, LOCAL_STT_LABELS[local])
+                logger.warning("%s — 다음 전사 엔진으로 전환합니다", error)
             else:
                 SttUsage.objects.create(recording_id=recording_id, audio_seconds=_round_up_billing(max(duration or 0, end_seconds)))
                 return text
         else:
             message = "CLOVA Speech 이번 달 무료 사용량(%d분)을 다 썼습니다" % (_clova_limit_seconds() // 60)
+            if not fallback_available:
+                raise RuntimeError(message + ". Groq나 로컬 Whisper를 설정하면 그쪽으로 넘어갑니다")
+            logger.info("%s — 다음 전사 엔진으로 전사합니다", message)
+
+    if _groq_enabled():
+        try:
+            return _transcribe_groq(recording_path)
+        except RuntimeError as error:
             if local is None:
-                raise RuntimeError(message + ". 로컬 Whisper(FASTER_WHISPER_MODEL)를 설정하면 그쪽으로 넘어갑니다")
-            logger.info("%s — %s로 전사합니다", message, LOCAL_STT_LABELS[local])
+                raise
+            logger.warning("%s — %s로 전환합니다", error, LOCAL_STT_LABELS[local])
+
     return _transcribe_local(recording_path, local)
 
 
@@ -236,16 +302,23 @@ def _format_minutes(seconds):
     return ("%.1f" % (seconds / 60)).rstrip("0").rstrip(".")
 
 
+def _fallback_stt_label():
+    """CLOVA 다음으로 넘어갈 전사 엔진 이름(화면 안내용). Groq가 설정돼 있으면 그걸, 아니면 로컬 엔진. 둘 다 없으면 None."""
+    if _groq_enabled():
+        return "Groq Whisper"
+    return LOCAL_STT_LABELS.get(_local_stt_engine())
+
+
 def stt_status_text():
     """회의 상세 화면의 녹음 업로드 폼에 보여줄 전사 엔진 안내 한 줄. 어떤 STT도 설정돼 있지 않으면 None."""
-    local = LOCAL_STT_LABELS.get(_local_stt_engine())
+    fallback = _fallback_stt_label()
     if not _clova_enabled():
-        return "전사 엔진: %s" % local if local else None
+        return "전사 엔진: %s" % fallback if fallback else None
     used, limit = clova_used_seconds(), _clova_limit_seconds()
     status = "전사 엔진: CLOVA Speech · 이번 달 무료 사용량 %s/%d분" % (_format_minutes(used), limit // 60)
     if used >= limit:
-        return status + (" (소진 → %s로 전사)" % local if local else " (소진 — 로컬 모델이 없어 전사가 실패합니다)")
-    return status + (" (소진 시 %s로 전환)" % local if local else "")
+        return status + (" (소진 → %s로 전사)" % fallback if fallback else " (소진 — 로컬 모델이 없어 전사가 실패합니다)")
+    return status + (" (소진 시 %s로 전환)" % fallback if fallback else "")
 
 
 def _generate(prompt, temperature=None):
