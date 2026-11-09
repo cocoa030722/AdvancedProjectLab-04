@@ -2,7 +2,7 @@
 {% block content %}
 <div class="page-head">
   <div>
-    <h1><a href="{% url 'index' %}" class="crumb-link">홈</a> <span class="crumb-sep">/</span> {{ team.name }}</h1>
+    <h1><a href="{% url 'index' %}" class="crumb-link">뒤로 가기</a> <span class="crumb-sep">/</span> {{ team.name }}</h1>
   </div>
   <div class="row" style="gap:8px">
     {% if team.created_by_id == user.id %}
