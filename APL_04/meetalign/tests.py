@@ -4267,6 +4267,250 @@ class DecisionAckTests(TestCase):
         self.assertEqual(self._as(self.alice).get(self.review_url).status_code, 403)
 
 
+class DecisionCardTests(TestCase):
+    """결정 확인 카드 목록 — 한 화면에서 확인·의견·질문을 끝낸다(사용자 테스트 피드백 반영)."""
+
+    TRANSCRIPT = "민수가 금요일까지 배포를 맡기로 했습니다. 문서는 다음 주에 보기로 해요."
+
+    def setUp(self):
+        self.host = User.objects.create_user("hostuser", password="pw12345!")
+        self.alice = User.objects.create_user("aliceuser", password="pw12345!")
+        self.bob = User.objects.create_user("bobuser", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host, self.alice, self.bob)
+        self.meeting = Meeting.objects.create(
+            team=self.team, title="m", host=self.host,
+            processing_status=Meeting.STATUS_DONE, record="회의록", transcript=self.TRANSCRIPT,
+        )
+        self.decisions = [
+            Decision.objects.create(
+                meeting=self.meeting, order=i, what="안건 %d" % i,
+                status=Decision.STATUS_PUBLISHED, final_text="확정 문장 %d" % i,
+            )
+            for i in range(4)
+        ]
+        self.undecided = Decision.objects.create(
+            meeting=self.meeting, order=9, what="결론 못 낸 안건", status=Decision.STATUS_UNDECIDED,
+            marked_undecided=True, final_text="이 안건은 다음 회의에서 다시 정한다",
+        )
+        self.url = reverse("decision_ack", args=[self.meeting.id])
+        self.client.force_login(self.alice)
+
+    def _agree_url(self, decision):
+        return reverse("decision_agree", args=[self.meeting.id, decision.id])
+
+    def _ask_url(self, decision):
+        return reverse("decision_ask", args=[self.meeting.id, decision.id])
+
+    def _as(self, user):
+        client = Client()
+        client.force_login(user)
+        return client
+
+    # ---- 2-1. 한 화면 목록 ----
+
+    def test_every_published_decision_is_on_one_screen(self):
+        r = self.client.get(self.url)
+        for decision in self.decisions:
+            self.assertContains(r, decision.final_text)
+        # 넘겨 보기 없이 카드 5개(공개 4 + 미결정 1)가 한 응답에 들어온다.
+        self.assertEqual(len(r.context["rows"]), 5)
+        self.assertNotContains(r, 'id="step-next"')
+
+    def test_undecided_items_are_read_only(self):
+        r = self.client.get(self.url)
+        body = r.content.decode()
+        card = body[body.index('id="decision-%d"' % self.undecided.id):]
+        self.assertIn("미결정", card)
+        # 그 카드 안에는 확인 버튼도 저장 폼도 없다.
+        self.assertNotIn(self._agree_url(self.undecided), body)
+        self.assertEqual(self.client.post(self._agree_url(self.undecided), {"kind": "ack"}).status_code, 404)
+
+    def test_progress_counts_only_my_own_answers(self):
+        self.assertContains(self.client.get(self.url), "4개 중 0개 확인함")
+        self.client.post(self._agree_url(self.decisions[0]), {"kind": "ack"})
+        self.client.post(self._agree_url(self.decisions[1]), {"kind": "differ"})
+        self.assertContains(self.client.get(self.url), "4개 중 2개 확인함")
+        # 밥이 응답해도 앨리스의 진행률은 그대로다.
+        self._as(self.bob).post(self._agree_url(self.decisions[2]), {"kind": "ack"})
+        self.assertContains(self.client.get(self.url), "4개 중 2개 확인함")
+
+    def test_revised_item_asks_for_a_fresh_check(self):
+        self.client.post(self._agree_url(self.decisions[0]), {"kind": "ack"})
+        self.assertNotContains(self.client.get(self.url), "다시 확인해 주세요")
+        decision_compiler.revise_final_text(self.decisions[0], "고친 확정 문장")
+        self.assertContains(self.client.get(self.url), "내용이 수정되었어요 — 다시 확인해 주세요")
+
+    # ---- 2-1. 카드 저장 (fetch / 일반 POST) ----
+
+    def test_plain_post_saves_and_redirects_back_to_the_card(self):
+        r = self.client.post(self._agree_url(self.decisions[0]), {"kind": "ack", "comment": "알겠습니다"})
+        self.assertRedirects(r, "%s#decision-%d" % (self.url, self.decisions[0].id))
+        agreement = DecisionAgreement.objects.get(decision=self.decisions[0], user=self.alice)
+        self.assertEqual(agreement.kind, DecisionAgreement.KIND_ACK)
+        self.assertEqual(agreement.comment, "알겠습니다")
+
+    def test_fetch_post_saves_and_returns_only_that_card(self):
+        r = self.client.post(
+            self._agree_url(self.decisions[0]),
+            {"kind": "differ", "comment": "저는 다음 주로 들었어요"},
+            headers={"x-requested-with": "fetch"},
+        )
+        self.assertEqual(r.status_code, 200)
+        payload = r.json()
+        self.assertIn("확정 문장 0", payload["card"])
+        self.assertNotIn("확정 문장 1", payload["card"])  # 다른 카드는 건드리지 않는다
+        self.assertEqual(payload["progress"], {"done": 1, "total": 4, "percent": 25})
+        agreement = DecisionAgreement.objects.get(decision=self.decisions[0], user=self.alice)
+        self.assertEqual(agreement.kind, DecisionAgreement.KIND_DIFFER)
+        self.assertEqual(agreement.comment, "저는 다음 주로 들었어요")
+
+    def test_choice_can_be_changed_and_stays_one_row(self):
+        for kind in ("ack", "differ", "ack"):
+            self.client.post(self._agree_url(self.decisions[0]), {"kind": kind})
+        rows = DecisionAgreement.objects.filter(decision=self.decisions[0])
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(rows.first().kind, DecisionAgreement.KIND_ACK)
+
+    def test_unknown_choice_is_rejected(self):
+        r = self.client.post(self._agree_url(self.decisions[0]), {"kind": "모르겠어요"})
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(DecisionAgreement.objects.exists())
+
+    # ---- 2-2. 카드 안에서 바로 AI에게 묻기 ----
+
+    def test_ai_answer_comes_back_in_the_card_and_is_saved_to_the_chat_log(self):
+        with patch.dict(os.environ, {}, clear=True):  # 가짜 응답 모드
+            r = self.client.post(
+                self._ask_url(self.decisions[0]), {"mode": "ai", "text": "제가 할 일은 뭔가요?"},
+                headers={"x-requested-with": "fetch"},
+            )
+        card = r.json()["card"]
+        self.assertIn("테스트용 가짜 AI 응답", card)
+        self.assertIn("제가 할 일은 뭔가요?", card)
+        turns = list(ChatMessage.objects.filter(meeting=self.meeting, user=self.alice).values_list("role", "text"))
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0][0], ChatMessage.ROLE_USER)
+        # 대화창에서도 어떤 결정에 대한 질문이었는지 알 수 있어야 한다.
+        self.assertIn("확정 문장 0", turns[0][1])
+        self.assertIn("제가 할 일은 뭔가요?", turns[0][1])
+        self.assertEqual(turns[1][0], ChatMessage.ROLE_ASSISTANT)
+
+    def test_the_prompt_carries_the_decision_sentence(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "_generate_clean", return_value="답변입니다") as gen:
+            self.client.post(self._ask_url(self.decisions[0]), {"mode": "ai", "text": "언제까지인가요?"})
+        prompt = gen.call_args[0][0]
+        self.assertIn("이 질문은 다음 결정에 대한 것이다: 확정 문장 0", prompt)
+        self.assertIn("언제까지인가요?", prompt)
+
+    def test_ai_answer_is_rendered_without_javascript_too(self):
+        with patch.dict(os.environ, {}, clear=True):
+            r = self.client.post(self._ask_url(self.decisions[0]), {"mode": "ai", "text": "무슨 뜻이에요?"})
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "테스트용 가짜 AI 응답")
+        self.assertContains(r, "무슨 뜻이에요?")
+
+    def test_a_failed_ai_call_shows_the_existing_fallback_message(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "_generate_clean", side_effect=OSError("down")):
+            r = self.client.post(self._ask_url(self.decisions[0]), {"mode": "ai", "text": "질문"})
+        self.assertContains(r, "AI 연결 실패")
+
+    def test_an_empty_question_is_rejected(self):
+        r = self.client.post(self._ask_url(self.decisions[0]), {"mode": "ai", "text": "   "})
+        self.assertContains(r, "질문을 입력해 주세요")
+        self.assertFalse(ChatMessage.objects.exists())
+
+    def test_outsider_cannot_ask_through_a_card(self):
+        outsider = self._as(User.objects.create_user("outsider2", password="pw12345!"))
+        r = outsider.post(self._ask_url(self.decisions[0]), {"mode": "ai", "text": "질문"})
+        self.assertEqual(r.status_code, 404)
+        self.assertFalse(ChatMessage.objects.exists())
+
+    # ---- 2-2. 카드 안에서 주최자에게 익명으로 묻기 ----
+
+    def test_anonymous_question_is_linked_to_the_decision(self):
+        r = self.client.post(
+            self._ask_url(self.decisions[1]), {"mode": "anon", "text": "이 기한이 맞나요?"},
+            headers={"x-requested-with": "fetch"},
+        )
+        self.assertEqual(r.status_code, 200)
+        question = Question.objects.get(meeting=self.meeting)
+        self.assertEqual(question.decision_id, self.decisions[1].id)
+        self.assertEqual(question.text, "이 기한이 맞나요?")
+        self.assertEqual(question.user, self.alice)  # 본인 확인용으로만 저장된다
+        self.assertFalse(ChatMessage.objects.exists())  # AI를 부르지 않는다
+
+    def test_host_inbox_shows_the_decision_sentence_but_not_the_author(self):
+        self.client.post(self._ask_url(self.decisions[1]), {"mode": "anon", "text": "이 기한이 맞나요?"})
+        host = self._as(self.host)
+        for url in (reverse("inbox", args=[self.meeting.id]), reverse("answers", args=[self.meeting.id])):
+            r = host.get(url)
+            self.assertContains(r, "이 기한이 맞나요?")
+            self.assertContains(r, "확정 문장 1")
+            self.assertNotContains(r, self.alice.username)
+
+    def test_the_asker_sees_their_own_question_and_answer_in_the_card(self):
+        self.client.post(self._ask_url(self.decisions[1]), {"mode": "anon", "text": "이 기한이 맞나요?"})
+        self.assertContains(self.client.get(self.url), "이 기한이 맞나요?")
+        question = Question.objects.get(meeting=self.meeting)
+        question.answer = "네, 금요일이 맞습니다"
+        question.save()
+        r = self.client.get(self.url)
+        self.assertContains(r, "네, 금요일이 맞습니다")
+        # 익명 질문함에서도 본인은 자기 질문과 답변을 본다.
+        self.assertContains(self.client.get(reverse("inbox", args=[self.meeting.id])), "네, 금요일이 맞습니다")
+
+    def test_another_members_card_never_shows_my_anonymous_question(self):
+        self.client.post(self._ask_url(self.decisions[1]), {"mode": "anon", "text": "이 기한이 맞나요?"})
+        bob = self._as(self.bob)
+        self.assertNotContains(bob.get(self.url), "이 기한이 맞나요?")
+        # 익명 질문함도 주최자가 아닌 팀원에게는 본인 질문만 보여준다.
+        self.assertNotContains(bob.get(reverse("inbox", args=[self.meeting.id])), "이 기한이 맞나요?")
+
+    def test_anonymous_question_is_blocked_on_an_ended_meeting(self):
+        Meeting.objects.filter(pk=self.meeting.pk).update(ended=True)
+        r = self.client.post(self._ask_url(self.decisions[1]), {"mode": "anon", "text": "질문"})
+        self.assertContains(r, "종료된 회의에는 익명 질문을 보낼 수 없습니다")
+        self.assertFalse(Question.objects.exists())
+
+    # ---- 노출 금지 ----
+
+    def test_my_choice_and_comment_are_not_in_another_members_response(self):
+        self.client.post(self._agree_url(self.decisions[0]), {"kind": "differ", "comment": "저는 다르게 들었어요"})
+        r = self._as(self.bob).get(self.url)
+        self.assertNotContains(r, "저는 다르게 들었어요")
+        self.assertNotContains(r, "달랐어요</span>")  # 내 선택 배지
+        self.assertContains(r, "4개 중 0개 확인함")
+        self.assertNotContains(r, self.alice.username)
+
+    def test_draft_items_are_never_in_the_member_response(self):
+        Decision.objects.create(
+            meeting=self.meeting, order=8, what="비공개 안건",
+            status=Decision.STATUS_DRAFT, final_text="아직 공개 안 된 문장",
+        )
+        r = self.client.get(self.url)
+        self.assertNotContains(r, "아직 공개 안 된 문장")
+        self.assertNotContains(r, "비공개 안건")
+
+    def test_outsider_cannot_see_or_save(self):
+        outsider = self._as(User.objects.create_user("outsider", password="pw12345!"))
+        self.assertEqual(outsider.get(self.url).status_code, 404)
+        self.assertEqual(outsider.post(self._agree_url(self.decisions[0]), {"kind": "ack"}).status_code, 404)
+        self.assertFalse(DecisionAgreement.objects.exists())
+
+    def test_decision_of_another_meeting_cannot_be_saved_through_this_meeting(self):
+        other = Meeting.objects.create(
+            team=self.team, title="m2", host=self.host, processing_status=Meeting.STATUS_DONE,
+        )
+        elsewhere = Decision.objects.create(
+            meeting=other, order=0, status=Decision.STATUS_PUBLISHED, final_text="다른 회의의 결정",
+        )
+        r = self.client.post(reverse("decision_agree", args=[self.meeting.id, elsewhere.id]), {"kind": "ack"})
+        self.assertEqual(r.status_code, 404)
+
+
 class DecisionNotificationTests(TestCase):
     """공개·수정 알림과 그 알림을 보여주는 세 곳 — 상단 메뉴 아이콘·알림 목록, 회의 목록 배지, 회의 화면 안내."""
 
