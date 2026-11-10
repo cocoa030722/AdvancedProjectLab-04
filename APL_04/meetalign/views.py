@@ -2,6 +2,7 @@ import os
 
 from django.contrib.auth import login, logout
 from django.core.exceptions import PermissionDenied
+from django.core.paginator import Paginator
 from django.db import transaction
 from django.http import FileResponse, Http404, HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.contrib.auth.decorators import login_required
@@ -773,14 +774,33 @@ def _ack_rows(user, meeting):
     return rows, progress
 
 
+# 한 칸에 보여줄 카드 수. 일곱 개가 한꺼번에 쏟아지면 어디까지 봤는지 놓치기 때문에 끊어 보여준다.
+ACK_PAGE_SIZE = 4
+
+
+def _ack_page_number(request):
+    """보고 있던 칸 번호. 저장·질문 뒤에도 같은 칸으로 돌아오게 폼이 함께 보낸다."""
+    try:
+        return max(1, int(request.POST.get("page") or request.GET.get("page") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _ack_context(request, meeting):
     rows, progress = _ack_rows(request.user, meeting)
+    # 진행률은 칸과 무관하게 이 회의 전체 기준이다 — 칸마다 분모가 바뀌면 얼마나 남았는지 알 수 없다.
+    page = Paginator(rows, ACK_PAGE_SIZE).get_page(_ack_page_number(request))
+    shown = list(page)
     return {
         "meeting": meeting,
-        "rows": rows,
+        "rows": shown,
+        "page": page,
+        "ack_page": page.number,
+        # 다음 칸에 몇 개가 들어 있는지 — 버튼이 "다음 3개"처럼 말하면 끝이 보인다.
+        "next_count": min(ACK_PAGE_SIZE, page.paginator.count - page.end_index()) if page.has_next() else 0,
         "progress": progress,
         "evidence_data": {
-            str(row["decision"].id): _published_evidence_spans(meeting, row["decision"]) for row in rows
+            str(row["decision"].id): _published_evidence_spans(meeting, row["decision"]) for row in shown
         },
         # 카드 목록이라 한 문항씩 넘겨 보지 않는다 — 녹취 원문 창만 쓴다(_decision_viewer).
         "unpaged": True,
@@ -805,9 +825,11 @@ def decision_ack(request, meeting_id):
     return render(request, "meetalign/decision_ack.html", _ack_context(request, meeting))
 
 
-def _ack_redirect(meeting, decision):
-    """자바스크립트가 꺼진 브라우저용 — 방금 누른 카드 자리로 되돌려 보낸다."""
-    return redirect("%s#decision-%d" % (reverse("decision_ack", args=[meeting.id]), decision.id))
+def _ack_redirect(request, meeting, decision):
+    """자바스크립트가 꺼진 브라우저용 — 보고 있던 칸의 그 카드 자리로 되돌려 보낸다."""
+    return redirect("%s?page=%d#decision-%d" % (
+        reverse("decision_ack", args=[meeting.id]), _ack_page_number(request), decision.id,
+    ))
 
 
 def _wants_card_json(request):
@@ -829,12 +851,12 @@ def _ack_response(request, meeting, decision, **card_extra):
             raise Http404
         row.update(card_extra)
         card = render_to_string("meetalign/_decision_card.html", {
-            "meeting": meeting, "row": row,
+            "meeting": meeting, "row": row, "ack_page": _ack_page_number(request),
             "kind_ack": DecisionAgreement.KIND_ACK, "kind_differ": DecisionAgreement.KIND_DIFFER,
         }, request=request)
         return JsonResponse({"card": card, "progress": progress})
     if not card_extra:
-        return _ack_redirect(meeting, decision)
+        return _ack_redirect(request, meeting, decision)
     context = _ack_context(request, meeting)
     for row in context["rows"]:
         if row["decision"].id == decision.id:
@@ -854,7 +876,7 @@ def decision_agree(request, meeting_id, decision_id):
         Decision, pk=decision_id, meeting=meeting, status=Decision.STATUS_PUBLISHED,
     )
     if request.method != "POST":
-        return _ack_redirect(meeting, decision)
+        return _ack_redirect(request, meeting, decision)
     kind = request.POST.get("kind", "")
     if kind not in (DecisionAgreement.KIND_ACK, DecisionAgreement.KIND_DIFFER):
         return HttpResponseBadRequest("알 수 없는 선택입니다.")
@@ -887,7 +909,7 @@ def decision_ask(request, meeting_id, decision_id):
         status__in=[Decision.STATUS_PUBLISHED, Decision.STATUS_UNDECIDED],
     )
     if request.method != "POST":
-        return _ack_redirect(meeting, decision)
+        return _ack_redirect(request, meeting, decision)
     text = request.POST.get("text", "").strip()
     if not text:
         return _ack_response(request, meeting, decision, ask_open=True, ask_error="질문을 입력해 주세요.")

@@ -20,6 +20,18 @@
   <div id="decision-cards">
     {% for row in rows %}{% include "meetalign/_decision_card.html" %}{% endfor %}
   </div>
+  {# 한 번에 네 개씩 끊어 보여준다. 넘기는 것은 평범한 링크라 스크립트가 없어도 된다. #}
+  {% if page.paginator.num_pages > 1 %}
+  <div class="ack-pager">
+    {% if page.has_previous %}
+    <a class="btn sm secondary" href="?page={{ page.previous_page_number }}">‹ 이전</a>
+    {% else %}<span></span>{% endif %}
+    <span class="step-counter">{{ page.start_index }}–{{ page.end_index }}번째 · 전체 {{ page.paginator.count }}개 ({{ page.number }}/{{ page.paginator.num_pages }})</span>
+    {% if page.has_next %}
+    <a class="btn sm" href="?page={{ page.next_page_number }}">다음 {{ next_count }}개 ›</a>
+    {% else %}<span></span>{% endif %}
+  </div>
+  {% endif %}
   {% else %}
   <div class="empty">아직 공개된 결정이 없습니다. 진행자가 확정해서 공개하면 여기에 보이고 알림이 가요.</div>
   {% endif %}

@@ -4309,16 +4309,41 @@ class DecisionCardTests(TestCase):
 
     # ---- 2-1. 한 화면 목록 ----
 
-    def test_every_published_decision_is_on_one_screen(self):
+    def test_a_page_shows_four_cards_and_the_rest_are_on_the_next_page(self):
         r = self.client.get(self.url)
+        # 한 칸에 네 개까지 — 한꺼번에 쏟아지면 어디까지 봤는지 놓친다.
+        self.assertEqual(len(r.context["rows"]), 4)
         for decision in self.decisions:
             self.assertContains(r, decision.final_text)
-        # 넘겨 보기 없이 카드 5개(공개 4 + 미결정 1)가 한 응답에 들어온다.
-        self.assertEqual(len(r.context["rows"]), 5)
+        self.assertNotContains(r, self.undecided.final_text)
+        self.assertContains(r, "다음 1개")
+        nxt = self.client.get(self.url, {"page": 2})
+        self.assertEqual(len(nxt.context["rows"]), 1)
+        self.assertContains(nxt, self.undecided.final_text)
+        self.assertNotContains(nxt, self.decisions[0].final_text)
+        # 넘기기는 평범한 링크다 — 한 문항씩 넘겨 보던 옛 버튼은 쓰지 않는다.
         self.assertNotContains(r, 'id="step-next"')
+        self.assertContains(r, "?page=2")
+
+    def test_progress_stays_whole_meeting_wide_across_pages(self):
+        self.client.post(self._agree_url(self.decisions[0]), {"kind": "ack"})
+        for page in (1, 2):
+            # 분모가 칸마다 바뀌면 얼마나 남았는지 알 수 없다.
+            self.assertContains(self.client.get(self.url, {"page": page}), "4개 중 1개 확인함")
+
+    def test_a_broken_page_number_falls_back_to_a_real_page(self):
+        self.assertEqual(self.client.get(self.url, {"page": "abc"}).context["page"].number, 1)
+        self.assertEqual(self.client.get(self.url, {"page": 99}).context["page"].number, 2)
+
+    def test_saving_comes_back_to_the_page_i_was_on(self):
+        r = self.client.post(self._agree_url(self.decisions[0]), {"kind": "ack", "page": "2"})
+        self.assertRedirects(
+            r, "%s?page=2#decision-%d" % (self.url, self.decisions[0].id),
+            target_status_code=200,
+        )
 
     def test_undecided_items_are_read_only(self):
-        r = self.client.get(self.url)
+        r = self.client.get(self.url, {"page": 2})
         body = r.content.decode()
         card = body[body.index('id="decision-%d"' % self.undecided.id):]
         self.assertIn("미결정", card)
@@ -4345,7 +4370,7 @@ class DecisionCardTests(TestCase):
 
     def test_plain_post_saves_and_redirects_back_to_the_card(self):
         r = self.client.post(self._agree_url(self.decisions[0]), {"kind": "ack", "comment": "알겠습니다"})
-        self.assertRedirects(r, "%s#decision-%d" % (self.url, self.decisions[0].id))
+        self.assertRedirects(r, "%s?page=1#decision-%d" % (self.url, self.decisions[0].id))
         agreement = DecisionAgreement.objects.get(decision=self.decisions[0], user=self.alice)
         self.assertEqual(agreement.kind, DecisionAgreement.KIND_ACK)
         self.assertEqual(agreement.comment, "알겠습니다")

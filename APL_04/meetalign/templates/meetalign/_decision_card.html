@@ -37,6 +37,8 @@
     {% endif %}
     {# 자바스크립트가 꺼져 있어도 그대로 동작하는 일반 form이다. 켜져 있으면 이 카드만 갈아끼운다. #}
     <form method="post" class="ack-form" action="{% url 'decision_agree' meeting.id row.decision.id %}">{% csrf_token %}
+      {# 저장 뒤에도 보고 있던 칸으로 돌아오게 칸 번호를 함께 보낸다. #}
+      <input type="hidden" name="page" value="{{ ack_page }}">
       <div class="ack-actions">
         <button type="submit" name="kind" value="{{ kind_ack }}" class="btn sm{% if row.kind != kind_ack %} secondary{% endif %}">확인했어요</button>
         <button type="submit" name="kind" value="{{ kind_differ }}" class="btn sm{% if row.kind != kind_differ %} secondary{% endif %}">제 이해와 달랐어요</button>
@@ -54,6 +56,7 @@
     <div class="step-more-body">
       {% if row.ask_error %}<div class="error" style="margin:0">{{ row.ask_error }}</div>{% endif %}
       <form method="post" class="ask-form" action="{% url 'decision_ask' meeting.id row.decision.id %}">{% csrf_token %}
+        <input type="hidden" name="page" value="{{ ack_page }}">
         <textarea name="text" rows="2" placeholder="예: 이 결정에서 제가 할 일은 뭔가요?"></textarea>
         <div class="ack-actions" style="margin-top:8px">
           <button type="submit" name="mode" value="ai" class="btn sm">AI에게 묻기</button>
