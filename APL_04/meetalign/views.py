@@ -805,24 +805,30 @@ def _wants_card_json(request):
 
 
 def _ack_response(request, meeting, decision, **card_extra):
-    """카드 하나를 저장한 뒤의 응답.
+    """카드 하나를 처리한 뒤의 응답. 그려지는 카드는 어느 경로에서나 _decision_card.html 하나다.
 
-    fetch면 그 카드를 다시 그린 조각과 진행률을 JSON으로 돌려주고(전체 새로고침 없이 그
-    카드만 갈아끼운다), 자바스크립트가 꺼져 있으면 화면을 다시 불러 같은 자리로 보낸다.
-    어느 쪽이든 그려지는 카드는 _decision_card.html 하나뿐이다.
+    - fetch: 그 카드 조각과 진행률만 JSON으로 — 전체 새로고침 없이 그 카드만 갈아끼운다.
+    - 스크립트가 꺼진 브라우저: 보여줄 것(AI 답변·오류)이 있으면 화면을 바로 그리고,
+      없으면 방금 누른 카드 자리로 되돌려 보낸다. 리다이렉트로는 방금 받은 답변이 사라진다.
     """
-    if not _wants_card_json(request):
+    if _wants_card_json(request):
+        rows, progress = _ack_rows(request.user, meeting)
+        row = next((row for row in rows if row["decision"].id == decision.id), None)
+        if row is None:  # 응답을 만드는 사이에 진행자가 공개를 취소한 경우.
+            raise Http404
+        row.update(card_extra)
+        card = render_to_string("meetalign/_decision_card.html", {
+            "meeting": meeting, "row": row,
+            "kind_ack": DecisionAgreement.KIND_ACK, "kind_differ": DecisionAgreement.KIND_DIFFER,
+        }, request=request)
+        return JsonResponse({"card": card, "progress": progress})
+    if not card_extra:
         return _ack_redirect(meeting, decision)
-    rows, progress = _ack_rows(request.user, meeting)
-    row = next((row for row in rows if row["decision"].id == decision.id), None)
-    if row is None:  # 응답을 만드는 사이에 진행자가 공개를 취소한 경우.
-        raise Http404
-    row.update(card_extra)
-    card = render_to_string("meetalign/_decision_card.html", {
-        "meeting": meeting, "row": row,
-        "kind_ack": DecisionAgreement.KIND_ACK, "kind_differ": DecisionAgreement.KIND_DIFFER,
-    }, request=request)
-    return JsonResponse({"card": card, "progress": progress})
+    context = _ack_context(request, meeting)
+    for row in context["rows"]:
+        if row["decision"].id == decision.id:
+            row.update(card_extra)
+    return render(request, "meetalign/decision_ack.html", context)
 
 
 @login_required
@@ -846,6 +852,36 @@ def decision_agree(request, meeting_id, decision_id):
         defaults={"kind": kind, "comment": request.POST.get("comment", "").strip()},
     )
     return _ack_response(request, meeting, decision)
+
+
+# 카드에서 AI에게 물을 때 질문 앞에 붙이는 맥락 한 줄. 대화창 답변 함수는 회의록만 근거로
+# 답하므로, 어떤 결정에 대한 질문인지는 이렇게 질문 안에 담아 전달한다.
+ASK_DECISION_CONTEXT = "이 질문은 다음 결정에 대한 것이다: %s"
+
+
+@login_required
+def decision_ask(request, meeting_id, decision_id):
+    """결정 카드 안에서 바로 묻기. 대화창으로 떠나지 않아도 질문과 답변이 끝나게 한다.
+
+    AI 답변은 대화창과 같은 함수(services.chat_reply)로 만든다 — 회의록만 근거로 답하고
+    회의에 없는 내용은 답하지 않는 규칙이 그대로 적용된다. 질문과 답변은 대화창 기록
+    (ChatMessage)에도 남겨 대화창에서 이어 볼 수 있게 한다.
+    """
+    meeting = _decision_meeting(request, meeting_id)
+    decision = get_object_or_404(
+        Decision, pk=decision_id, meeting=meeting,
+        status__in=[Decision.STATUS_PUBLISHED, Decision.STATUS_UNDECIDED],
+    )
+    if request.method != "POST":
+        return _ack_redirect(meeting, decision)
+    text = request.POST.get("text", "").strip()
+    if not text:
+        return _ack_response(request, meeting, decision, ask_open=True, ask_error="질문을 입력해 주세요.")
+    asked = "%s\n%s" % (ASK_DECISION_CONTEXT % decision.published_text, text)
+    ChatMessage.objects.create(meeting=meeting, user=request.user, role=ChatMessage.ROLE_USER, text=asked)
+    reply = services.chat_reply(meeting, asked)
+    ChatMessage.objects.create(meeting=meeting, user=request.user, role=ChatMessage.ROLE_ASSISTANT, text=reply)
+    return _ack_response(request, meeting, decision, ask_open=True, ai_question=text, ai_answer=reply)
 
 
 @login_required

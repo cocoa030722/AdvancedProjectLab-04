@@ -47,4 +47,25 @@
   {% else %}
     <div class="notice" style="margin:0"><span><b>미결정</b> (다음 회의에서 다룸)</span></div>
   {% endif %}
+
+  {# 궁금한 점을 묻기 위해 대화창으로 떠나지 않아도 되게 — 기본은 접혀 있다. #}
+  <details class="card-ask"{% if row.ask_open %} open{% endif %}>
+    <summary class="muted">이 결정에 대해 질문하기</summary>
+    <div class="step-more-body">
+      {% if row.ask_error %}<div class="error" style="margin:0">{{ row.ask_error }}</div>{% endif %}
+      <form method="post" class="ask-form" action="{% url 'decision_ask' meeting.id row.decision.id %}">{% csrf_token %}
+        <textarea name="text" rows="2" placeholder="예: 이 결정에서 제가 할 일은 뭔가요?"></textarea>
+        <div class="ack-actions" style="margin-top:8px">
+          <button type="submit" name="mode" value="ai" class="btn sm">AI에게 묻기</button>
+        </div>
+      </form>
+      {% if row.ai_answer %}
+      <div class="ask-answer">
+        <div class="meta">Q. {{ row.ai_question }}</div>
+        <div class="bubble" style="margin-top:4px">{{ row.ai_answer }}</div>
+        <div class="meta" style="margin-top:4px">이 질문과 답변은 <a href="{% url 'chat' meeting.id %}">대화창</a>에도 저장됐어요.</div>
+      </div>
+      {% endif %}
+    </div>
+  </details>
 </section>

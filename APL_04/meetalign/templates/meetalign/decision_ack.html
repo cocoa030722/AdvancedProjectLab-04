@@ -63,12 +63,24 @@
     });
   }
 
+  // AI 답변은 수십 초~수 분이 걸릴 수 있다. 기다리는 동안에도 다른 카드의 확인 버튼은
+  // 그대로 쓸 수 있다(이 카드의 버튼만 잠긴다).
+  function showWaiting(form) {
+    var box = document.createElement("div");
+    box.className = "ask-waiting";
+    box.innerHTML = '<span class="spinner"></span> 답변을 기다리는 중... (수십 초 걸릴 수 있어요)';
+    form.insertAdjacentElement("afterend", box);
+  }
+
   document.addEventListener("submit", function (event) {
     var form = event.target;
-    if (!(form instanceof HTMLFormElement) || !form.classList.contains("ack-form")) return;
+    if (!(form instanceof HTMLFormElement)) return;
+    var isAsk = form.classList.contains("ask-form");
+    if (!isAsk && !form.classList.contains("ack-form")) return;
     var card = form.closest(".ack-card");
     if (!card) return;
     event.preventDefault();
+    if (isAsk) showWaiting(form);
     fetch(form.action, {
       method: "POST",
       headers: { "X-Requested-With": "fetch" },
@@ -85,7 +97,9 @@
       paintProgress(payload.progress);
     }).catch(function () {
       restoreButtons(form);
-      showError(card, "저장하지 못했어요. 잠시 뒤 다시 눌러 주세요.");
+      var waiting = card.querySelector(".ask-waiting");
+      if (waiting) waiting.remove();
+      showError(card, isAsk ? "질문을 보내지 못했어요. 잠시 뒤 다시 눌러 주세요." : "저장하지 못했어요. 잠시 뒤 다시 눌러 주세요.");
     });
   });
 })();

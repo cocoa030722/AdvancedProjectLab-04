@@ -28,6 +28,10 @@ urlpatterns = [
         views.decision_agree, name="decision_agree",
     ),
     path(
+        "meetings/<int:meeting_id>/decisions/<int:decision_id>/ask/",
+        views.decision_ask, name="decision_ask",
+    ),
+    path(
         "meetings/<int:meeting_id>/decisions/<int:decision_id>/carryover/resolve/",
         views.decision_carryover_resolve, name="decision_carryover_resolve",
     ),
