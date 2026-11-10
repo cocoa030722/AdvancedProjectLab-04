@@ -111,6 +111,10 @@ class Question(models.Model):
     답변을 본인만 볼 수 있도록 내부적으로는 작성자를 저장한다."""
     meeting = models.ForeignKey(Meeting, on_delete=models.CASCADE, related_name="questions")
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="questions")
+    # 결정 확인 카드에서 보낸 질문이면 어떤 결정에 대한 질문인지. 대화창에서 보낸 질문은 비어 있다.
+    # 주최자 익명 질문함에서 질문 옆에 그 결정 문장을 보여주는 데 쓴다(작성자는 여전히 비공개).
+    # 결정이 지워져도 질문 자체는 주최자가 답할 몫이라 남겨 둔다(SET_NULL).
+    decision = models.ForeignKey("Decision", on_delete=models.SET_NULL, null=True, blank=True, related_name="questions")
     text = models.TextField()
     answer = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

@@ -305,7 +305,9 @@ def inbox(request, meeting_id):
     # 그 답변만 볼 수 있다 — 익명이라는 취지상 다른 사람이 받은 답은 보이면 안 된다.
     meeting = _meeting(request, meeting_id)
     is_host = meeting.host_id == request.user.id
-    questions = meeting.questions.all() if is_host else meeting.questions.filter(user=request.user)
+    # 결정 카드에서 온 질문은 어떤 결정에 대한 질문인지 함께 보여주므로 결정도 같이 읽는다.
+    questions = meeting.questions.select_related("decision")
+    questions = questions.all() if is_host else questions.filter(user=request.user)
     return render(request, "meetalign/inbox.html", {"meeting": meeting, "questions": questions, "is_host": is_host})
 
 
@@ -323,7 +325,9 @@ def answers(request, meeting_id):
         question.answer = request.POST.get("answer", "").strip()
         question.save()
         return redirect("answers", meeting_id=meeting.id)
-    return render(request, "meetalign/answers.html", {"meeting": meeting, "questions": meeting.questions.all()})
+    return render(request, "meetalign/answers.html", {
+        "meeting": meeting, "questions": meeting.questions.select_related("decision"),
+    })
 
 
 @login_required
@@ -741,6 +745,12 @@ def _ack_rows(user, meeting):
         agreement.decision_id: agreement
         for agreement in DecisionAgreement.objects.filter(decision__in=decisions, user=user)
     }
+    # 내가 이 카드에서 보낸 익명 질문과 그 답변 — 보낸 본인만 볼 수 있다(익명 질문함과 같은 기준).
+    asked = {}
+    for question in Question.objects.filter(
+        meeting=meeting, user=user, decision__in=decisions,
+    ).order_by("created_at", "id"):
+        asked.setdefault(question.decision_id, []).append(question)
     rows = []
     for number, decision in enumerate(decisions, start=1):
         agreement = mine.get(decision.id)
@@ -755,6 +765,7 @@ def _ack_rows(user, meeting):
             "needs_recheck": decision.revised and agreement is None,
             "answerable": decision.status == Decision.STATUS_PUBLISHED,
             "evidence": _published_evidence(decision),
+            "questions": asked.get(decision.id, []),
         })
     total = sum(1 for row in rows if row["answerable"])
     done = sum(1 for row in rows if row["answerable"] and row["agreement"])
@@ -863,9 +874,12 @@ ASK_DECISION_CONTEXT = "이 질문은 다음 결정에 대한 것이다: %s"
 def decision_ask(request, meeting_id, decision_id):
     """결정 카드 안에서 바로 묻기. 대화창으로 떠나지 않아도 질문과 답변이 끝나게 한다.
 
-    AI 답변은 대화창과 같은 함수(services.chat_reply)로 만든다 — 회의록만 근거로 답하고
-    회의에 없는 내용은 답하지 않는 규칙이 그대로 적용된다. 질문과 답변은 대화창 기록
-    (ChatMessage)에도 남겨 대화창에서 이어 볼 수 있게 한다.
+    mode=anon이면 주최자에게 보내는 익명 질문(Question)으로 저장하고 어떤 결정에 대한
+    질문인지만 함께 남긴다 — 작성자는 어느 화면에도 나가지 않는다.
+
+    그 밖에는 AI에게 묻는다. 답변은 대화창과 같은 함수(services.chat_reply)로 만든다 —
+    회의록만 근거로 답하고 회의에 없는 내용은 답하지 않는 규칙이 그대로 적용된다. 질문과
+    답변은 대화창 기록(ChatMessage)에도 남겨 대화창에서 이어 볼 수 있게 한다.
     """
     meeting = _decision_meeting(request, meeting_id)
     decision = get_object_or_404(
@@ -877,6 +891,16 @@ def decision_ask(request, meeting_id, decision_id):
     text = request.POST.get("text", "").strip()
     if not text:
         return _ack_response(request, meeting, decision, ask_open=True, ask_error="질문을 입력해 주세요.")
+    if request.POST.get("mode") == "anon":
+        if meeting.ended:
+            return _ack_response(
+                request, meeting, decision,
+                ask_open=True, ask_error="종료된 회의에는 익명 질문을 보낼 수 없습니다.",
+            )
+        # 대화창의 익명 질문과 같은 Question에 저장하고, 어떤 결정에 대한 질문인지만 함께 남긴다.
+        # 작성자는 주최자 화면에도 다른 팀원 화면에도 나가지 않는다(inbox / answers).
+        Question.objects.create(meeting=meeting, user=request.user, text=text, decision=decision)
+        return _ack_response(request, meeting, decision, ask_open=True, ask_sent=True)
     asked = "%s\n%s" % (ASK_DECISION_CONTEXT % decision.published_text, text)
     ChatMessage.objects.create(meeting=meeting, user=request.user, role=ChatMessage.ROLE_USER, text=asked)
     reply = services.chat_reply(meeting, asked)

@@ -57,6 +57,7 @@
         <textarea name="text" rows="2" placeholder="예: 이 결정에서 제가 할 일은 뭔가요?"></textarea>
         <div class="ack-actions" style="margin-top:8px">
           <button type="submit" name="mode" value="ai" class="btn sm">AI에게 묻기</button>
+          <button type="submit" name="mode" value="anon" class="btn sm secondary">주최자에게 익명으로 묻기</button>
         </div>
       </form>
       {% if row.ai_answer %}
@@ -66,6 +67,15 @@
         <div class="meta" style="margin-top:4px">이 질문과 답변은 <a href="{% url 'chat' meeting.id %}">대화창</a>에도 저장됐어요.</div>
       </div>
       {% endif %}
+      {% if row.ask_sent %}<div class="success" style="margin:8px 0 0">익명 질문을 주최자에게 보냈어요. 이름은 전달되지 않습니다.</div>{% endif %}
+      {# 내가 이 결정에 대해 보낸 익명 질문과 주최자 답변 — 보낸 본인만 보인다. #}
+      {% for question in row.questions %}
+      <div class="ask-mine" style="margin-top:8px">
+        <div class="meta">내 익명 질문: {{ question.text }}</div>
+        {% if question.answer %}<div class="bubble" style="margin-top:4px">주최자 답변: {{ question.answer }}</div>
+        {% else %}<span class="badge processing" style="margin-top:4px">아직 답변 전</span>{% endif %}
+      </div>
+      {% endfor %}
     </div>
   </details>
 </section>

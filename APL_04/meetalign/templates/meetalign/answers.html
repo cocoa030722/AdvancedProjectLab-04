@@ -9,6 +9,8 @@
   <div class="item-icon" style="margin-bottom:16px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></div>
   {% for q in questions %}
   <form method="post" class="item" style="display:block;margin-bottom:12px">{% csrf_token %}
+    {# 결정 확인 카드에서 온 질문이면 어떤 결정에 대한 질문인지 먼저 보여준다(작성자는 비공개). #}
+    {% if q.decision %}<div class="meta" style="margin:0 0 4px">이 결정에 대한 질문 · {{ q.decision.published_text }}</div>{% endif %}
     <div class="title">Q. {{ q.text }}</div>
     <input type="hidden" name="question_id" value="{{ q.id }}">
     <div class="row" style="margin-top:8px">
