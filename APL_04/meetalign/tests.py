@@ -188,6 +188,21 @@ class PrototypeFlowTests(TestCase):
         self.assertContains(r, "record-toggle")
         self.assertContains(r, "getUserMedia")
 
+    def test_mic_button_is_the_primary_action_above_the_file_input(self):
+        """처음 쓰는 사람이 설명 없이 찾을 수 있게, 강조 색 큰 버튼으로 업로드 칸보다 위에 둔다."""
+        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
+        # class에 secondary가 없으면 기본(강조 색) 버튼이고, lg가 확대 크기다.
+        self.assertContains(r, 'id="record-toggle" class="btn lg"')
+        body = r.content.decode()
+        self.assertLess(body.index('id="record-toggle"'), body.index('id="recording" type="file"'))
+
+    def test_recording_state_shows_a_red_dot_elapsed_time_and_paused_label(self):
+        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
+        self.assertContains(r, 'id="record-dot"')
+        self.assertContains(r, "record-blink")  # 깜빡임 키프레임(base.html)
+        self.assertContains(r, 'id="record-time">00:00')  # mm:ss
+        self.assertContains(r, "일시정지됨")
+
     def test_mic_recording_not_offered_once_meeting_ended(self):
         self.meeting.ended = True
         self.meeting.save()
