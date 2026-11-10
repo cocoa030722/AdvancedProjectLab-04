@@ -17,4 +17,11 @@
     <details><summary>녹취 원문 보기</summary><div class="record" style="margin-top:8px">{{ meeting.transcript }}</div></details>
   {% endif %}
 </div>
+{# 요약이 길면 다 읽은 뒤 위로 되돌아가야 해서, 본문 끝에도 상단과 같은 목적지의 뒤로가기를 둔다. #}
+<div class="row">
+  <a class="btn secondary" id="back-bottom" href="{% url 'meeting_detail' meeting.id %}">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H7M12 18l-6-6 6-6"/></svg>
+    회의 화면으로 돌아가기
+  </a>
+</div>
 {% endblock %}

@@ -1186,6 +1186,22 @@ class MeetingSummaryTests(TestCase):
         self.assertContains(r, "녹취 원문 보기")
         self.assertContains(r, "녹취 원문 내용")
 
+    def test_meeting_detail_and_summary_open(self):
+        self.assertEqual(self.client.get(reverse("meeting_detail", args=[self.meeting.id])).status_code, 200)
+        self.assertEqual(self.client.get(reverse("summary", args=[self.meeting.id])).status_code, 200)
+
+    def test_summary_page_has_a_back_link_below_the_record(self):
+        """긴 요약을 다 읽은 뒤 위로 되돌아가지 않아도 회의 화면으로 갈 수 있어야 한다."""
+        self.meeting.record = "요약 문장. " * 200
+        self.meeting.save()
+        r = self.client.get(reverse("summary", args=[self.meeting.id]))
+        back = reverse("meeting_detail", args=[self.meeting.id])
+        self.assertContains(r, 'id="back-bottom"')
+        # 상단 뒤로가기와 하단 뒤로가기 — 목적지가 같아서 같은 주소가 두 번 나온다.
+        self.assertContains(r, 'href="%s"' % back, count=2)
+        body = r.content.decode()
+        self.assertGreater(body.index('id="back-bottom"'), body.index("요약 문장."))
+
 
 @override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
 
