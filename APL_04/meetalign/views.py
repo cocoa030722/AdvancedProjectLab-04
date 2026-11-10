@@ -3,7 +3,7 @@ import os
 from django.contrib.auth import login, logout
 from django.core.exceptions import PermissionDenied
 from django.db import transaction
-from django.http import FileResponse, Http404, HttpResponse
+from django.http import FileResponse, Http404, HttpResponse, HttpResponseBadRequest
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.shortcuts import get_object_or_404, redirect, render
@@ -14,8 +14,8 @@ from django.utils.http import url_has_allowed_host_and_scheme
 
 from . import decision_compiler, notifications, services, tasks
 from .models import (
-    ChatMessage, Decision, Interpretation, Meeting, Notification,
-    Question, Recording, Team,
+    ChatMessage, Decision, DecisionAgreement, Interpretation, Meeting,
+    Notification, Question, Recording, Team,
 )
 
 ALLOWED_RECORDING_EXTENSIONS = {
@@ -715,28 +715,110 @@ def _published_evidence_spans(meeting, decision):
     return decision_compiler.evidence_spans(meeting.transcript, evidences, _evidence_context(decision, interpretations))
 
 
+def _published_evidence(decision):
+    """카드 안에 접어 둘 근거 발언 한 문장 — 진행자가 고른 후보의 근거, 없으면 저장된 근거.
+
+    _published_evidence_spans(녹취 원문 창의 하이라이트 위치)와 같은 기준으로 고른다.
+    """
+    for interpretation in decision.interpretations.all():
+        if interpretation.text == decision.final_text and interpretation.evidence:
+            return interpretation.evidence
+    return decision.evidence
+
+
+def _ack_rows(user, meeting):
+    """팀원 결정 확인 화면의 카드 묶음과 '내' 진행률.
+
+    담는 것은 내 선택·내 의견·내 질문뿐이다 — 누가 무엇을 골랐는지는 저장만 하고 어떤 화면에도
+    내보내지 않으므로, 다른 사람의 기록은 여기서 아예 조회하지 않는다.
+
+    진행률의 분모는 '확인할 수 있는 항목'(공개된 항목)이다. 미결정으로 이월된 항목은 읽기
+    전용이라 분모에서 빠진다 — 아무리 눌러도 줄지 않는 숫자가 되기 때문이다.
+    """
+    decisions = decision_compiler.published_decisions(meeting)
+    mine = {
+        agreement.decision_id: agreement
+        for agreement in DecisionAgreement.objects.filter(decision__in=decisions, user=user)
+    }
+    rows = []
+    for number, decision in enumerate(decisions, start=1):
+        agreement = mine.get(decision.id)
+        rows.append({
+            "number": number,
+            "decision": decision,
+            "agreement": agreement,
+            "kind": agreement.kind if agreement else "",
+            "comment": agreement.comment if agreement else "",
+            # 공개 뒤 확정 문장이 고쳐지면 내 확인 기록도 지워진다(decision_compiler.revise_final_text).
+            # 그 자리를 빈칸으로 두면 왜 다시 눌러야 하는지 알 수 없으므로 사유를 표시한다.
+            "needs_recheck": decision.revised and agreement is None,
+            "answerable": decision.status == Decision.STATUS_PUBLISHED,
+            "evidence": _published_evidence(decision),
+        })
+    total = sum(1 for row in rows if row["answerable"])
+    done = sum(1 for row in rows if row["answerable"] and row["agreement"])
+    progress = {"done": done, "total": total, "percent": int(done * 100 / total) if total else 0}
+    return rows, progress
+
+
+def _ack_context(request, meeting):
+    rows, progress = _ack_rows(request.user, meeting)
+    return {
+        "meeting": meeting,
+        "rows": rows,
+        "progress": progress,
+        "evidence_data": {
+            str(row["decision"].id): _published_evidence_spans(meeting, row["decision"]) for row in rows
+        },
+        # 카드 목록이라 한 문항씩 넘겨 보지 않는다 — 녹취 원문 창만 쓴다(_decision_viewer).
+        "unpaged": True,
+        "status_published": Decision.STATUS_PUBLISHED,
+        "kind_ack": DecisionAgreement.KIND_ACK,
+        "kind_differ": DecisionAgreement.KIND_DIFFER,
+    }
+
+
 @login_required
 def decision_ack(request, meeting_id):
-    """팀원 화면. 진행자가 공개한 확정 문장을 한 문항씩 읽고, 근거가 된 녹취 원문을 볼 수 있다.
+    """팀원 화면. 공개된 결정 전체를 한 화면 카드 목록으로 보고, 카드마다 확인 여부를 남긴다.
 
-    읽기 전용이다 — 확인 버튼은 없다. 이 화면을 열면 이 회의의 결정 알림은 읽은 것으로 보고 지운다.
-    진행자는 진행자 화면으로 보낸다. 공개 전(draft) 항목은 published_decisions()가 아예 돌려주지
-    않으므로 응답에 담기지 않는다.
+    저장은 카드별 전용 엔드포인트(decision_agree)가 맡는다 — 이 화면은 GET만 받는다.
+    이 화면을 열면 이 회의의 결정 알림은 읽은 것으로 보고 지운다. 진행자는 진행자 화면으로
+    보낸다. 공개 전(draft) 항목은 published_decisions()가 아예 돌려주지 않으므로 응답에 담기지 않는다.
     """
     meeting = _decision_meeting(request, meeting_id)
     if meeting.host_id == request.user.id:
         return redirect("decision_review", meeting_id=meeting.id)
     notifications.mark_read(request.user, meeting)
-    decisions = decision_compiler.published_decisions(meeting)
-    return render(request, "meetalign/decision_ack.html", {
-        "meeting": meeting,
-        "rows": [{"decision": decision} for decision in decisions],
-        "evidence_data": {
-            str(decision.id): _published_evidence_spans(meeting, decision) for decision in decisions
-        },
-        "step_key": "decision-step-ack-%d" % meeting.id,
-        "status_published": Decision.STATUS_PUBLISHED,
-    })
+    return render(request, "meetalign/decision_ack.html", _ack_context(request, meeting))
+
+
+def _ack_redirect(meeting, decision):
+    """자바스크립트가 꺼진 브라우저용 — 방금 누른 카드 자리로 되돌려 보낸다."""
+    return redirect("%s#decision-%d" % (reverse("decision_ack", args=[meeting.id]), decision.id))
+
+
+@login_required
+def decision_agree(request, meeting_id, decision_id):
+    """카드 하나의 '확인했어요 / 달랐어요'(+ 한 줄 의견)를 저장한다.
+
+    공개된 항목만 대상이다 — 미결정으로 이월된 항목은 404로 막는다(화면에도 버튼이 없다).
+    선택은 다시 바꿀 수 있어야 하므로 update_or_create로 (항목, 사용자)당 한 줄만 남긴다.
+    """
+    meeting = _decision_meeting(request, meeting_id)
+    decision = get_object_or_404(
+        Decision, pk=decision_id, meeting=meeting, status=Decision.STATUS_PUBLISHED,
+    )
+    if request.method != "POST":
+        return _ack_redirect(meeting, decision)
+    kind = request.POST.get("kind", "")
+    if kind not in (DecisionAgreement.KIND_ACK, DecisionAgreement.KIND_DIFFER):
+        return HttpResponseBadRequest("알 수 없는 선택입니다.")
+    DecisionAgreement.objects.update_or_create(
+        decision=decision, user=request.user,
+        defaults={"kind": kind, "comment": request.POST.get("comment", "").strip()},
+    )
+    return _ack_redirect(meeting, decision)
 
 
 @login_required

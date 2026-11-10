@@ -227,6 +227,14 @@
   @keyframes record-blink { 50% { opacity:.15; } }
   @media (prefers-reduced-motion: reduce) { .record-dot { animation:none; } }
 
+  /* ---- 결정 확인 카드 목록 (팀원 화면) ---- */
+  #decision-cards { display:flex; flex-direction:column; gap:12px; margin-top:18px; }
+  .ack-card { flex-direction:column; align-items:stretch; gap:10px; }
+  /* 목록이라 카드마다 들썩이면 산만하다 — 테두리만 짙어지게 둔다. */
+  .ack-card:hover { transform:none; box-shadow:none; }
+  .ack-actions { display:flex; gap:8px; flex-wrap:wrap; }
+  .ack-actions .btn, .ack-actions button { flex:0 1 auto; }
+
   .tabs { display:inline-flex; background:var(--surface-sunken); border-radius:11px; padding:4px; gap:3px; margin:10px 0 16px; }
   .tabs a { padding:7px 16px; border-radius:8px; font-size:.88rem; color:var(--muted); font-weight:600; }
   .tabs a.on { background:var(--surface); color:var(--ink); box-shadow:var(--shadow-sm); text-decoration:none; }

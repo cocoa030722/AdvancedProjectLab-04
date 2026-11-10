@@ -4,6 +4,8 @@
   쓰는 쪽 템플릿이 지켜야 할 약속:
   - 문항마다 <section class="decision-step" data-decision-id="결정 id">로 감싼다. 이 부품이 한 번에 하나만 보여준다.
     자바스크립트가 꺼져 있으면 모든 문항이 그대로 다 보인다(숨김은 스크립트가 켤 때만 건다).
+  - 컨텍스트에 unpaged=True를 주면 한 문항씩 넘겨 보기를 끄고 녹취 원문 창만 쓴다(카드 목록 화면).
+    값을 주지 않으면 지금까지처럼 넘겨 보기가 켜진다.
   - 문항 안에서 녹취 원문 창을 여는 곳에 data-open-transcript를 붙인다. 특정 후보의 근거로 바로 가려면
     data-evidence-label="후보 A"처럼 하이라이트 꼬리표를 함께 준다.
   - 컨텍스트: meeting(녹취 원문 meeting.transcript), evidence_data({결정 id: [{start, end, label, primary}, ...]}),
@@ -109,6 +111,8 @@
   var next = document.getElementById("step-next");
   var counter = document.getElementById("step-counter");
   var storageKey = "{{ step_key|escapejs }}";
+  // 카드 목록 화면은 넘겨 보기 없이 녹취 원문 창만 쓴다.
+  var unpaged = {{ unpaged|yesno:"true,false" }};
   var current = 0;
   var scrollOnShow = false;  // 처음 그릴 때는 스크롤을 건드리지 않는다.
 
@@ -227,7 +231,7 @@
     body.classList.remove("dragging");
   });
 
-  if (steps.length) {
+  if (steps.length && !unpaged) {
     var move = nav ? nav.querySelector(".step-move") : null;
     var hasActions = !!(nav && nav.querySelector("[data-step-actions]"));
     // 문항이 하나뿐이면 이전·다음은 숨기되, 저장·공개 버튼이 있으면 줄은 남긴다.

@@ -4180,13 +4180,13 @@ class DecisionAckTests(TestCase):
     def test_member_sees_the_published_text(self):
         self.assertContains(self._as(self.alice).get(self.url), "금요일 18시까지 스테이징 배포")
 
-    def test_the_screen_is_read_only(self):
+    def test_each_card_offers_ack_and_differ(self):
         r = self._as(self.alice).get(self.url)
-        self.assertNotContains(r, "확인했어요")
-        self.assertNotContains(r, "제 이해와 달랐어요")
-        self.assertNotContains(r, '<form method="post"')
+        self.assertContains(r, "확인했어요")
+        self.assertContains(r, "제 이해와 달랐어요")
 
-    def test_posting_changes_nothing(self):
+    def test_posting_to_the_screen_itself_changes_nothing(self):
+        """저장은 카드별 엔드포인트(decision_agree)만 받는다 — 화면 주소로 쏘면 아무 일도 없다."""
         r = self._as(self.alice).post(self.url, {"decision_id": self.decision.id, "kind": "ack"})
         self.assertEqual(r.status_code, 200)
         self.assertFalse(DecisionAgreement.objects.exists())
@@ -4219,12 +4219,14 @@ class DecisionAckTests(TestCase):
         Decision.objects.filter(pk=self.decision.pk).update(revised=True)
         self.assertContains(self._as(self.alice).get(self.url), "수정됨")
 
-    def test_items_are_shown_one_at_a_time_with_prev_next(self):
+    def test_items_are_shown_as_one_card_list_without_paging(self):
         r = self._as(self.alice).get(self.url)
-        self.assertContains(r, 'class="decision-step item" data-decision-id="%d"' % self.decision.id)
-        self.assertContains(r, 'id="step-prev"')
-        self.assertContains(r, 'id="step-next"')
+        self.assertContains(r, 'class="decision-step item ack-card" id="decision-%d"' % self.decision.id)
+        self.assertNotContains(r, 'id="step-prev"')
+        self.assertNotContains(r, 'id="step-next"')
+        # 녹취 원문 창은 그대로 쓴다 — 넘겨 보기만 끈다.
         self.assertContains(r, 'id="transcript-panel"')
+        self.assertContains(r, "var unpaged = true")
 
     def test_the_chosen_candidates_evidence_is_highlighted(self):
         evidence = "민수가 금요일까지 배포를 맡기로 했습니다."
