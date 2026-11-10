@@ -4316,7 +4316,7 @@ class DecisionCardTests(TestCase):
         for decision in self.decisions:
             self.assertContains(r, decision.final_text)
         self.assertNotContains(r, self.undecided.final_text)
-        self.assertContains(r, "다음 1개")
+        self.assertContains(r, '<a class="btn sm" href="?page=2">다음 ›</a>', html=False)
         nxt = self.client.get(self.url, {"page": 2})
         self.assertEqual(len(nxt.context["rows"]), 1)
         self.assertContains(nxt, self.undecided.final_text)

@@ -795,8 +795,6 @@ def _ack_context(request, meeting):
         "rows": shown,
         "page": page,
         "ack_page": page.number,
-        # 다음 칸에 몇 개가 들어 있는지 — 버튼이 "다음 3개"처럼 말하면 끝이 보인다.
-        "next_count": min(ACK_PAGE_SIZE, page.paginator.count - page.end_index()) if page.has_next() else 0,
         "progress": progress,
         "evidence_data": {
             str(row["decision"].id): _published_evidence_spans(meeting, row["decision"]) for row in shown
