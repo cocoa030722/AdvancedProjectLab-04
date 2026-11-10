@@ -43,8 +43,6 @@
         <button type="submit" name="kind" value="{{ kind_ack }}" class="btn sm{% if row.kind != kind_ack %} secondary{% endif %}">확인했어요</button>
         <button type="submit" name="kind" value="{{ kind_differ }}" class="btn sm{% if row.kind != kind_differ %} secondary{% endif %}">제 이해와 달랐어요</button>
       </div>
-      <input type="text" name="comment" value="{{ row.comment }}" maxlength="500"
-        placeholder="한 줄 의견 (선택) — 저는 이렇게 이해했어요" style="margin-top:8px">
     </form>
   {% else %}
     <div class="notice" style="margin:0"><span><b>미결정</b> (다음 회의에서 다룸)</span></div>

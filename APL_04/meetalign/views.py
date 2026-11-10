@@ -760,7 +760,6 @@ def _ack_rows(user, meeting):
             "decision": decision,
             "agreement": agreement,
             "kind": agreement.kind if agreement else "",
-            "comment": agreement.comment if agreement else "",
             # 공개 뒤 확정 문장이 고쳐지면 내 확인 기록도 지워진다(decision_compiler.revise_final_text).
             # 그 자리를 빈칸으로 두면 왜 다시 눌러야 하는지 알 수 없으므로 사유를 표시한다.
             "needs_recheck": decision.revised and agreement is None,
@@ -866,10 +865,13 @@ def _ack_response(request, meeting, decision, **card_extra):
 
 @login_required
 def decision_agree(request, meeting_id, decision_id):
-    """카드 하나의 '확인했어요 / 달랐어요'(+ 한 줄 의견)를 저장한다.
+    """카드 하나의 '확인했어요 / 달랐어요'를 저장한다.
 
     공개된 항목만 대상이다 — 미결정으로 이월된 항목은 404로 막는다(화면에도 버튼이 없다).
     선택은 다시 바꿀 수 있어야 하므로 update_or_create로 (항목, 사용자)당 한 줄만 남긴다.
+
+    DecisionAgreement.comment(한 줄 의견)는 화면에서 뺐다 — 두 버튼만 남겼고, 그래서 이 뷰는
+    항상 빈 문자열로 맞춘다. 칸은 모델에 그대로 두되(옛 기록 보존) 화면과 어긋나지 않게 한다.
     """
     meeting = _decision_meeting(request, meeting_id)
     decision = get_object_or_404(
@@ -882,7 +884,7 @@ def decision_agree(request, meeting_id, decision_id):
         return HttpResponseBadRequest("알 수 없는 선택입니다.")
     DecisionAgreement.objects.update_or_create(
         decision=decision, user=request.user,
-        defaults={"kind": kind, "comment": request.POST.get("comment", "").strip()},
+        defaults={"kind": kind, "comment": ""},
     )
     return _ack_response(request, meeting, decision)
 

@@ -4369,16 +4369,14 @@ class DecisionCardTests(TestCase):
     # ---- 2-1. 카드 저장 (fetch / 일반 POST) ----
 
     def test_plain_post_saves_and_redirects_back_to_the_card(self):
-        r = self.client.post(self._agree_url(self.decisions[0]), {"kind": "ack", "comment": "알겠습니다"})
+        r = self.client.post(self._agree_url(self.decisions[0]), {"kind": "ack"})
         self.assertRedirects(r, "%s?page=1#decision-%d" % (self.url, self.decisions[0].id))
         agreement = DecisionAgreement.objects.get(decision=self.decisions[0], user=self.alice)
         self.assertEqual(agreement.kind, DecisionAgreement.KIND_ACK)
-        self.assertEqual(agreement.comment, "알겠습니다")
 
     def test_fetch_post_saves_and_returns_only_that_card(self):
         r = self.client.post(
-            self._agree_url(self.decisions[0]),
-            {"kind": "differ", "comment": "저는 다음 주로 들었어요"},
+            self._agree_url(self.decisions[0]), {"kind": "differ"},
             headers={"x-requested-with": "fetch"},
         )
         self.assertEqual(r.status_code, 200)
@@ -4388,7 +4386,15 @@ class DecisionCardTests(TestCase):
         self.assertEqual(payload["progress"], {"done": 1, "total": 4, "percent": 25})
         agreement = DecisionAgreement.objects.get(decision=self.decisions[0], user=self.alice)
         self.assertEqual(agreement.kind, DecisionAgreement.KIND_DIFFER)
-        self.assertEqual(agreement.comment, "저는 다음 주로 들었어요")
+
+    def test_the_card_has_only_the_two_buttons_and_no_comment_box(self):
+        """한 줄 의견 칸은 화면에서 뺐다 — 두 버튼만 남는다."""
+        r = self.client.get(self.url)
+        self.assertNotContains(r, 'name="comment"')
+        self.assertNotContains(r, "한 줄 의견")
+        # 보내온 의견이 있어도 저장하지 않는다(화면에 없는 글이 기록에 남지 않게).
+        self.client.post(self._agree_url(self.decisions[0]), {"kind": "ack", "comment": "몰래 보낸 의견"})
+        self.assertEqual(DecisionAgreement.objects.get(decision=self.decisions[0]).comment, "")
 
     def test_choice_can_be_changed_and_stays_one_row(self):
         for kind in ("ack", "differ", "ack"):
@@ -4502,10 +4508,9 @@ class DecisionCardTests(TestCase):
 
     # ---- 노출 금지 ----
 
-    def test_my_choice_and_comment_are_not_in_another_members_response(self):
-        self.client.post(self._agree_url(self.decisions[0]), {"kind": "differ", "comment": "저는 다르게 들었어요"})
+    def test_my_choice_is_not_in_another_members_response(self):
+        self.client.post(self._agree_url(self.decisions[0]), {"kind": "differ"})
         r = self._as(self.bob).get(self.url)
-        self.assertNotContains(r, "저는 다르게 들었어요")
         self.assertNotContains(r, "달랐어요</span>")  # 내 선택 배지
         self.assertContains(r, "4개 중 0개 확인함")
         self.assertNotContains(r, self.alice.username)
