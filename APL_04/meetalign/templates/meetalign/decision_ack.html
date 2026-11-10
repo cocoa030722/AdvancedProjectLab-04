@@ -25,4 +25,70 @@
   {% endif %}
 </div>
 {% if rows %}{% include "meetalign/_decision_viewer.html" %}{% endif %}
+
+{% if rows %}
+<script>
+(function () {
+  // 카드 안의 폼을 fetch로 보내고 그 카드만 갈아끼운다. 스크립트가 없거나 fetch가 없으면
+  // 폼이 그대로 제출되어 화면이 다시 그려진다 — 동작은 같고 깜빡임만 다르다.
+  var list = document.getElementById("decision-cards");
+  if (!list || !window.fetch) return;
+  var label = document.getElementById("ack-progress-label");
+  var percent = document.getElementById("ack-progress-percent");
+  var fill = document.getElementById("ack-progress-fill");
+
+  function paintProgress(progress) {
+    if (!progress || !label) return;
+    label.textContent = progress.total + "개 중 " + progress.done + "개 확인함";
+    percent.textContent = progress.percent + "%";
+    fill.style.width = progress.percent + "%";
+  }
+
+  function showError(card, message) {
+    var box = card.querySelector(".ack-error");
+    if (!box) {
+      box = document.createElement("div");
+      box.className = "error ack-error";
+      card.appendChild(box);
+    }
+    box.textContent = message;
+  }
+
+  // base.html이 제출 직후 버튼을 "처리 중..."으로 바꿔 둔다. 카드를 갈아끼우면 그 버튼도 함께
+  // 사라지지만, 실패했을 때는 되돌려 줘야 다시 누를 수 있다.
+  function restoreButtons(form) {
+    form.querySelectorAll("button[disabled]").forEach(function (btn) {
+      if (btn.dataset.originalHtml) btn.innerHTML = btn.dataset.originalHtml;
+      btn.disabled = false;
+    });
+  }
+
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!(form instanceof HTMLFormElement) || !form.classList.contains("ack-form")) return;
+    var card = form.closest(".ack-card");
+    if (!card) return;
+    event.preventDefault();
+    fetch(form.action, {
+      method: "POST",
+      headers: { "X-Requested-With": "fetch" },
+      body: new FormData(form),
+    }).then(function (res) {
+      if (!res.ok) throw new Error(res.status);
+      return res.json();
+    }).then(function (payload) {
+      var holder = document.createElement("div");
+      holder.innerHTML = payload.card;
+      var fresh = holder.firstElementChild;
+      if (!fresh) throw new Error("empty");
+      card.replaceWith(fresh);
+      paintProgress(payload.progress);
+    }).catch(function () {
+      restoreButtons(form);
+      showError(card, "저장하지 못했어요. 잠시 뒤 다시 눌러 주세요.");
+    });
+  });
+})();
+</script>
+{% endif %}
 {% endblock %}

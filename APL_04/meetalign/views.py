@@ -3,10 +3,11 @@ import os
 from django.contrib.auth import login, logout
 from django.core.exceptions import PermissionDenied
 from django.db import transaction
-from django.http import FileResponse, Http404, HttpResponse, HttpResponseBadRequest
+from django.http import FileResponse, Http404, HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.shortcuts import get_object_or_404, redirect, render
+from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -798,6 +799,32 @@ def _ack_redirect(meeting, decision):
     return redirect("%s#decision-%d" % (reverse("decision_ack", args=[meeting.id]), decision.id))
 
 
+def _wants_card_json(request):
+    """카드 하나만 갈아끼우려는 fetch 요청인가 — 스크립트가 붙이는 표시로 일반 form POST와 가른다."""
+    return request.headers.get("x-requested-with") == "fetch"
+
+
+def _ack_response(request, meeting, decision, **card_extra):
+    """카드 하나를 저장한 뒤의 응답.
+
+    fetch면 그 카드를 다시 그린 조각과 진행률을 JSON으로 돌려주고(전체 새로고침 없이 그
+    카드만 갈아끼운다), 자바스크립트가 꺼져 있으면 화면을 다시 불러 같은 자리로 보낸다.
+    어느 쪽이든 그려지는 카드는 _decision_card.html 하나뿐이다.
+    """
+    if not _wants_card_json(request):
+        return _ack_redirect(meeting, decision)
+    rows, progress = _ack_rows(request.user, meeting)
+    row = next((row for row in rows if row["decision"].id == decision.id), None)
+    if row is None:  # 응답을 만드는 사이에 진행자가 공개를 취소한 경우.
+        raise Http404
+    row.update(card_extra)
+    card = render_to_string("meetalign/_decision_card.html", {
+        "meeting": meeting, "row": row,
+        "kind_ack": DecisionAgreement.KIND_ACK, "kind_differ": DecisionAgreement.KIND_DIFFER,
+    }, request=request)
+    return JsonResponse({"card": card, "progress": progress})
+
+
 @login_required
 def decision_agree(request, meeting_id, decision_id):
     """카드 하나의 '확인했어요 / 달랐어요'(+ 한 줄 의견)를 저장한다.
@@ -818,7 +845,7 @@ def decision_agree(request, meeting_id, decision_id):
         decision=decision, user=request.user,
         defaults={"kind": kind, "comment": request.POST.get("comment", "").strip()},
     )
-    return _ack_redirect(meeting, decision)
+    return _ack_response(request, meeting, decision)
 
 
 @login_required
