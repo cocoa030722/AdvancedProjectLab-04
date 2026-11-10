@@ -26,7 +26,7 @@
     {% if page.has_previous %}
     <a class="btn sm secondary" href="?page={{ page.previous_page_number }}">‹ 이전</a>
     {% else %}<span></span>{% endif %}
-    <span class="step-counter">{{ page.start_index }}–{{ page.end_index }}번째 · 전체 {{ page.paginator.count }}개 ({{ page.number }}/{{ page.paginator.num_pages }})</span>
+    <span class="step-counter">({{ page.number }}/{{ page.paginator.num_pages }})</span>
     {% if page.has_next %}
     <a class="btn sm" href="?page={{ page.next_page_number }}">다음 ›</a>
     {% else %}<span></span>{% endif %}
