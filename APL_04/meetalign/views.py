@@ -742,6 +742,9 @@ def _ack_rows(user, meeting):
     전용이라 분모에서 빠진다 — 아무리 눌러도 줄지 않는 숫자가 되기 때문이다.
     """
     decisions = decision_compiler.published_decisions(meeting)
+    # 읽기 전용인 미결정 항목은 뒤로 몰아 둔다. 쪽을 넘기며 확인하는 화면이라, 손댈 것이 없는
+    # 카드가 중간에 끼면 흐름이 끊긴다. 같은 묶음 안에서는 원래 순서를 그대로 둔다(정렬이 안정적).
+    decisions.sort(key=lambda decision: decision.status != Decision.STATUS_PUBLISHED)
     mine = {
         agreement.decision_id: agreement
         for agreement in DecisionAgreement.objects.filter(decision__in=decisions, user=user)

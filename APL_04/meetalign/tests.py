@@ -4325,6 +4325,23 @@ class DecisionCardTests(TestCase):
         self.assertNotContains(r, 'id="step-next"')
         self.assertContains(r, "?page=2")
 
+    def test_undecided_items_go_last_whatever_their_order(self):
+        # 미결정 카드는 누를 것이 없다 — 중간에 끼면 확인하다 말고 건너뛰게 되므로 뒤로 몰아 둔다.
+        # 이 항목은 회의록 차례로는 미결정(order=9) 뒤지만, 확인할 수 있으니 앞으로 올라온다.
+        late = Decision.objects.create(
+            meeting=self.meeting, order=10, what="늦게 나온 안건",
+            status=Decision.STATUS_PUBLISHED, final_text="확정 문장 10",
+        )
+        rows = self.client.get(self.url).context["rows"]
+        self.assertEqual(
+            [row["decision"].id for row in rows], [d.id for d in self.decisions],
+        )
+        last = self.client.get(self.url, {"page": 2}).context["rows"]
+        self.assertEqual([row["decision"].id for row in last], [late.id, self.undecided.id])
+        # 번호도 보이는 차례를 따라간다 — 카드에 적힌 번호가 건너뛰면 빠진 항목을 찾게 된다.
+        self.assertEqual([row["number"] for row in rows] + [row["number"] for row in last],
+                         [1, 2, 3, 4, 5, 6])
+
     def test_progress_stays_whole_meeting_wide_across_pages(self):
         self.client.post(self._agree_url(self.decisions[0]), {"kind": "ack"})
         for page in (1, 2):
