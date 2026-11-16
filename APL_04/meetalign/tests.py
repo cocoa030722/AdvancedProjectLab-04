@@ -183,6 +183,21 @@ class PrototypeFlowTests(TestCase):
         self.assertContains(r, "<audio")
         self.assertContains(r, reverse("recording_file", args=[self.meeting.id, rec.id]))
 
+    def test_record_and_end_buttons_appear_only_after_a_record_exists(self):
+        """회의록이 만들어지기 전에는 볼 것도 끝낼 것도 없으므로 두 버튼 다 숨긴다."""
+        url = reverse("meeting_detail", args=[self.meeting.id])
+        self.meeting.record = ""
+        self.meeting.save(update_fields=["record"])
+        before = self.client.get(url)
+        self.assertNotContains(before, "회의록 보기")
+        self.assertNotContains(before, "회의 종료")
+
+        self.meeting.record = "[결정 사항] 금요일에 배포한다"
+        self.meeting.save(update_fields=["record"])
+        after = self.client.get(url)
+        self.assertContains(after, "회의록 보기")
+        self.assertContains(after, "회의 종료")
+
     def test_meeting_detail_offers_mic_recording_before_upload(self):
         r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
         self.assertContains(r, "record-toggle")

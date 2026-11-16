@@ -103,7 +103,7 @@
     <div class="notice" style="background:var(--surface-sunken);color:var(--ink-soft);border-color:var(--line)">
       회의가 종료되었습니다. 녹음 업로드와 익명 질문은 더 이상 받지 않습니다.
     </div>
-    <div class="row" style="margin-top:12px"><a class="btn secondary" href="{% url 'summary' meeting.id %}">회의 요약</a></div>
+    {% if meeting.record %}<div class="row" style="margin-top:12px"><a class="btn secondary" href="{% url 'summary' meeting.id %}">회의록 보기</a></div>{% endif %}
   {% else %}
   <h2 class="section-title">{% if meeting.recordings.all %}녹음 추가 업로드{% else %}회의 녹음{% endif %}</h2>
   {% if stt_status %}<p class="muted" style="margin:-4px 0 10px">{{ stt_status }}</p>{% endif %}
@@ -137,9 +137,12 @@
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 12h12M13 6l6 6-6 6"/></svg>
         녹음 제출하고 회의록 만들기
       </button>
-      <a class="btn secondary" href="{% url 'summary' meeting.id %}">회의 요약</a>
+      {# 회의록이 만들어지기 전에는 볼 것도 끝낼 것도 없다 — 제출(회의록 만들기)을 거친 뒤에만 둘 다 보인다. #}
+      {% if meeting.record %}
+      <a class="btn secondary" href="{% url 'summary' meeting.id %}">회의록 보기</a>
       <button name="action" value="end" class="secondary"
         onclick="return confirm('회의를 종료할까요? 종료 후에는 녹음 업로드와 익명 질문이 막힙니다.');">회의 종료</button>
+      {% endif %}
     </div>
   </form>
   <script>
