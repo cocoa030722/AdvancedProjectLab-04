@@ -13,11 +13,12 @@ from django.urls import reverse
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.utils.http import url_has_allowed_host_and_scheme
+from django.views.decorators.http import require_POST
 
 from . import decision_compiler, notifications, services, tasks
 from .models import (
     ChatMessage, Decision, DecisionAgreement, Interpretation, Meeting,
-    Notification, Question, Recording, Team,
+    Notification, Question, Recording, Team, TEXT_TRANSCRIPT_EXTENSIONS,
 )
 
 ALLOWED_RECORDING_EXTENSIONS = {
@@ -25,6 +26,8 @@ ALLOWED_RECORDING_EXTENSIONS = {
     ".aac", ".wma", ".opus", ".amr", ".caf", ".avi", ".mov", ".mkv", ".3gp",
 }
 MAX_RECORDING_BYTES = 500 * 1024 * 1024
+# 회의 원문 텍스트 파일(.txt·.md). 녹음과 같은 칸으로 받되, 회의 한 번 분량의 글은 이보다 훨씬 작다.
+MAX_TEXT_TRANSCRIPT_BYTES = 5 * 1024 * 1024
 
 
 def index(request):
@@ -140,11 +143,54 @@ def _parse_deadline(raw):
 
 
 def _recording_error(recording):
-    if os.path.splitext(recording.name)[1].lower() not in ALLOWED_RECORDING_EXTENSIONS:
-        return "지원하지 않는 녹음 형식입니다 (" + ", ".join(sorted(ext.lstrip(".") for ext in ALLOWED_RECORDING_EXTENSIONS)) + ")."
+    """녹음 칸에 올린 파일 하나를 검사한다. 문제가 없으면 None."""
+    extension = os.path.splitext(recording.name)[1].lower()
+    if extension in TEXT_TRANSCRIPT_EXTENSIONS:
+        return "%s: 텍스트 파일은 아래 '텍스트 파일' 칸에 올려 주세요." % recording.name
+    if extension not in ALLOWED_RECORDING_EXTENSIONS:
+        allowed = ", ".join(sorted(ext.lstrip(".") for ext in ALLOWED_RECORDING_EXTENSIONS))
+        return "%s: 지원하지 않는 녹음 형식입니다 (%s)." % (recording.name, allowed)
     if recording.size > MAX_RECORDING_BYTES:
-        return "녹음 파일이 너무 큽니다 (500MB 이하만 가능)."
+        return "%s: 녹음 파일이 너무 큽니다 (500MB 이하만 가능)." % recording.name
     return None
+
+
+def _text_file_error(text_file):
+    """텍스트 파일 칸에 올린 파일 하나를 검사한다. 읽을 수 없거나 빈 파일은 처리 단계까지 보내지 않는다."""
+    extension = os.path.splitext(text_file.name)[1].lower()
+    if extension not in TEXT_TRANSCRIPT_EXTENSIONS:
+        allowed = ", ".join(sorted(ext.lstrip(".") for ext in TEXT_TRANSCRIPT_EXTENSIONS))
+        return "%s: 텍스트 파일 칸에는 %s 파일만 올릴 수 있어요." % (text_file.name, allowed)
+    if text_file.size > MAX_TEXT_TRANSCRIPT_BYTES:
+        return "%s: 텍스트 파일이 너무 큽니다 (5MB 이하만 가능)." % text_file.name
+    try:
+        text = services.decode_text_transcript(text_file.read())
+    except ValueError as error:
+        return "%s: %s" % (text_file.name, error)
+    finally:
+        text_file.seek(0)
+    if not text:
+        return "%s: 텍스트 파일이 비어 있습니다." % text_file.name
+    return None
+
+
+def _duplicate_text_errors(meeting, text_files):
+    """이미 이 회의에 올린 텍스트 파일, 또는 함께 올린 다른 파일과 내용이 같은 텍스트 파일을 막는다.
+
+    같은 메모를 두 번 올리면 녹취 원문에 똑같은 글이 두 번 들어가고 요약·결정 추출도 그 내용을 두 번
+    읽는다. 파일 이름이 아니라 내용으로 비교한다 — 같은 이름으로 다시 올리면 저장소가 이름 뒤에 임의의
+    글자를 붙여 별개 파일처럼 보이기 때문이다.
+    """
+    seen = {r.transcript: r.filename for r in meeting.recordings.all() if r.is_text and r.transcript}
+    errors = []
+    for text_file in text_files:
+        text = services.decode_text_transcript(text_file.read())
+        text_file.seek(0)
+        if text in seen:
+            errors.append("%s: 이미 올린 텍스트 파일(%s)과 내용이 같아요." % (text_file.name, seen[text]))
+        else:
+            seen[text] = text_file.name
+    return errors
 
 
 def _team_members(team):
@@ -199,7 +245,10 @@ def meeting_detail(request, meeting_id):
     meeting = _meeting(request, meeting_id)
     error = None
     if request.method == "POST":
-        recording = request.FILES.get("recording")
+        # 녹음 칸과 텍스트 파일 칸 — 화면에서 여러 개를 쌓아 두었다가 한 번에 제출한다.
+        recordings = request.FILES.getlist("recording")
+        text_files = request.FILES.getlist("text_file")
+        uploads = recordings + text_files
         if request.POST.get("action") == "delete_meeting":
             if meeting.host_id != request.user.id:
                 raise PermissionDenied
@@ -211,18 +260,25 @@ def meeting_detail(request, meeting_id):
                 raise PermissionDenied
             meeting.participants.set(_chosen_participants(request, meeting.team, meeting.host))
             return redirect("meeting_detail", meeting_id=meeting.id)
-        if recording and meeting.ended:
+        if uploads and meeting.ended:
             error = "종료된 회의에는 녹음을 올릴 수 없습니다."
-        elif recording:
-            error = _recording_error(recording)
+        elif uploads:
+            # 하나라도 잘못됐으면 아무것도 저장하지 않는다 — 일부만 올라가면 회의록이 빠진 채로 만들어진다.
+            errors = ([e for e in map(_recording_error, recordings) if e]
+                      + [e for e in map(_text_file_error, text_files) if e])
+            if not errors:
+                errors = _duplicate_text_errors(meeting, text_files)
+            error = "\n".join(errors) or None
         if error:
             return render(request, "meetalign/meeting_detail.html", {
                 "meeting": meeting, "error": error, "stt_status": services.stt_status_text(),
                 **_participant_context(meeting, request.user),
             })
-        if recording:
-            added = Recording.objects.create(meeting=meeting, file=recording, status=Recording.STATUS_PROCESSING)
-            tasks.start_processing(added.id)
+        if uploads:
+            # 녹음을 먼저 만들고 텍스트 파일을 나중에 만든다(처리 순서). 녹취 원문에서는 텍스트 파일이 앞에 온다(tasks).
+            added = [Recording.objects.create(meeting=meeting, file=upload, status=Recording.STATUS_PROCESSING)
+                     for upload in uploads]
+            tasks.start_processing(*(r.id for r in added))
         if request.POST.get("action") == "end":
             Meeting.objects.filter(pk=meeting.pk).update(ended=True)
             return redirect("meeting_detail", meeting_id=meeting.id)
@@ -263,35 +319,52 @@ def recording_retry(request, meeting_id, recording_id):
     return redirect("meeting_result", meeting_id=meeting.id)
 
 
+@login_required
+@require_POST
+def recording_delete(request, meeting_id, recording_id):
+    """업로드된 녹음·텍스트 파일 하나를 지우고, 남은 파일로 녹취 원문과 회의록을 다시 만든다.
+
+    진행자만 지울 수 있다(팀원은 올리기·다시 시도까지). 처리 중인 파일은 처리 스레드가 아직 그 행을
+    쓰고 있으므로 끝난 뒤에 지우게 하고, 종료된 회의는 업로드와 마찬가지로 손대지 않는다.
+    """
+    meeting = _meeting(request, meeting_id)
+    if meeting.host_id != request.user.id:
+        raise PermissionDenied
+    recording = get_object_or_404(Recording, pk=recording_id, meeting=meeting)
+    if meeting.ended or recording.status == Recording.STATUS_PROCESSING:
+        return redirect("meeting_detail", meeting_id=meeting.id)
+    recording.file.delete(save=False)
+    recording.delete()
+    tasks.start_refresh(meeting.id)
+    return redirect("meeting_detail", meeting_id=meeting.id)
+
+
 CHAT_HISTORY_TURNS = 3
 
 
 @login_required
 def chat(request, meeting_id):
+    """대화창 — LLM과 회의 내용을 묻고 답하는 화면 하나뿐이다. 주최자에게 보내는 익명 질문은 익명 대화창(inbox)으로 옮겼다."""
     meeting = _meeting(request, meeting_id)
-    mode = request.POST.get("mode") or request.GET.get("mode", "llm")
-    error = None
+    # 예전 대화창의 '주최자에게 익명 질문' 탭으로 오던 요청(북마크, 열어 둔 옛 화면)은 익명 대화창으로 보낸다.
+    # 보내던 질문은 LLM에 넘기지 않는다 — 쓴 사람은 이름 없이 주최자에게 보낸다고 생각하고 쓴 글이다.
+    if (request.POST.get("mode") or request.GET.get("mode")) == "anon":
+        if request.method == "POST":
+            return _post_anonymous_question(request, meeting)
+        return redirect("inbox", meeting_id=meeting.id)
     if request.method == "POST" and request.POST.get("text", "").strip():
         text = request.POST["text"].strip()
-        if mode == "anon":
-            if meeting.ended:
-                error = "종료된 회의에는 익명 질문을 보낼 수 없습니다."
-            else:
-                Question.objects.create(meeting=meeting, text=text, user=request.user)
-        else:
-            history = list(
-                ChatMessage.objects.filter(meeting=meeting, user=request.user)
-                .order_by("-created_at")[: CHAT_HISTORY_TURNS * 2]
-                .values_list("role", "text")
-            )[::-1]
-            ChatMessage.objects.create(meeting=meeting, user=request.user, role=ChatMessage.ROLE_USER, text=text)
-            reply = services.chat_reply(meeting, text, history=history)
-            ChatMessage.objects.create(meeting=meeting, user=request.user, role=ChatMessage.ROLE_ASSISTANT, text=reply)
-            return redirect("%s?mode=llm" % reverse("chat", args=[meeting.id]))
-    messages = []
-    if mode != "anon":
-        messages = ChatMessage.objects.filter(meeting=meeting, user=request.user)
-    return render(request, "meetalign/chat.html", {"meeting": meeting, "mode": mode, "messages": messages, "error": error})
+        history = list(
+            ChatMessage.objects.filter(meeting=meeting, user=request.user)
+            .order_by("-created_at")[: CHAT_HISTORY_TURNS * 2]
+            .values_list("role", "text")
+        )[::-1]
+        ChatMessage.objects.create(meeting=meeting, user=request.user, role=ChatMessage.ROLE_USER, text=text)
+        reply = services.chat_reply(meeting, text, history=history)
+        ChatMessage.objects.create(meeting=meeting, user=request.user, role=ChatMessage.ROLE_ASSISTANT, text=reply)
+        return redirect("chat", meeting_id=meeting.id)
+    messages = ChatMessage.objects.filter(meeting=meeting, user=request.user)
+    return render(request, "meetalign/chat.html", {"meeting": meeting, "messages": messages})
 
 
 def _require_host(meeting, user):
@@ -300,15 +373,46 @@ def _require_host(meeting, user):
         raise PermissionDenied
 
 
-@login_required
-def inbox(request, meeting_id):
+def _render_inbox(request, meeting, error=None, text=""):
     # 질문과 답변은 팀원 모두에게 공개하고, 작성자는 누구에게도(주최자 포함) 보여주지 않는다.
     # 답변은 주최자만 단다(answers 뷰). is_host는 답변하기 버튼 노출에만 쓴다.
-    meeting = _meeting(request, meeting_id)
-    is_host = meeting.host_id == request.user.id
     # 결정 카드에서 온 질문은 어떤 결정에 대한 질문인지 함께 보여주므로 결정도 같이 읽는다.
     questions = meeting.questions.select_related("decision").order_by("-created_at", "-id")
-    return render(request, "meetalign/inbox.html", {"meeting": meeting, "questions": questions, "is_host": is_host})
+    return render(request, "meetalign/inbox.html", {
+        "meeting": meeting, "questions": questions, "is_host": meeting.host_id == request.user.id,
+        "error": error, "text": text, "sent": request.GET.get("sent") == "1",
+    })
+
+
+def _post_anonymous_question(request, meeting):
+    """익명 대화창에서 쓴 질문을 저장한다. 작성자(user)는 '내 질문' 표시에만 쓰고 누구에게도 보이지 않는다."""
+    text = request.POST.get("text", "").strip()
+    if not text:
+        return _render_inbox(request, meeting, error="질문을 입력해 주세요.")
+    if meeting.ended:
+        return _render_inbox(request, meeting, error="종료된 회의에는 익명 질문을 보낼 수 없습니다.", text=text)
+    Question.objects.create(meeting=meeting, text=text, user=request.user)
+    return redirect("%s?sent=1" % reverse("inbox", args=[meeting.id]))
+
+
+@login_required
+def inbox(request, meeting_id):
+    """익명 대화창 — 주최자에게 이름 없이 질문을 보내고, 팀원 모두의 질문과 주최자 답변을 한곳에서 본다."""
+    meeting = _meeting(request, meeting_id)
+    if request.method == "POST":
+        if "question_id" in request.POST:
+            return _save_answer(request, meeting)
+        return _post_anonymous_question(request, meeting)
+    return _render_inbox(request, meeting)
+
+
+def _save_answer(request, meeting):
+    """주최자가 익명 대화창에서 질문 아래 바로 답을 단다. 답을 비우고 저장하면 '아직 답변 전'으로 돌아간다."""
+    _require_host(meeting, request.user)
+    question = get_object_or_404(Question, pk=request.POST.get("question_id"), meeting=meeting)
+    question.answer = request.POST.get("answer", "").strip()
+    question.save(update_fields=["answer"])
+    return redirect("%s#q%d" % (reverse("inbox", args=[meeting.id]), question.id))
 
 
 @login_required
@@ -318,16 +422,11 @@ def summary(request, meeting_id):
 
 @login_required
 def answers(request, meeting_id):
+    """예전 '질문에 답변하기' 화면 주소. 답변은 이제 익명 대화창 안에서 단다 — 옛 링크와 열어 둔 옛 화면을 위해 남겨 둔다."""
     meeting = _meeting(request, meeting_id)
-    _require_host(meeting, request.user)
     if request.method == "POST":
-        question = get_object_or_404(Question, pk=request.POST.get("question_id"), meeting=meeting)
-        question.answer = request.POST.get("answer", "").strip()
-        question.save()
-        return redirect("answers", meeting_id=meeting.id)
-    return render(request, "meetalign/answers.html", {
-        "meeting": meeting, "questions": meeting.questions.select_related("decision"),
-    })
+        return _save_answer(request, meeting)
+    return redirect("inbox", meeting_id=meeting.id)
 
 
 @login_required
@@ -734,8 +833,9 @@ def _published_evidence(decision):
 def _ack_rows(user, meeting):
     """팀원 결정 확인 화면의 카드 묶음과 '내' 진행률.
 
-    담는 것은 내 선택·내 의견·내 질문뿐이다 — 누가 무엇을 골랐는지는 저장만 하고 어떤 화면에도
-    내보내지 않으므로, 다른 사람의 기록은 여기서 아예 조회하지 않는다.
+    담는 것은 내 선택·내 의견과, 결정마다 올라온 익명 질문이다 — 누가 무엇을 골랐는지는 저장만 하고
+    어떤 화면에도 내보내지 않으므로 다른 사람의 선택·의견은 여기서 아예 조회하지 않는다. 익명 질문은
+    익명 대화창처럼 팀 전체 공개이고 작성자는 드러내지 않는다.
 
     진행률의 분모는 '확인할 수 있는 항목'(공개된 항목)이다. 미결정으로 이월된 항목은 읽기
     전용이라 분모에서 빠진다 — 아무리 눌러도 줄지 않는 숫자가 되기 때문이다.
@@ -748,10 +848,11 @@ def _ack_rows(user, meeting):
         agreement.decision_id: agreement
         for agreement in DecisionAgreement.objects.filter(decision__in=decisions, user=user)
     }
-    # 내가 이 카드에서 보낸 익명 질문과 그 답변 — 보낸 본인만 볼 수 있다(익명 질문함과 같은 기준).
+    # 이 결정에 대해 올라온 익명 질문과 주최자 답변 — 익명 대화창과 같은 기준으로 팀원 모두에게 보인다.
+    # 작성자는 내보내지 않고, 내 질문인지만 화면에서 표시한다(question.user_id).
     asked = {}
     for question in Question.objects.filter(
-        meeting=meeting, user=user, decision__in=decisions,
+        meeting=meeting, decision__in=decisions,
     ).order_by("created_at", "id"):
         asked.setdefault(question.decision_id, []).append(question)
     rows = []

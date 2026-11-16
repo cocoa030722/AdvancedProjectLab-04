@@ -380,6 +380,27 @@ def _with_speakers(recording_path, segments):
         return " ".join(segment["text"] for segment in segments)
 
 
+# 텍스트 파일은 UTF-8(BOM 포함)을 먼저 보고, 윈도우 메모장에서 저장한 한글 파일(CP949)도 읽는다.
+TEXT_TRANSCRIPT_ENCODINGS = ("utf-8-sig", "cp949")
+
+
+def decode_text_transcript(data):
+    """텍스트 파일 바이트 → 녹취 원문 문자열. 읽을 수 없는 인코딩이면 ValueError."""
+    for encoding in TEXT_TRANSCRIPT_ENCODINGS:
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    raise ValueError("텍스트 파일을 읽지 못했습니다. UTF-8로 저장해 다시 올려 주세요.")
+
+
+def read_text_transcript(path):
+    """녹음 대신 올린 회의 원문 텍스트 파일을 읽는다 — 음성 인식(STT)은 거치지 않는다."""
+    with open(path, "rb") as handle:
+        return decode_text_transcript(handle.read())
+
+
 def transcribe(recording_path, recording_id=None):
     """녹음 파일을 전사한다. 네이버 CLOVA Speech(이번 달 무료 사용량 이내) → Groq Whisper API → 로컬 Whisper 순서로
     시도하고, 앞 단계가 설정돼 있지 않거나 실패하면 다음 단계로 넘어간다. 아무 것도 설정돼 있지 않으면 None(가짜 동작
@@ -622,7 +643,7 @@ def summarize(transcript):
     prompt = (
         "다음은 회의 녹음의 전사본이다. 한국어로만, 아래 형식으로 정리하라. 전사본에 없는 내용은 쓰지 말고, "
         "해당하는 내용이 전혀 없는 섹션은 통째로 생략하라.\n\n"
-        "[요약]\n- 회의 전체 내용을 2~4줄로 요약\n\n"
+        "[요약]\n- 회의 전체 내용을 요약\n\n"
         "[결정된 사항]\n- 회의에서 확정된 것만\n\n"
         "[아직 논의 중인 사항]\n- 결론 안 나고 보류되거나 이견이 남은 것\n\n"
         "[할 일]\n- 담당자가 언급됐으면 \"할 일 (담당자)\" 형식으로, 안 됐으면 할 일만\n\n"
