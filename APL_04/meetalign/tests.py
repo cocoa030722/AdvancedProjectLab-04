@@ -318,28 +318,46 @@ class PrototypeFlowTests(TestCase):
         q.refresh_from_db()
         self.assertEqual(q.answer, "")
 
-    def test_asker_sees_only_their_own_question_and_answer(self):
-        member_user = User.objects.create_user("member", password="pw12345!")
+    def test_every_member_sees_all_questions_and_answers(self):
+        member_user = User.objects.create_user("asker_alpha", password="pw12345!")
         self.team.members.add(member_user)
         member = Client()
         member.force_login(member_user)
 
-        other_user = User.objects.create_user("c", password="pw12345!")
+        other_user = User.objects.create_user("asker_beta", password="pw12345!")
         self.team.members.add(other_user)
         other = Client()
         other.force_login(other_user)
 
-        Question.objects.create(meeting=self.meeting, text="내 질문", answer="주최자 답변", user=member_user)
-        Question.objects.create(meeting=self.meeting, text="다른 사람 질문", answer="다른 답변", user=other_user)
+        Question.objects.create(meeting=self.meeting, text="알파의 질문", answer="알파에게 한 답변", user=member_user)
+        Question.objects.create(meeting=self.meeting, text="베타의 질문", answer="베타에게 한 답변", user=other_user)
 
-        r = member.get(reverse("inbox", args=[self.meeting.id]))
-        self.assertContains(r, "내 질문")
-        self.assertContains(r, "주최자 답변")
-        self.assertNotContains(r, "다른 사람 질문")
+        for client in (member, other, self.client):
+            r = client.get(reverse("inbox", args=[self.meeting.id]))
+            for text in ("알파의 질문", "알파에게 한 답변", "베타의 질문", "베타에게 한 답변"):
+                self.assertContains(r, text)
 
-        r2 = other.get(reverse("inbox", args=[self.meeting.id]))
-        self.assertContains(r2, "다른 사람 질문")
-        self.assertNotContains(r2, "내 질문")
+        # 작성자 이름은 다른 팀원에게도, 주최자에게도 노출되지 않는다.
+        self.assertNotContains(member.get(reverse("inbox", args=[self.meeting.id])), "asker_beta")
+        self.assertNotContains(other.get(reverse("inbox", args=[self.meeting.id])), "asker_alpha")
+        host_view = self.client.get(reverse("inbox", args=[self.meeting.id]))
+        self.assertNotContains(host_view, "asker_alpha")
+        self.assertNotContains(host_view, "asker_beta")
+
+    def test_own_question_marked_only_for_asker(self):
+        member = self._member_client()
+        member.post(reverse("chat", args=[self.meeting.id]), {"mode": "anon", "text": "팀원 질문"})
+        self.assertContains(member.get(reverse("inbox", args=[self.meeting.id])), "내 질문")
+        self.assertNotContains(self.client.get(reverse("inbox", args=[self.meeting.id])), "내 질문")
+
+    def test_outsider_cannot_view_inbox(self):
+        Question.objects.create(meeting=self.meeting, text="팀 내부 질문")
+        outsider = User.objects.create_user("outsider", password="pw12345!")
+        client = Client()
+        client.force_login(outsider)
+        r = client.get(reverse("inbox", args=[self.meeting.id]))
+        self.assertIn(r.status_code, (403, 404))
+        self.assertNotContains(r, "팀 내부 질문", status_code=r.status_code)
 
     def test_host_sees_all_questions_regardless_of_asker(self):
         member = self._member_client()
@@ -4514,8 +4532,11 @@ class DecisionCardTests(TestCase):
         self.client.post(self._ask_url(self.decisions[1]), {"mode": "anon", "text": "이 기한이 맞나요?"})
         bob = self._as(self.bob)
         self.assertNotContains(bob.get(self.url), "이 기한이 맞나요?")
-        # 익명 질문함도 주최자가 아닌 팀원에게는 본인 질문만 보여준다.
-        self.assertNotContains(bob.get(reverse("inbox", args=[self.meeting.id])), "이 기한이 맞나요?")
+        # 익명 질문함은 팀 전체 공개라 다른 팀원도 질문을 보지만, 작성자는 드러나지 않는다.
+        r = bob.get(reverse("inbox", args=[self.meeting.id]))
+        self.assertContains(r, "이 기한이 맞나요?")
+        self.assertNotContains(r, self.alice.username)
+        self.assertNotContains(r, "내 질문")
 
     def test_anonymous_question_is_blocked_on_an_ended_meeting(self):
         Meeting.objects.filter(pk=self.meeting.pk).update(ended=True)
