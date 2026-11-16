@@ -2,7 +2,8 @@
 {% block content %}
 <div class="page-head">
   <div>
-    <h1><a href="{% url 'meeting_detail' meeting.id %}" class="crumb-link">뒤로 가기</a> <span class="crumb-sep">/</span> {% if is_host %}익명 질문함{% else %}내가 보낸 질문{% endif %}</h1>
+    <h1><a href="{% url 'meeting_detail' meeting.id %}" class="crumb-link">뒤로 가기</a> <span class="crumb-sep">/</span> 익명 질문함</h1>
+    <p class="muted">팀원 모두가 질문과 답변을 볼 수 있습니다. 누가 보냈는지는 주최자를 포함해 아무에게도 보이지 않습니다.</p>
   </div>
 </div>
 <div class="card elevated">
@@ -12,11 +13,11 @@
     <li class="item" style="display:block">
       {# 결정 확인 카드에서 보낸 질문이면 어떤 결정에 대한 질문인지 함께 보여준다(작성자는 비공개). #}
       {% if q.decision %}<div class="meta" style="margin:0 0 4px">이 결정에 대한 질문 · {{ q.decision.published_text }}</div>{% endif %}
-      <div class="title">{{ q.text }}</div>
+      <div class="title">{{ q.text }}{% if q.user_id and q.user_id == request.user.id %} <span class="badge">내 질문</span>{% endif %}</div>
       {% if q.answer %}<div class="bubble" style="margin-top:8px">답변: {{ q.answer }}</div>{% else %}<span class="badge processing" style="margin-top:6px">아직 답변 전</span>{% endif %}
     </li>
   {% empty %}
-    <li class="empty"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11V6a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v5"/><path d="M4 11h4.5a1 1 0 0 1 .9.55L10.5 14h3l1.1-2.45a1 1 0 0 1 .9-.55H20"/><path d="M4 11v6a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-6"/></svg>{% if is_host %}받은 익명 질문이 없습니다.{% else %}아직 보낸 질문이 없습니다. 대화창에서 주최자에게 익명으로 물어보세요.{% endif %}</li>
+    <li class="empty"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11V6a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v5"/><path d="M4 11h4.5a1 1 0 0 1 .9.55L10.5 14h3l1.1-2.45a1 1 0 0 1 .9-.55H20"/><path d="M4 11v6a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-6"/></svg>아직 올라온 질문이 없습니다. 대화창의 익명 질문 탭에서 질문을 보낼 수 있습니다.</li>
   {% endfor %}
   </ul>
   {% if is_host %}

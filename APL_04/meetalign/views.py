@@ -302,13 +302,12 @@ def _require_host(meeting, user):
 
 @login_required
 def inbox(request, meeting_id):
-    # 주최자는 받은 질문 전체(작성자 비공개)를 보고 답한다. 팀원은 본인이 보낸 질문과
-    # 그 답변만 볼 수 있다 — 익명이라는 취지상 다른 사람이 받은 답은 보이면 안 된다.
+    # 질문과 답변은 팀원 모두에게 공개하고, 작성자는 누구에게도(주최자 포함) 보여주지 않는다.
+    # 답변은 주최자만 단다(answers 뷰). is_host는 답변하기 버튼 노출에만 쓴다.
     meeting = _meeting(request, meeting_id)
     is_host = meeting.host_id == request.user.id
     # 결정 카드에서 온 질문은 어떤 결정에 대한 질문인지 함께 보여주므로 결정도 같이 읽는다.
-    questions = meeting.questions.select_related("decision")
-    questions = questions.all() if is_host else questions.filter(user=request.user)
+    questions = meeting.questions.select_related("decision").order_by("-created_at", "-id")
     return render(request, "meetalign/inbox.html", {"meeting": meeting, "questions": questions, "is_host": is_host})
 
 

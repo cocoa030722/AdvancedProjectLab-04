@@ -107,8 +107,8 @@ class ChatMessage(models.Model):
 
 
 class Question(models.Model):
-    """회의별 대화방의 익명 질문. 주최자와 다른 팀원에게는 작성자를 보여주지 않지만,
-    답변을 본인만 볼 수 있도록 내부적으로는 작성자를 저장한다."""
+    """회의별 익명 질문. 질문과 답변은 팀원 모두에게 공개하고, 작성자는 누구에게도
+    보여주지 않는다. user는 본인 질문에 '내 질문' 표시를 붙이는 데만 쓴다."""
     meeting = models.ForeignKey(Meeting, on_delete=models.CASCADE, related_name="questions")
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="questions")
     # 결정 확인 카드에서 보낸 질문이면 어떤 결정에 대한 질문인지. 대화창에서 보낸 질문은 비어 있다.
