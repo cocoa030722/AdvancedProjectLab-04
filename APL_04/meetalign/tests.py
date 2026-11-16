@@ -125,9 +125,11 @@ class PrototypeFlowTests(TestCase):
         self.assertTrue(Meeting.objects.filter(title="x").exists())
         for name in ["meeting_list", "meeting_create"]:
             self.assertEqual(self.client.get(reverse(name, args=[self.team.id])).status_code, 200)
-        for name in ["meeting_detail", "meeting_result", "chat", "inbox",
-                     "summary", "answers"]:
+        for name in ["meeting_detail", "meeting_result", "chat", "inbox", "summary"]:
             self.assertEqual(self.client.get(reverse(name, args=[self.meeting.id])).status_code, 200, name)
+        # 예전 답변 화면 주소는 익명 대화창으로 보낸다(답변은 그 안에서 단다).
+        self.assertRedirects(self.client.get(reverse("answers", args=[self.meeting.id])),
+                             reverse("inbox", args=[self.meeting.id]))
 
     def test_submit_and_end(self):
         url = reverse("meeting_detail", args=[self.meeting.id])
@@ -288,7 +290,7 @@ class PrototypeFlowTests(TestCase):
 
     def test_sub_screens_have_back_to_meeting_link(self):
         back = 'href="%s"' % reverse("meeting_detail", args=[self.meeting.id])
-        for name in ["meeting_result", "chat", "inbox", "summary", "answers"]:
+        for name in ["meeting_result", "chat", "inbox", "summary"]:
             r = self.client.get(reverse(name, args=[self.meeting.id]))
             self.assertContains(r, back, msg_prefix=name)
 
@@ -1302,8 +1304,10 @@ class BackgroundProcessingTests(TestCase):
     def test_result_page_shows_processing_message_and_refresh(self):
         self.meeting.processing_status = Meeting.STATUS_PROCESSING
         self.meeting.save()
-        tasks._active.add(self.meeting.id)
-        self.addCleanup(tasks._active.discard, self.meeting.id)
+        # 처리 스레드가 실제로 돌고 있는 파일 — 처리 중인 파일이 없으면 recover_stuck이 '처리 중'을 풀어 버린다.
+        rec = Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("a.wav", b"RIFF"), status=Recording.STATUS_PROCESSING)
+        tasks._active.add(rec.id)
+        self.addCleanup(tasks._active.discard, rec.id)
         r = self.client.get(reverse("meeting_result", args=[self.meeting.id]))
         self.assertContains(r, "http-equiv=\"refresh\"")
         self.assertContains(r, "녹음을 글로 옮기고")
@@ -4527,7 +4531,7 @@ class DecisionCardTests(TestCase):
         self.client.post(self._ask_url(self.decisions[1]), {"mode": "anon", "text": "이 기한이 맞나요?"})
         host = self._as(self.host)
         for url in (reverse("inbox", args=[self.meeting.id]), reverse("answers", args=[self.meeting.id])):
-            r = host.get(url)
+            r = host.get(url, follow=True)
             self.assertContains(r, "이 기한이 맞나요?")
             self.assertContains(r, "확정 문장 1")
             self.assertNotContains(r, self.alice.username)
@@ -4543,10 +4547,20 @@ class DecisionCardTests(TestCase):
         # 익명 질문함에서도 본인은 자기 질문과 답변을 본다.
         self.assertContains(self.client.get(reverse("inbox", args=[self.meeting.id])), "네, 금요일이 맞습니다")
 
-    def test_another_members_card_never_shows_my_anonymous_question(self):
+    def test_another_member_sees_my_anonymous_question_in_the_card_without_my_name(self):
         self.client.post(self._ask_url(self.decisions[1]), {"mode": "anon", "text": "이 기한이 맞나요?"})
+        question = Question.objects.get(meeting=self.meeting)
+        question.answer = "네, 금요일이 맞습니다"
+        question.save()
         bob = self._as(self.bob)
-        self.assertNotContains(bob.get(self.url), "이 기한이 맞나요?")
+        card = bob.get(self.url)
+        self.assertContains(card, "익명 질문: 이 기한이 맞나요?")
+        self.assertContains(card, "네, 금요일이 맞습니다")
+        self.assertContains(card, "익명 질문 1개")
+        self.assertNotContains(card, self.alice.username)
+        self.assertNotContains(card, "내 질문")
+        # 보낸 본인에게는 '내 질문' 표시가 붙는다.
+        self.assertContains(self.client.get(self.url), "내 질문")
         # 익명 질문함은 팀 전체 공개라 다른 팀원도 질문을 보지만, 작성자는 드러나지 않는다.
         r = bob.get(reverse("inbox", args=[self.meeting.id]))
         self.assertContains(r, "이 기한이 맞나요?")
@@ -4903,3 +4917,346 @@ class MeetingParticipantTests(TestCase):
         self.assertContains(self.client.get(url), 'value="set_participants"')
         self.client.force_login(self.alpha)
         self.assertNotContains(self.client.get(url), 'value="set_participants"')
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
+class TextTranscriptUploadTests(TestCase):
+    """녹음 대신 회의 원문 텍스트 파일(.txt·.md)을 올리면 음성 인식 없이 그 내용이 녹취 원문이 된다."""
+
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
+
+    def _upload(self, name, data):
+        file = SimpleUploadedFile(name, data, content_type="text/plain")
+        return self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit", "text_file": file})
+
+    def _post(self, recordings=(), text_files=()):
+        return self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {
+            "action": "submit",
+            "recording": [SimpleUploadedFile(n, d, content_type="audio/wav") for n, d in recordings],
+            "text_file": [SimpleUploadedFile(n, d, content_type="text/plain") for n, d in text_files],
+        })
+
+    def test_text_files_come_first_and_audio_transcripts_follow(self):
+        def fake_stt(path, recording_id=None):
+            return "전사:" + os.path.basename(path).split("_")[0].split(".")[0]
+        with patch.object(services, "transcribe", side_effect=fake_stt) as stt, \
+             patch.object(services, "summarize", return_value="요약") as summarize:
+            r = self._post(recordings=[("a1.wav", b"R"), ("a2.wav", b"R")],
+                           text_files=[("메모.txt", "메모 내용".encode()), ("정리.md", "정리 내용".encode())])
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(stt.call_count, 2)
+        # 파일이 몇 개든 한 번 제출하면 요약은 한 번만 만든다.
+        summarize.assert_called_once()
+        self.meeting.refresh_from_db()
+        recs = {r.filename.split("_")[0].split(".")[0]: r.filename for r in self.meeting.recordings.all()}
+        self.assertEqual(self.meeting.transcript, "\n\n".join([
+            "[텍스트 파일: %s]\n메모 내용" % recs["메모"], "[텍스트 파일: %s]\n정리 내용" % recs["정리"],
+            "[%s]\n전사:a1" % recs["a1"], "[%s]\n전사:a2" % recs["a2"],
+        ]))
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_DONE)
+
+    def test_text_stays_first_even_when_recordings_are_added_later(self):
+        with patch.object(services, "summarize", side_effect=lambda t: t):
+            self._post(text_files=[("메모.txt", "메모 내용".encode())])
+        with patch.object(services, "transcribe", return_value="녹음 전사"), patch.object(services, "summarize", side_effect=lambda t: t):
+            self._post(recordings=[("late.wav", b"R")])
+        self.meeting.refresh_from_db()
+        self.assertLess(self.meeting.transcript.index("메모 내용"), self.meeting.transcript.index("녹음 전사"))
+        self.assertTrue(self.meeting.transcript.startswith("[텍스트 파일: "))
+        self.assertIn("[텍스트 파일: ", self.meeting.transcript)
+
+    def test_text_file_in_recording_field_is_rejected(self):
+        r = self._post(recordings=[("메모.txt", "내용".encode())])
+        self.assertContains(r, "메모.txt: 텍스트 파일은 아래")
+        self.assertFalse(Recording.objects.filter(meeting=self.meeting).exists())
+
+    def test_audio_in_text_field_is_rejected(self):
+        r = self._post(text_files=[("a.wav", b"RIFF")])
+        self.assertContains(r, "txt 파일만 올릴 수 있어요")
+        self.assertFalse(Recording.objects.filter(meeting=self.meeting).exists())
+
+    def test_one_bad_file_saves_nothing(self):
+        with patch.object(services, "transcribe") as stt:
+            r = self._post(recordings=[("a.wav", b"R")], text_files=[("빈.txt", b" ")])
+        self.assertContains(r, "빈.txt: 텍스트 파일이 비어 있습니다")
+        stt.assert_not_called()
+        self.assertFalse(Recording.objects.filter(meeting=self.meeting).exists())
+
+    def test_text_file_becomes_transcript_without_stt(self):
+        with patch.object(services, "transcribe") as stt, patch.object(services, "summarize", return_value="요약본"):
+            r = self._upload("회의.txt", "민수: 금요일까지 발표 자료 만들게요\r\n지수: 좋아요".encode("utf-8"))
+        self.assertEqual(r.status_code, 302)
+        stt.assert_not_called()
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.transcript, "민수: 금요일까지 발표 자료 만들게요\n지수: 좋아요")
+        self.assertEqual(self.meeting.record, "요약본")
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_DONE)
+        self.assertTrue(Recording.objects.get(meeting=self.meeting).is_text)
+
+    def test_markdown_and_cp949_and_bom_are_read(self):
+        for name, data in [("a.md", "# 회의\n주제 확정".encode("utf-8")),
+                           ("b.txt", "주제 확정".encode("cp949")),
+                           ("c.TXT", "﻿주제 확정".encode("utf-8"))]:
+            self.meeting.recordings.all().delete()
+            with patch.object(services, "summarize", side_effect=lambda t: t):
+                self.assertEqual(self._upload(name, data).status_code, 302, name)
+            self.assertTrue(Recording.objects.get(meeting=self.meeting).transcript.endswith("주제 확정"), name)
+
+    def test_empty_text_file_is_rejected(self):
+        r = self._upload("a.txt", b"  \n ")
+        self.assertContains(r, "텍스트 파일이 비어 있습니다")
+        self.assertFalse(Recording.objects.filter(meeting=self.meeting).exists())
+
+    def test_undecodable_text_file_is_rejected(self):
+        r = self._upload("a.txt", b"\xff\xfe\x00\xd8\x00\xdc\xff")
+        self.assertContains(r, "텍스트 파일을 읽지 못했습니다")
+        self.assertFalse(Recording.objects.filter(meeting=self.meeting).exists())
+
+    def test_oversized_text_file_is_rejected(self):
+        with patch.object(views, "MAX_TEXT_TRANSCRIPT_BYTES", 2):
+            r = self._upload("a.txt", "회의 내용".encode("utf-8"))
+        self.assertContains(r, "텍스트 파일이 너무 큽니다")
+
+    def test_text_file_has_no_audio_player_and_form_accepts_text(self):
+        with patch.object(services, "summarize", side_effect=lambda t: t):
+            self._upload("회의.txt", "내용".encode("utf-8"))
+        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
+        self.assertNotContains(r, "<audio controls preload")
+        self.assertContains(r, 'name="text_file" multiple')
+        self.assertContains(r, 'name="recording" multiple')
+
+    def test_same_text_content_uploaded_again_is_rejected(self):
+        with patch.object(services, "summarize", side_effect=lambda t: t):
+            self._post(text_files=[("메모.txt", "메모 내용".encode())])
+            r = self._post(text_files=[("메모.txt", "메모 내용\n".encode())])
+        self.assertContains(r, "이미 올린 텍스트 파일")
+        self.assertEqual(self.meeting.recordings.count(), 1)
+
+    def test_same_text_twice_in_one_submit_is_rejected(self):
+        r = self._post(text_files=[("a.txt", "같은 내용".encode()), ("b.txt", "같은 내용".encode())])
+        self.assertContains(r, "b.txt: 이미 올린 텍스트 파일(a.txt)")
+        self.assertFalse(self.meeting.recordings.exists())
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
+class RecordingDeleteTests(TestCase):
+    """업로드된 파일을 진행자가 지우면 남은 파일로 녹취 원문과 회의록을 다시 만든다."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.member = User.objects.create_user("member", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host, self.member)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.host)
+        self.client.force_login(self.host)
+        with patch.object(services, "transcribe", return_value="녹음 전사"), \
+             patch.object(services, "summarize", side_effect=lambda t: "요약:" + t):
+            self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {
+                "action": "submit",
+                "recording": [SimpleUploadedFile("a.wav", b"R", content_type="audio/wav")],
+                "text_file": [SimpleUploadedFile("메모.txt", "메모 내용".encode(), content_type="text/plain")],
+            })
+        self.audio = self.meeting.recordings.get(file__endswith=".wav")
+        self.text = self.meeting.recordings.get(file__endswith=".txt")
+
+    def _delete(self, recording, client=None):
+        with patch.object(services, "summarize", side_effect=lambda t: "요약:" + t):
+            return (client or self.client).post(reverse("recording_delete", args=[self.meeting.id, recording.id]))
+
+    def test_delete_removes_file_and_rebuilds_transcript_and_record(self):
+        path = self.text.file.path
+        self.assertTrue(os.path.exists(path))
+        r = self._delete(self.text)
+        self.assertRedirects(r, reverse("meeting_detail", args=[self.meeting.id]))
+        self.assertFalse(Recording.objects.filter(pk=self.text.pk).exists())
+        self.assertFalse(os.path.exists(path))
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.transcript, "녹음 전사")
+        self.assertEqual(self.meeting.record, "요약:녹음 전사")
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_DONE)
+
+    def test_deleting_last_file_empties_the_record(self):
+        self._delete(self.text)
+        self._delete(self.audio)
+        self.meeting.refresh_from_db()
+        self.assertEqual((self.meeting.transcript, self.meeting.record, self.meeting.processing_status), ("", "", ""))
+
+    def test_member_cannot_delete(self):
+        client = Client()
+        client.force_login(self.member)
+        r = self._delete(self.text, client)
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(Recording.objects.filter(pk=self.text.pk).exists())
+
+    def test_get_does_not_delete(self):
+        r = self.client.get(reverse("recording_delete", args=[self.meeting.id, self.text.id]))
+        self.assertEqual(r.status_code, 405)
+        self.assertTrue(Recording.objects.filter(pk=self.text.pk).exists())
+
+    def test_processing_file_and_ended_meeting_are_not_deleted(self):
+        Recording.objects.filter(pk=self.audio.pk).update(status=Recording.STATUS_PROCESSING)
+        self._delete(self.audio)
+        self.assertTrue(Recording.objects.filter(pk=self.audio.pk).exists())
+        Meeting.objects.filter(pk=self.meeting.pk).update(ended=True)
+        self._delete(self.text)
+        self.assertTrue(Recording.objects.filter(pk=self.text.pk).exists())
+
+    def test_delete_button_only_for_host(self):
+        url = reverse("recording_delete", args=[self.meeting.id, self.text.id])
+        self.assertContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), url)
+        client = Client()
+        client.force_login(self.member)
+        self.assertNotContains(client.get(reverse("meeting_detail", args=[self.meeting.id])), url)
+
+    def test_background_delete_refresh_marks_processing_and_recovers_after_restart(self):
+        with override_settings(BACKGROUND_RECORDING=True), patch.object(tasks.threading, "Thread") as thread:
+            self._delete(self.text)
+        thread.return_value.start.assert_called_once()
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_PROCESSING)
+        # 스레드가 돌기 전에 서버가 재시작된 상황 — 진행 중 표시만 남았다.
+        tasks._refreshing.discard(self.meeting.id)
+        with patch.object(services, "summarize", side_effect=lambda t: "요약:" + t):
+            self.client.get(reverse("meeting_result", args=[self.meeting.id]))
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_DONE)
+        self.assertEqual(self.meeting.transcript, "녹음 전사")
+
+
+class AnonymousChatTests(TestCase):
+    """대화창은 LLM과의 대화 하나뿐이고, 익명 질문은 익명 대화창(inbox)에서 보내고 본다."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.member = User.objects.create_user("member", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host, self.member)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.host)
+        self.client.force_login(self.member)
+        self.inbox = reverse("inbox", args=[self.meeting.id])
+        self.chat = reverse("chat", args=[self.meeting.id])
+
+    def test_chat_page_is_llm_only(self):
+        r = self.client.get(self.chat)
+        self.assertContains(r, "LLM과의 대화")
+        self.assertNotContains(r, "주최자에게 익명 질문")
+        self.assertNotContains(r, "?mode=anon")
+
+    def test_chat_post_goes_to_llm(self):
+        with patch.object(services, "chat_reply", return_value="AI 답") as reply:
+            r = self.client.post(self.chat, {"text": "질문"})
+        self.assertRedirects(r, self.chat)
+        reply.assert_called_once()
+        self.assertFalse(Question.objects.exists())
+
+    def test_anonymous_question_is_sent_from_inbox(self):
+        r = self.client.post(self.inbox, {"text": "익명 질문입니다"}, follow=True)
+        self.assertContains(r, "익명 질문이 전송되었습니다")
+        self.assertContains(r, "익명 질문입니다")
+        self.assertContains(r, "내 질문")
+        q = Question.objects.get()
+        self.assertEqual((q.meeting, q.user, q.text), (self.meeting, self.member, "익명 질문입니다"))
+        self.assertFalse(ChatMessage.objects.exists())
+
+    def test_inbox_page_has_form_and_new_name(self):
+        r = self.client.get(self.inbox)
+        self.assertContains(r, "익명 대화창")
+        self.assertContains(r, 'placeholder="주최자에게 보낼 질문"')
+
+    def test_empty_question_is_rejected(self):
+        r = self.client.post(self.inbox, {"text": "  "})
+        self.assertContains(r, "질문을 입력해 주세요")
+        self.assertFalse(Question.objects.exists())
+
+    def test_ended_meeting_hides_form_and_rejects(self):
+        Meeting.objects.filter(pk=self.meeting.pk).update(ended=True)
+        self.assertNotContains(self.client.get(self.inbox), 'placeholder="주최자에게 보낼 질문"')
+        r = self.client.post(self.inbox, {"text": "늦은 질문"})
+        self.assertContains(r, "종료된 회의에는 익명 질문을 보낼 수 없습니다")
+        self.assertFalse(Question.objects.exists())
+
+    def test_old_anon_tab_links_redirect_to_inbox_and_never_reach_llm(self):
+        self.assertRedirects(self.client.get(self.chat + "?mode=anon"), self.inbox)
+        with patch.object(services, "chat_reply") as reply:
+            self.client.post(self.chat, {"mode": "anon", "text": "옛 화면에서 보낸 질문"})
+        reply.assert_not_called()
+        self.assertEqual(Question.objects.get().text, "옛 화면에서 보낸 질문")
+
+    def test_outsider_cannot_post_anonymous_question(self):
+        outsider = User.objects.create_user("x", password="pw12345!")
+        client = Client()
+        client.force_login(outsider)
+        self.assertEqual(client.post(self.inbox, {"text": "침입"}).status_code, 404)
+        self.assertFalse(Question.objects.exists())
+
+    def test_meeting_page_lists_llm_chat_and_anonymous_chat(self):
+        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
+        self.assertContains(r, "익명 대화창")
+        self.assertContains(r, "LLM과 회의 내용에 대해 대화하기")
+        self.assertNotContains(r, "익명 질문함")
+
+
+
+class InboxAnswerTests(TestCase):
+    """주최자는 익명 대화창 안에서 질문 바로 아래에 답을 단다(예전 '질문에 답변하기' 화면을 합침)."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.member = User.objects.create_user("member", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host, self.member)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.host)
+        self.question = Question.objects.create(meeting=self.meeting, text="언제까지예요?", user=self.member)
+        self.inbox = reverse("inbox", args=[self.meeting.id])
+        self.client.force_login(self.host)
+
+    def test_host_sees_inline_answer_form_and_no_separate_page_link(self):
+        r = self.client.get(self.inbox)
+        self.assertContains(r, 'name="question_id" value="%d"' % self.question.id)
+        self.assertContains(r, "답변 저장")
+        self.assertNotContains(r, "질문에 답변하기")
+
+    def test_host_answers_inline_and_everyone_sees_it(self):
+        r = self.client.post(self.inbox, {"question_id": self.question.id, "answer": "금요일까지요"})
+        self.assertRedirects(r, "%s#q%d" % (self.inbox, self.question.id), fetch_redirect_response=False)
+        self.question.refresh_from_db()
+        self.assertEqual(self.question.answer, "금요일까지요")
+        self.assertFalse(Question.objects.exclude(pk=self.question.pk).exists())  # 새 질문으로 저장되지 않는다
+        member = Client()
+        member.force_login(self.member)
+        page = member.get(self.inbox)
+        self.assertContains(page, "답변: 금요일까지요")
+        self.assertNotContains(page, 'name="question_id"')
+
+    def test_host_can_edit_and_clear_answer(self):
+        self.client.post(self.inbox, {"question_id": self.question.id, "answer": "금요일"})
+        self.assertContains(self.client.get(self.inbox), "답변 고치기")
+        self.client.post(self.inbox, {"question_id": self.question.id, "answer": ""})
+        self.question.refresh_from_db()
+        self.assertEqual(self.question.answer, "")
+        self.assertContains(self.client.get(self.inbox), "아직 답변 전")
+
+    def test_member_cannot_answer_through_inbox(self):
+        member = Client()
+        member.force_login(self.member)
+        r = member.post(self.inbox, {"question_id": self.question.id, "answer": "가짜 답"})
+        self.assertEqual(r.status_code, 403)
+        self.question.refresh_from_db()
+        self.assertEqual(self.question.answer, "")
+
+    def test_question_from_another_meeting_cannot_be_answered(self):
+        other = Meeting.objects.create(team=self.team, title="o", host=self.host)
+        foreign = Question.objects.create(meeting=other, text="다른 회의")
+        r = self.client.post(self.inbox, {"question_id": foreign.id, "answer": "x"})
+        self.assertEqual(r.status_code, 404)
+
+    def test_old_answers_url_still_saves_and_returns_to_inbox(self):
+        r = self.client.post(reverse("answers", args=[self.meeting.id]), {"question_id": self.question.id, "answer": "옛 화면 답"})
+        self.assertRedirects(r, "%s#q%d" % (self.inbox, self.question.id), fetch_redirect_response=False)
+        self.question.refresh_from_db()
+        self.assertEqual(self.question.answer, "옛 화면 답")

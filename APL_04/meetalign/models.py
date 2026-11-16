@@ -53,6 +53,10 @@ class Meeting(models.Model):
         return self.deadline is not None and self.deadline - timezone.localdate() == timedelta(days=1)
 
 
+# 녹음 대신 올릴 수 있는 회의 원문 텍스트 파일. 음성 인식을 건너뛰고 파일 내용을 그대로 녹취 원문으로 쓴다.
+TEXT_TRANSCRIPT_EXTENSIONS = {".txt", ".md"}
+
+
 class Recording(models.Model):
     STATUS_PROCESSING = "processing"
     STATUS_DONE = "done"
@@ -72,6 +76,11 @@ class Recording(models.Model):
     def filename(self):
         return os.path.basename(self.file.name)
 
+    @property
+    def is_text(self):
+        """녹음이 아니라 회의 원문 텍스트 파일인가(TEXT_TRANSCRIPT_EXTENSIONS)."""
+        return os.path.splitext(self.file.name)[1].lower() in TEXT_TRANSCRIPT_EXTENSIONS
+
     def __str__(self):
         return self.filename
 
@@ -89,7 +98,7 @@ class SttUsage(models.Model):
 
 class ChatMessage(models.Model):
     """회의 내용에 대해 질문하는 대화창의 기록. 사용자별로 따로 저장되어
-    다음 질문을 할 때 이전 대화를 참고할 수 있게 한다. 익명 질문함(Question)과는 별개다."""
+    다음 질문을 할 때 이전 대화를 참고할 수 있게 한다. 익명 대화창(Question)과는 별개다."""
     ROLE_USER = "user"
     ROLE_ASSISTANT = "assistant"
 
@@ -112,7 +121,7 @@ class Question(models.Model):
     meeting = models.ForeignKey(Meeting, on_delete=models.CASCADE, related_name="questions")
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="questions")
     # 결정 확인 카드에서 보낸 질문이면 어떤 결정에 대한 질문인지. 대화창에서 보낸 질문은 비어 있다.
-    # 주최자 익명 질문함에서 질문 옆에 그 결정 문장을 보여주는 데 쓴다(작성자는 여전히 비공개).
+    # 익명 대화창에서 질문 옆에 그 결정 문장을 보여주는 데 쓴다(작성자는 여전히 비공개).
     # 결정이 지워져도 질문 자체는 주최자가 답할 몫이라 남겨 둔다(SET_NULL).
     decision = models.ForeignKey("Decision", on_delete=models.SET_NULL, null=True, blank=True, related_name="questions")
     text = models.TextField()

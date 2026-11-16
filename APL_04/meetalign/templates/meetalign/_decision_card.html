@@ -50,7 +50,7 @@
 
   {# 궁금한 점을 묻기 위해 대화창으로 떠나지 않아도 되게 — 기본은 접혀 있다. #}
   <details class="card-ask"{% if row.ask_open %} open{% endif %}>
-    <summary class="muted">이 결정에 대해 질문하기</summary>
+    <summary class="muted">이 결정에 대해 질문하기{% if row.questions %} · 익명 질문 {{ row.questions|length }}개{% endif %}</summary>
     <div class="step-more-body">
       {% if row.ask_error %}<div class="error" style="margin:0">{{ row.ask_error }}</div>{% endif %}
       <form method="post" class="ask-form" action="{% url 'decision_ask' meeting.id row.decision.id %}">{% csrf_token %}
@@ -65,14 +65,14 @@
       <div class="ask-answer">
         <div class="meta">Q. {{ row.ai_question }}</div>
         <div class="bubble" style="margin-top:4px">{{ row.ai_answer }}</div>
-        <div class="meta" style="margin-top:4px">이 질문과 답변은 <a href="{% url 'chat' meeting.id %}">대화창</a>에도 저장됐어요.</div>
+        <div class="meta" style="margin-top:4px">이 질문과 답변은 <a href="{% url 'chat' meeting.id %}">LLM과의 대화</a>에도 저장됐어요.</div>
       </div>
       {% endif %}
       {% if row.ask_sent %}<div class="success" style="margin:8px 0 0">익명 질문을 주최자에게 보냈어요. 이름은 전달되지 않습니다.</div>{% endif %}
-      {# 내가 이 결정에 대해 보낸 익명 질문과 주최자 답변 — 보낸 본인만 보인다. #}
+      {# 이 결정에 대해 올라온 익명 질문과 주최자 답변 — 익명 대화창처럼 팀원 모두가 보고, 작성자는 드러나지 않는다. #}
       {% for question in row.questions %}
       <div class="ask-mine" style="margin-top:8px">
-        <div class="meta">내 익명 질문: {{ question.text }}</div>
+        <div class="meta">익명 질문: {{ question.text }}{% if question.user_id == user.id %} <span class="badge">내 질문</span>{% endif %}</div>
         {% if question.answer %}<div class="bubble" style="margin-top:4px">주최자 답변: {{ question.answer }}</div>
         {% else %}<span class="badge processing" style="margin-top:4px">아직 답변 전</span>{% endif %}
       </div>

@@ -146,6 +146,11 @@ STATIC_URL = 'static/'
 
 MEDIA_URL = 'media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+# `manage.py test`에서는 업로드 테스트가 만든 파일(a.wav, test.mp3 …)이 실제 media/recordings에 쌓이지 않게
+# 임시 폴더를 쓴다. 테스트마다 override_settings(MEDIA_ROOT=…)를 잊어도 안전하다.
+if len(sys.argv) > 1 and sys.argv[1] == 'test':
+    import tempfile
+    MEDIA_ROOT = Path(tempfile.mkdtemp(prefix='meetalign-test-media-'))
 
 
 # Email
