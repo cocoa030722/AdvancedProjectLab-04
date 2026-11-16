@@ -10,6 +10,8 @@
   <ul class="plain">
   {% for q in questions %}
     <li class="item" style="display:block">
+      {# 결정 확인 카드에서 보낸 질문이면 어떤 결정에 대한 질문인지 함께 보여준다(작성자는 비공개). #}
+      {% if q.decision %}<div class="meta" style="margin:0 0 4px">이 결정에 대한 질문 · {{ q.decision.published_text }}</div>{% endif %}
       <div class="title">{{ q.text }}</div>
       {% if q.answer %}<div class="bubble" style="margin-top:8px">답변: {{ q.answer }}</div>{% else %}<span class="badge processing" style="margin-top:6px">아직 답변 전</span>{% endif %}
     </li>

@@ -208,6 +208,40 @@
   .btn.danger, button.danger { background:#fff; color:var(--danger); border-color:#eec3bc; }
   .btn.block { width:100%; }
   .btn.sm { padding:7px 14px; font-size:.84rem; }
+  .btn.lg, button.lg { padding:14px 24px; font-size:1.02rem; }
+
+  /* ---- 마이크 녹음 (회의 화면) ---- */
+  .record-cta { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:0 0 16px; }
+  .record-state {
+    display:inline-flex; align-items:center; gap:8px; font-size:1rem; font-weight:700;
+    color:var(--ink); font-variant-numeric:tabular-nums;
+  }
+  .record-dot {
+    width:11px; height:11px; border-radius:50%; background:var(--danger); flex:0 0 auto;
+    animation:record-blink 1.1s steps(1, end) infinite;
+  }
+  /* 일시정지 중에는 깜빡임을 멈춘다 — 녹음 중과 한눈에 구분되게. */
+  .record-dot.paused { animation:none; opacity:.35; }
+  .record-state #record-paused-label { color:var(--muted); font-weight:600; font-size:.9rem; }
+  .record-state [hidden] { display:none; }
+  @keyframes record-blink { 50% { opacity:.15; } }
+  @media (prefers-reduced-motion: reduce) { .record-dot { animation:none; } }
+
+  /* ---- 결정 확인 카드 목록 (팀원 화면) ---- */
+  #decision-cards { display:flex; flex-direction:column; gap:12px; margin-top:18px; }
+  .ack-card { flex-direction:column; align-items:stretch; gap:10px; }
+  /* 목록이라 카드마다 들썩이면 산만하다 — 테두리만 짙어지게 둔다. */
+  .ack-card:hover { transform:none; box-shadow:none; }
+  .ack-actions { display:flex; gap:8px; flex-wrap:wrap; }
+  .ack-actions .btn, .ack-actions button { flex:0 1 auto; }
+  .ack-pager {
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    margin-top:16px; padding-top:14px; border-top:1px solid var(--line); flex-wrap:wrap;
+  }
+  .ack-pager .step-counter { font-size:.86rem; color:var(--ink-soft); font-weight:600; }
+  .card-ask { margin-top:0; }
+  .card-ask > summary { padding:4px 0; }
+  .ask-waiting { display:flex; align-items:center; gap:8px; margin-top:8px; font-size:.9rem; color:var(--muted); }
 
   .tabs { display:inline-flex; background:var(--surface-sunken); border-radius:11px; padding:4px; gap:3px; margin:10px 0 16px; }
   .tabs a { padding:7px 16px; border-radius:8px; font-size:.88rem; color:var(--muted); font-weight:600; }

@@ -24,6 +24,14 @@ urlpatterns = [
     path("meetings/<int:meeting_id>/decisions/", views.decision_ack, name="decision_ack"),
     path("meetings/<int:meeting_id>/decisions/review/", views.decision_review, name="decision_review"),
     path(
+        "meetings/<int:meeting_id>/decisions/<int:decision_id>/agree/",
+        views.decision_agree, name="decision_agree",
+    ),
+    path(
+        "meetings/<int:meeting_id>/decisions/<int:decision_id>/ask/",
+        views.decision_ask, name="decision_ask",
+    ),
+    path(
         "meetings/<int:meeting_id>/decisions/<int:decision_id>/carryover/resolve/",
         views.decision_carryover_resolve, name="decision_carryover_resolve",
     ),

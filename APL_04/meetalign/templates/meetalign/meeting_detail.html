@@ -108,18 +108,27 @@
   <h2 class="section-title">{% if meeting.recordings.all %}녹음 추가 업로드{% else %}회의 녹음{% endif %}</h2>
   {% if stt_status %}<p class="muted" style="margin:-4px 0 10px">{{ stt_status }}</p>{% endif %}
   <form method="post" enctype="multipart/form-data">{% csrf_token %}
+    {# 마이크 녹음이 이 화면의 주요 행동이다 — 파일 업로드보다 위에, 더 크고 강조 색으로 둔다. #}
+    <div class="record-cta">
+      <button type="button" id="record-toggle" class="btn lg">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v4M9 21h6"/></svg>
+        <span id="record-toggle-label">마이크로 녹음하기</span>
+      </button>
+      {# 녹음이 시작되면 보인다. 녹음 버튼은 일시정지·이어서 녹음을 맡고, 끝내는 것은 이 버튼이다. #}
+      <button type="button" id="record-stop" class="btn lg secondary" style="display:none">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+        녹음 끝내기
+      </button>
+      {# 녹음 중임을 멀리서도 알 수 있게 빨간 점 + 경과 시간. 일시정지하면 점이 멈춘다. #}
+      <span id="record-timer" class="record-state" style="display:none" aria-live="polite">
+        <span id="record-dot" class="record-dot"></span>
+        <span id="record-time">00:00</span>
+        <span id="record-paused-label" hidden>일시정지됨</span>
+      </span>
+    </div>
+    <audio id="record-preview" controls style="display:none;width:100%;margin-bottom:10px"></audio>
     <div class="field">
-      <label for="recording">회의 녹음 파일</label>
-      <div class="row" style="margin-bottom:8px">
-        <button type="button" id="record-toggle" class="btn sm secondary">
-          <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>
-          마이크로 녹음하기
-        </button>
-        {# 녹음이 시작되면 보인다. 녹음 버튼은 일시정지·이어서 녹음을 맡고, 끝내는 것은 이 버튼이다. #}
-        <button type="button" id="record-stop" class="btn sm secondary" style="display:none">■ 녹음 중지</button>
-        <span id="record-timer" class="muted" style="display:none">0:00</span>
-      </div>
-      <audio id="record-preview" controls style="display:none;width:100%;margin-bottom:10px"></audio>
+      <label for="recording">또는 녹음 파일 올리기</label>
       <input id="recording" type="file" name="recording" accept="audio/*">
       <p class="muted" style="margin:4px 0 0">마이크 녹음은 localhost 또는 https 주소에서만 동작합니다. 일반 http로 다른 기기에서 접속했다면 파일을 올려 주세요.</p>
     </div>
@@ -136,8 +145,12 @@
   <script>
   (function () {
     var toggleBtn = document.getElementById("record-toggle");
+    var toggleLabel = document.getElementById("record-toggle-label");
     var stopBtn = document.getElementById("record-stop");
     var timerEl = document.getElementById("record-timer");
+    var timeEl = document.getElementById("record-time");
+    var dotEl = document.getElementById("record-dot");
+    var pausedLabel = document.getElementById("record-paused-label");
     var preview = document.getElementById("record-preview");
     var fileInput = document.getElementById("recording");
     var submitBtn = document.getElementById("record-submit");
@@ -159,10 +172,12 @@
     var elapsedMs = 0;
     var segmentStart = 0;
 
+    function pad(n) {
+      return (n < 10 ? "0" : "") + n;
+    }
+
     function formatTime(totalSeconds) {
-      var m = Math.floor(totalSeconds / 60);
-      var s = totalSeconds % 60;
-      return m + ":" + (s < 10 ? "0" : "") + s;
+      return pad(Math.floor(totalSeconds / 60)) + ":" + pad(totalSeconds % 60);
     }
 
     function isActive() {
@@ -178,19 +193,25 @@
 
     function paintTimer() {
       var paused = mediaRecorder && mediaRecorder.state === "paused";
-      timerEl.textContent = formatTime(Math.floor(recordedMs() / 1000)) + (paused ? " (일시정지)" : "");
+      timeEl.textContent = formatTime(Math.floor(recordedMs() / 1000));
+      // 일시정지 중에는 점이 깜빡이지 않고 "일시정지됨"이 뜬다 — 녹음 중과 눈으로 구분되게.
+      dotEl.classList.toggle("paused", !!paused);
+      pausedLabel.hidden = !paused;
     }
 
     function paintButtons() {
       if (!isActive()) {
         stopBtn.style.display = "none";
+        toggleBtn.classList.remove("secondary");
         return;
       }
       stopBtn.style.display = canPause ? "inline-flex" : "none";
+      // 녹음 중에는 '끝내기'가 주요 행동이다 — 강조 색을 그쪽으로 넘긴다.
+      toggleBtn.classList.toggle("secondary", canPause);
       if (mediaRecorder.state === "paused") {
-        toggleBtn.textContent = "▶ 이어서 녹음";
+        toggleLabel.textContent = "▶ 이어서 녹음";
       } else {
-        toggleBtn.textContent = canPause ? "⏸ 일시정지" : "■ 녹음 중지";
+        toggleLabel.textContent = canPause ? "⏸ 일시정지" : "■ 녹음 중지";
       }
     }
 
@@ -217,13 +238,14 @@
           fileInput.files = dataTransfer.files;
           preview.src = URL.createObjectURL(blob);
           preview.style.display = "block";
-          toggleBtn.textContent = "● 다시 녹음하기";
+          toggleLabel.textContent = "다시 녹음하기";
+          toggleBtn.classList.remove("secondary");
           stopBtn.style.display = "none";
         });
 
         mediaRecorder.start();
         preview.style.display = "none";
-        timerEl.style.display = "inline";
+        timerEl.style.display = "inline-flex";
         paintTimer();
         paintButtons();
       }).catch(function (err) {
