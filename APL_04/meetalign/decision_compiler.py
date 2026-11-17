@@ -44,8 +44,6 @@ from django.db import IntegrityError, transaction
 from . import services
 from .models import Decision, Interpretation
 
-# 한 회의에서 받을 결정 수 상한(LLM이 회의록을 잘게 쪼개는 경우 방지).
-MAX_DECISIONS = 12
 # 결정 하나에 보여줄 AI 확정 문장 수. 가장 추천하는 하나만 보여준다 — 후보 여러 개를 읽고 비교하는
 # 것이 진행자에게 가장 큰 부담이었고, 고르지 않는 것은 '직접 쓰기'로 언제든 대신할 수 있다.
 MAX_INTERPRETATIONS = 1
@@ -281,8 +279,7 @@ def _compile_prompt(source):
         "결론을 다음으로 미루기로 한 안건(\"내일 다시 얘기\", \"일단 보류\" 등)은 둘 중 하나를 고른 것처럼 쓰지 "
         "마라. ambiguous: true로 두고, candidate는 아직 정해지지 않았다는 사실 그대로를 반영해 쓴다.\n"
         "evidence 규칙: 항목마다 그 결정이 나온 전사본 원문 구절을 토씨 하나 틀리지 않고 그대로 복사해서 써라(짧게 "
-        "한 구절). 확정 문장의 근거가 아니라 회의 원문에서 이 안건이 나온 자리다.\n"
-        "ambiguous 항목이 많으면, 회의에서 가장 중요한 5개에만 ambiguous를 붙여라.\n\n"
+        "한 구절). 확정 문장의 근거가 아니라 회의 원문에서 이 안건이 나온 자리다.\n\n"
         "반드시 아래 JSON 배열 형식으로만 답하라. 설명이나 코드블록 표시 없이 JSON만 출력하라:\n"
         '[{"topic": "안건 한 줄", "ambiguous": true, "why": "왜 갈릴 수 있나", '
         '"evidence": "이 안건이 나온 원문 문장", "candidate": "가장 추천하는 확정 문장"}, '
@@ -453,8 +450,6 @@ def parse_items(raw, source_text=None):
             "candidates": candidates,
             "draft_hint": draft_hint,
         })
-        if len(items) >= MAX_DECISIONS:
-            break
     return _dedupe_items(items)
 
 
