@@ -2280,6 +2280,14 @@ class DecisionCompileTests(TestCase):
         _, _, gen = self._compiled(self.CLEAR)
         self.assertIn(self.meeting.transcript, gen.call_args_list[0][0][0])
 
+    def test_compile_saves_action_impact_for_ambiguous_items(self):
+        impact = "담당자가 보관 기간을 서로 다르게 설정할 수 있다"
+        item = dict(self.AMBIGUOUS, impact="  " + impact + "\n")
+        _, by_topic, gen = self._compiled(dict(self.CLEAR, impact=impact), item)
+        self.assertEqual(by_topic[item["topic"]].impact, impact)
+        self.assertEqual(by_topic[self.CLEAR["topic"]].impact, "")
+        self.assertIn('"impact"', gen.call_args.args[0])
+
     def test_compile_uses_the_llm_response_when_a_model_is_configured(self):
         _, by_topic, _ = self._compiled(self.CLEAR, self.AMBIGUOUS)
         self.assertEqual(sorted(by_topic), ["로그 보관 기간", "배포 스크립트 정리"])
@@ -2663,6 +2671,17 @@ class DecisionReviewTests(TestCase):
     def test_meeting_without_a_finished_record_gets_404(self):
         Meeting.objects.filter(pk=self.meeting.pk).update(processing_status=Meeting.STATUS_PROCESSING)
         self.assertEqual(self.client.get(self.url).status_code, 404)
+
+    def test_review_displays_action_impact_with_the_divergence_reason(self):
+        impact = "담당자 둘이 같은 장표를 만들 수 있다"
+        Decision.objects.create(
+            meeting=self.meeting, order=0, what="발표 장표",
+            divergence_reason="장표 분담이 불분명하다", impact=impact,
+        )
+        response = self.client.get(self.url)
+        self.assertContains(response, "장표 분담이 불분명하다")
+        self.assertContains(response, "팀원 행동에 미치는 영향")
+        self.assertContains(response, impact)
 
     def test_first_visit_offers_the_compile_button_only(self):
         r = self.client.get(self.url)

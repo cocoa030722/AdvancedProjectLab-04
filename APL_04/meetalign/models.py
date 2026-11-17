@@ -196,6 +196,7 @@ class Decision(models.Model):
     # 규칙 사유(warnings)와 나란히 두는 이유: 화면에서 AI 이유를 앞에 굵게, 규칙 사유를
     # 그 아래 작게 보여주기 때문이다. 둘 중 하나라도 있으면 진행자 확인 대상이다(has_warning).
     divergence_reason = models.TextField(blank=True, default="")
+    impact = models.TextField(blank=True, default="")
     status = models.CharField(max_length=12, choices=STATUS_CHOICES, default=STATUS_DRAFT)
     # 그대로 공개되는 확정 문장. 공개 경로는 이 칸 하나뿐이다(published_text).
     # 확인이 필요 없던 항목은 AI가 쓴 문장, 확인이 필요했던 항목은 진행자가 고르거나 직접 쓴
