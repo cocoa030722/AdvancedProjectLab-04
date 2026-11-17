@@ -44,8 +44,6 @@ from django.db import IntegrityError, transaction
 from . import services
 from .models import Decision, Interpretation
 
-# 한 회의에서 받을 결정 수 상한(LLM이 회의록을 잘게 쪼개는 경우 방지).
-MAX_DECISIONS = 12
 # 결정 하나에 보여줄 AI 확정 문장 수. 가장 추천하는 하나만 보여준다 — 후보 여러 개를 읽고 비교하는
 # 것이 진행자에게 가장 큰 부담이었고, 고르지 않는 것은 '직접 쓰기'로 언제든 대신할 수 있다.
 MAX_INTERPRETATIONS = 1
@@ -452,8 +450,6 @@ def parse_items(raw, source_text=None):
             "candidates": candidates,
             "draft_hint": draft_hint,
         })
-        if len(items) >= MAX_DECISIONS:
-            break
     return _dedupe_items(items)
 
 

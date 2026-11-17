@@ -2083,10 +2083,10 @@ class DecisionParseTests(TestCase):
         for raw in ("JSON 못 만들겠습니다", '[{"topic": "배포",]', '{"topic": "배포"}'):
             self.assertEqual(decision_compiler.parse_items(raw), [], raw)
 
-    def test_parse_items_caps_the_number_of_items(self):
+    def test_parse_items_keeps_all_thirty_items(self):
         raw = json.dumps([{"topic": "안건 %d" % i, "ambiguous": False, "final": "문장"}
                           for i in range(30)], ensure_ascii=False)
-        self.assertEqual(len(decision_compiler.parse_items(raw)), decision_compiler.MAX_DECISIONS)
+        self.assertEqual(len(decision_compiler.parse_items(raw)), 30)
 
     def test_parse_items_skips_blank_sentences(self):
         raw = json.dumps([{"topic": self.TOPIC, "ambiguous": True, "why": "x", "candidates": [
@@ -2387,12 +2387,13 @@ class DecisionCompileTests(TestCase):
 
     # ---- 상한 없음 ----
 
-    def test_eight_ambiguous_items_all_wait_for_the_host(self):
+    def test_thirteen_ambiguous_items_are_saved_and_all_wait_for_the_host(self):
         summary, _, _ = self._compiled(*[dict(self.AMBIGUOUS, topic="안건 %d" % i)
-                                         for i in range(8)])
-        self.assertEqual(summary["ambiguous"], 8)
+                                         for i in range(13)])
+        self.assertEqual(summary["decisions"], 13)
+        self.assertEqual(summary["ambiguous"], 13)
         self.assertEqual(
-            len(decision_compiler.publish_blockers(list(self.meeting.decisions.all()))), 8)
+            len(decision_compiler.publish_blockers(list(self.meeting.decisions.all()))), 13)
 
     # ---- 실패 처리와 가짜 응답 모드 ----
 
