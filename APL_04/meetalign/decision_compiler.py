@@ -64,10 +64,7 @@ AMBIGUOUS_PHRASES = ("쯤", "시간 되면", "각자", "나중에", "아까 정�
 #   문장에 지시어가 남아 있으면 실제로 담당자·대상을 못 정한 것이라 과탐 위험이 훨씬 낮다.
 REFERENT_PHRASES = ("그쪽", "그분", "그 사람", "그거", "저쪽")
 
-# 결론을 다음으로 미루는 표현. 후보 근거 문장에 있으면 AI가 뭐라고 판단했든 '다음 회의로 넘김'을
-# compile 시점에 기본값으로 걸어 둔다(_looks_deferred) — 생성형 모델은 "미정"보다 그럴듯한 답을
-# 내놓는 쪽으로 치우치기 쉽고, 프롬프트만으로는 그 습성이 쉽게 재발하기 때문이다. 진행자는 화면에서
-# 언제든 다른 후보나 직접 작성으로 바꿀 수 있다.
+# 원문에 보류 신호가 있으면 AI가 명확하다고 본 결정도 진행자가 확인한다.
 DEFERRAL_PHRASES = ("내일 다시", "다음에 얘기", "나중에 정하", "일단 둘 다", "보류")
 
 
@@ -387,7 +384,7 @@ def _legacy_candidate_evidence(raw_candidates, normalized_source):
     """예전 형식(후보마다 evidence)으로 답했을 때 결정의 근거로 쓸 첫 후보 근거.
 
     결정 단위 evidence가 비어 있을 때만 쓴다. 원문을 들고 있으면 원문에서 찾은 것만 쓴다 —
-    근거는 녹취 원문 창 하이라이트와 '보류' 자동 감지(_looks_deferred)에 쓰이기 때문이다.
+    근거는 녹취 원문 창 하이라이트와 '보류' 여부 확인(_looks_deferred)에 쓰이기 때문이다.
     """
     for item in raw_candidates if isinstance(raw_candidates, list) else []:
         if not isinstance(item, dict):
@@ -529,15 +526,10 @@ def _save_items(meeting, items):
     with transaction.atomic():
         for order, item in enumerate(items):
             warnings, divergence_reason, final_text, candidates, draft_hint = _resolve_item(item)
-            # 미루기로 한 안건은 AI가 뭐라고 썼든 '다음 회의로 넘김'을 기본값으로 건다 —
-            # 진행자가 수동으로 고르는 것과 똑같이 final_text/marked_undecided를 같이 채운다
-            # (views._save_decision_edits의 CHOICE_UNDECIDED 처리와 동일).
-            deferred = _looks_deferred(item)
             decision = Decision.objects.create(
                 meeting=meeting, order=order, what=item["topic"],
                 warnings=warnings, divergence_reason=divergence_reason,
-                final_text=undecided_sentence(item["topic"]) if deferred else final_text,
-                marked_undecided=deferred, draft_hint=draft_hint,
+                final_text=final_text, draft_hint=draft_hint,
                 # 그 결정이 나온 원문 구절 — 녹취 원문 창에서 하이라이트한다. AI 추천 문장에는
                 # 근거를 따로 붙이지 않으므로 결정마다 이 하나뿐이다.
                 evidence=item["evidence"],
@@ -558,13 +550,14 @@ def _save_items(meeting, items):
 def _resolve_item(item):
     """응답 항목 하나 → (warnings, divergence_reason, final_text, candidates, draft_hint).
 
-    세 갈래다.
+    네 갈래다.
     1. AI가 모호하다고 본 항목: AI의 이유와 후보를 그대로 쓴다. 규칙은 부르지 않는다 —
        이미 진행자에게 묻고 있으므로 중복 검사할 이유가 없다. draft_hint는 _parse_candidates가
        버린 후보에서 이미 만들어 둔 것을 그대로 쓴다.
-    2. AI가 명확하다고 했지만 근거를 원문에서 확인하지 못한 항목(parse_items가 final을
+    2. AI가 명확하다고 했지만 근거에 보류 표현이 있으면 확인 필요로 올리고 후보는 두지 않는다.
+    3. AI가 명확하다고 했지만 근거를 원문에서 확인하지 못한 항목(parse_items가 final을
        비운 경우): 확인 필요로 올리고 후보는 두지 않는다.
-    3. AI가 명확하다고 하고 근거도 확인된 항목: 규칙 안전망을 돌린다. 걸리면 확인 필요로
+    4. AI가 명확하다고 하고 근거도 확인된 항목: 규칙 안전망을 돌린다. 걸리면 확인 필요로
        올리고 AI가 쓴 문장을 "이 문장 그대로 공개" 후보 하나로 보여준다. 걸리지 않으면 그
        문장이 곧 확정 내용이고 진행자는 탭하지 않는다. 경고가 모호어·지시어 때문이면 그
        문장에서 바로 draft_hint를 만든다 — "이 문장 그대로 공개" 후보를 고르지 않을 호스트를
@@ -574,6 +567,8 @@ def _resolve_item(item):
         # AI가 이유를 비워 보낼 수 있다. 사유가 비면 has_warning이 False가 되어 모호한 결정이
         # 확인 없이 공개되므로, 기본 문구로라도 채워 확인 대상으로 남긴다.
         return [], item["why"] or "AI가 다르게 이해할 수 있다고 봤어요", "", item["candidates"], item["draft_hint"]
+    if _looks_deferred(item):
+        return [], "녹취에 결론을 미루자는 표현이 있어요", "", [], ""
     if not item["final"]:
         return [], "근거를 원문에서 확인하지 못했어요", "", [], ""
     warnings = safety_warnings(item["final"], item["evidence"])

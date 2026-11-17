@@ -2479,45 +2479,50 @@ class DecisionCompileTests(TestCase):
             if decision.has_warning:
                 self.assertGreater(decision.interpretations.count(), 0, decision.what)
 
-    # ---- 보류 신호(DEFERRAL_PHRASES) 자동 처리 ----
+    # ---- 보류 안건 검토 ----
 
     def test_non_deferred_ambiguous_item_is_not_marked_undecided(self):
         _, by_topic, _ = self._compiled(self.AMBIGUOUS)
         self.assertFalse(by_topic["로그 보관 기간"].marked_undecided)
 
-    def test_deferred_evidence_sets_undecided_by_default(self):
-        """'내일 다시 얘기' 같은 근거가 있으면 AI가 뭐라고 했든 '다음 회의로 넘김'을 기본값으로 건다."""
+    def test_deferred_item_keeps_its_recommendation_and_requires_review(self):
         source = "A안과 B안을 놓고 일단 둘 다 준비해보면서 내일 다시 얘기해보기로 했다."
         self.meeting.transcript = source
         self.meeting.save(update_fields=["transcript"])
         item = {
             "topic": "디자인 선택", "ambiguous": True, "why": "A안/B안 중 무엇을 고를지 아직 안 정해짐",
-            "evidence": source, "candidate": "A안으로 진행한다",
+            "evidence": source, "candidate": "A안과 B안을 준비하고 내일 다시 논의한다",
         }
         _, by_topic, _ = self._compiled(item)
         decision = by_topic["디자인 선택"]
-        self.assertTrue(decision.marked_undecided)
-        self.assertEqual(decision.final_text, decision_compiler.undecided_sentence("디자인 선택"))
-        self.assertEqual(decision.published_text, decision.final_text)
-        # 추천 문장은 그대로 남겨 둬서 진행자가 보고 다시 고를 수 있다.
-        self.assertEqual(decision.interpretations.count(), 1)
+        self.assertFalse(decision.marked_undecided)
+        self.assertEqual(decision.final_text, "")
+        self.assertTrue(decision.needs_host)
+        self.assertTrue(decision.blocks_publish)
+        self.assertEqual(decision.interpretations.get().text, item["candidate"])
 
-    def test_deferred_evidence_in_an_old_style_response_is_still_caught(self):
+    def test_deferred_item_keeps_its_recommendation_from_an_old_style_response(self):
         source = "A안과 B안을 놓고 일단 둘 다 준비해보면서 내일 다시 얘기해보기로 했다."
         self.meeting.transcript = source
         self.meeting.save(update_fields=["transcript"])
         item = {"topic": "디자인 선택", "ambiguous": True, "why": "x",
                 "candidates": [{"text": "A안으로 진행한다", "evidence": source, "recommended": True}]}
         _, by_topic, _ = self._compiled(item)
-        self.assertTrue(by_topic["디자인 선택"].marked_undecided)
+        decision = by_topic["디자인 선택"]
+        self.assertFalse(decision.marked_undecided)
+        self.assertEqual(decision.interpretations.get().text, "A안으로 진행한다")
 
-    def test_clear_item_with_deferral_evidence_is_also_marked_undecided(self):
+    def test_clear_item_with_deferral_evidence_requires_review(self):
         source = "예산 건은 보류하고 다음에 다시 얘기하기로 했다."
         self.meeting.transcript = source
         self.meeting.save(update_fields=["transcript"])
         item = {"topic": "예산", "ambiguous": False, "final": "예산은 보류한다", "evidence": source}
         _, by_topic, _ = self._compiled(item)
-        self.assertTrue(by_topic["예산"].marked_undecided)
+        decision = by_topic["예산"]
+        self.assertFalse(decision.marked_undecided)
+        self.assertTrue(decision.needs_host)
+        self.assertTrue(decision.blocks_publish)
+        self.assertFalse(decision.interpretations.exists())
 
     # ---- draft_hint: '직접 쓰기' 출발점 ----
 
@@ -2541,7 +2546,7 @@ class DecisionCompileTests(TestCase):
 
 
 class DecisionAmbiguityHintTests(TestCase):
-    """_review_hints(정규식 탐지 → 프롬프트 힌트)와 _looks_deferred(보류 강제)는 DB 없이 동작하는 순수 함수다."""
+    """_review_hints(정규식 탐지 → 프롬프트 힌트)와 _looks_deferred(보류 표현 확인)는 DB 없이 동작하는 순수 함수다."""
 
     def test_review_hints_picks_sentences_with_known_phrases(self):
         source = "오늘은 날씨가 좋다. 그거 두 번째 걸로 그분한테 넘겨주세요. 예산은 대충 여유있게 잡아주세요."
