@@ -91,6 +91,7 @@ _QUANTITY_EXPR = re.compile(r"\d+\s*(?:개(?!월)|명|건|퍼센트|%)")
 FAKE_DECISIONS = [
     {
         "topic": "로그 보관 기간",
+        "impact": "운영 담당자가 서로 다른 시점에 로그를 지우는 설정을 적용할 수 있다",
         "ambiguous": True,
         "why": "\"한 달 정도면 충분\"이 30일인지 90일인지 갈립니다",
         "evidence": "로그는 일단 한 달 정도면 충분할 것 같은데요",
@@ -98,6 +99,7 @@ FAKE_DECISIONS = [
     },
     {
         "topic": "QA 범위",
+        "impact": "각 담당자가 본인 화면만 확인하면 공통 화면의 QA가 빠질 수 있다",
         "ambiguous": True,
         "why": "\"담당 화면\"이 각자 만든 화면인지 배포에 포함된 화면 전체인지 갈립니다",
         "evidence": "담당 화면은 각자 보는 게 빠를 것 같아요",
@@ -246,7 +248,7 @@ def _compile_prompt(source):
         "- 정하려다 뒤로 미룬 것 (예: \"그건 이따 단톡에서 정해요\", \"나중에 다시 얘기해요\")\n"
         "- 다음 회의의 날짜·시간·장소\n"
         "인사, 자기소개, 진행 멘트는 넣지 마라.\n\n"
-        "항목마다 아래 점검표를 원문과 하나씩 맞춰 보고, 하나라도 해당하면 ambiguous: true다.\n"
+        "항목마다 원문과 아래 점검표를 대조해 실제 행동이 달라질 가능성을 찾는다.\n"
         "1. 기한이 없거나 막연하다: \"최대한 빨리\", \"되는 대로\", \"그때\", \"나중에\", \"쯤\", \"다음 주쯤\" 등\n"
         "2. 정하지 않고 미뤘다: \"단톡에서 정해요\", \"이따 정해요\", \"봐서 정해요\" — 정할 때까지 팀원마다 "
         "다르게 준비한다\n"
@@ -259,11 +261,16 @@ def _compile_prompt(source):
         "다르게 받아들일 수 있다(예: \"한 장 정도\"가 슬라이드인지 문서인지), 가리키는 대상이 불분명하다(\"아까 그거\"), "
         "완료 기준이 없다, 사람마다 말한 내용이 엇갈렸는데 정리하지 않았다, 조건이 풀려야 확정되는 결정이다(\"면접 "
         "없으면 금요일\"). 7번은 실제로 행동이 갈릴 때만 붙이고, 말투만 다른 정도로는 붙이지 마라.\n"
-        "1~7 중 아무것도 해당하지 않으면 ambiguous: false다.\n\n"
+        "1~7에 해당하더라도 그 해석 차이가 담당·실행 시점·범위·완료 기준 등 팀원의 행동을 어떻게 바꿀지 "
+        "구체적으로 설명할 수 있을 때만 ambiguous: true다. 표현이 느슨해도 실제로 할 일이 같다면 "
+        "ambiguous: false다. 결론을 명시적으로 미룬 안건은 행동 차이가 아직 없어도 확인 대상으로 둔다.\n\n"
         "ambiguous: true 항목:\n"
         "  why에 원문에서 무엇이 빠졌거나 부딪혀서 어떻게 다르게 이해할 수 있는지를 한 줄로 구체적으로 쓰되, 원인이 된 "
         "전사본 표현을 따옴표로 그대로 인용해라(예: \"'한 달 정도면 충분'이 30일인지 90일인지 갈립니다\"). 점검표 "
         "번호(\"1번에 해당\" 등)는 쓰지 마라 — 진행자 화면에 그대로 보인다. 누가 틀렸다는 식으로 쓰지 마라.\n"
+        "  impact에 누가 무엇을 다르게 하거나 어떤 일이 중복·누락될 수 있는지 한 줄로 쓴다. "
+        "예: 장표 범위를 다르게 이해해 두 담당자가 같은 장표를 만들거나 일부 장표를 아무도 맡지 않을 수 있다. "
+        "원문에 없는 이름이나 결과를 지어내지 마라. 명시적으로 미룬 안건에서 구체적 영향이 없으면 빈 문자열로 둔다.\n"
         "  candidate에 진행자에게 가장 추천하는 '그대로 공개될 확정 문장' 하나만 쓴다. 빠진 부분을 원문 흐름상 "
         "가장 그럴듯한 쪽으로 채운 실행 문장이다. 원문에 없는 날짜·이름을 지어내지 말고, 원문에 나온 날짜·요일·"
         "시간·장소 안에서만 고른다. 채울 근거가 원문에 전혀 없으면 \"~은 다음 회의 전까지 단톡방에서 정한다\"처럼 "
@@ -278,7 +285,7 @@ def _compile_prompt(source):
         "evidence 규칙: 항목마다 그 결정이 나온 전사본 원문 구절을 토씨 하나 틀리지 않고 그대로 복사해서 써라(짧게 "
         "한 구절). 확정 문장의 근거가 아니라 회의 원문에서 이 안건이 나온 자리다.\n\n"
         "반드시 아래 JSON 배열 형식으로만 답하라. 설명이나 코드블록 표시 없이 JSON만 출력하라:\n"
-        '[{"topic": "안건 한 줄", "ambiguous": true, "why": "왜 갈릴 수 있나", '
+        '[{"topic": "안건 한 줄", "ambiguous": true, "why": "왜 갈릴 수 있나", "impact": "팀원의 행동이 어떻게 갈릴 수 있나", '
         '"evidence": "이 안건이 나온 원문 문장", "candidate": "가장 추천하는 확정 문장"}, '
         '{"topic": "안건 한 줄", "ambiguous": false, "final": "확정 문장", "evidence": "근거가 된 원문 문장"}]\n\n'
         "전사본:\n" + source
@@ -396,7 +403,7 @@ def _legacy_candidate_evidence(raw_candidates, normalized_source):
 
 
 def parse_items(raw, source_text=None):
-    """LLM 응답 → [{"topic","ambiguous","why","final","evidence","candidates","draft_hint"}, ...].
+    """LLM 응답 → 안건별 모호 여부, 사유, 행동 영향, 문장과 원문 근거.
 
     한 번의 호출로 받은 응답을 전부 여기서 읽는다. 항목 하나의 형식이 틀렸다고 나머지를
     버리지 않는다 — 읽을 수 없는 조각만 비워서 넘기고, 그 항목은 진행자가 직접 쓰거나 다음
@@ -438,9 +445,11 @@ def parse_items(raw, source_text=None):
             evidence = ""
         raw_candidates = row.get("candidate") if row.get("candidate") is not None else row.get("candidates")
         candidates, draft_hint = _parse_candidates(raw_candidates) if ambiguous else ([], "")
+        impact = row.get("impact")
         items.append({
             "topic": topic,
             "ambiguous": ambiguous,
+            "impact": " ".join(impact.split()) if ambiguous and isinstance(impact, str) else "",
             "why": str(row.get("why", "")).strip() if ambiguous else "",
             "final": final,
             "evidence": evidence,
@@ -528,7 +537,7 @@ def _save_items(meeting, items):
             warnings, divergence_reason, final_text, candidates, draft_hint = _resolve_item(item)
             decision = Decision.objects.create(
                 meeting=meeting, order=order, what=item["topic"],
-                warnings=warnings, divergence_reason=divergence_reason,
+                warnings=warnings, divergence_reason=divergence_reason, impact=item["impact"],
                 final_text=final_text, draft_hint=draft_hint,
                 # 그 결정이 나온 원문 구절 — 녹취 원문 창에서 하이라이트한다. AI 추천 문장에는
                 # 근거를 따로 붙이지 않으므로 결정마다 이 하나뿐이다.

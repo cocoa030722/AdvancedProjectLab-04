@@ -76,6 +76,10 @@
       <div style="font-weight:600;font-size:.9rem">{{ row.decision.divergence_reason }}</div>
       {% endif %}
 
+      {% if row.decision.impact %}
+      <div class="meta"><b>팀원 행동에 미치는 영향</b> — {{ row.decision.impact }}</div>
+      {% endif %}
+
       {% if editable %}
       <div data-choice-name="choice_{{ row.decision.id }}">
         <div style="border-top:1px solid var(--line);padding-top:12px">
