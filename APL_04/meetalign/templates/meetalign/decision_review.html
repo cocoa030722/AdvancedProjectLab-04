@@ -84,17 +84,21 @@
           <div style="margin-top:8px">
             {% include "meetalign/_decision_choices.html" with carried=False part="ai" %}
             {% if not row.interpretations %}
-            <div class="meta">AI 추천 문장이 없습니다. 아래 '더 보기'에서 직접 쓰거나 다음 회의로 넘길 수 있고, 고르지 않으면 공개할 때 빠집니다.</div>
+            <div class="meta">AI 추천 문장이 없습니다.</div>
             {% endif %}
           </div>
         </div>
+        {% if row.interpretations %}
         <details class="step-more"{% if row.choice == choice_custom %} open{% endif %}>
           <summary class="meta">더 보기 — 원문 근거 · 직접 쓰기 · 다음 회의로 넘김 · 이 결정 빼기</summary>
+        {% endif %}
           <div class="step-more-body">
             {% include "meetalign/_decision_evidence.html" %}
             {% include "meetalign/_decision_choices.html" with carried=False part="rest" %}
           </div>
+        {% if row.interpretations %}
         </details>
+        {% endif %}
       </div>
       {% else %}
       {% if row.interpretations %}

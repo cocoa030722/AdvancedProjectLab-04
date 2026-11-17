@@ -1,6 +1,6 @@
 {% comment %}
   진행자 화면에서 한 결정의 확정 방법 고르기 — [AI 추천 문장 | 직접 쓰기 | 다음 회의로 넘김 | 이 결정 빼기].
-  part로 나눠 그린다 — AI가 만든 선택지는 늘 보이고, 나머지는 문항 아래 '더 보기'에 접혀 있기 때문이다.
+  part로 나눠 그린다 — AI가 만든 선택지는 늘 보이고, 후보가 있으면 나머지를 문항 아래 '더 보기'에 접어 두기 때문이다.
   - part="ai": AI 추천 문장만
   - part="rest": 직접 쓰기 · 다음 회의로 넘김 · 이 결정 빼기
   - part 없음: 전부(다음 회의로 넘긴 결정의 '다시 고르기')
@@ -27,8 +27,11 @@
       {% if row.choice == choice_custom and not carried %}checked{% endif %}>
     <span style="flex:1 1 auto">
       <b>직접 쓰기</b>
+      {% if row.group == "ambiguous" and not row.interpretations and row.decision.draft_hint %}
+      <span class="meta" style="display:block">참고: {{ row.decision.draft_hint }}</span>
+      {% endif %}
       <input type="text" name="custom_text_{{ row.decision.id }}" value="{% if not carried %}{{ row.custom_text }}{% endif %}" data-advance-on-enter
-        placeholder="{% if row.decision.draft_hint %}참고: {{ row.decision.draft_hint }}{% else %}예: 민수가 금요일 18시까지 배포 스크립트를 정리하고 스테이징에서 한 번 돌려 본다{% endif %}" style="margin-top:6px">
+        placeholder="{% if row.group == "ambiguous" and not row.interpretations %}누가 / 무엇을 / 언제까지 / 무엇을 보면 완료인지{% elif row.decision.draft_hint %}참고: {{ row.decision.draft_hint }}{% else %}예: 민수가 금요일 18시까지 배포 스크립트를 정리하고 스테이징에서 한 번 돌려 본다{% endif %}" style="margin-top:6px">
     </span>
   </label>
   <label style="display:flex;gap:9px;align-items:flex-start;padding:7px 0;font-weight:500">
