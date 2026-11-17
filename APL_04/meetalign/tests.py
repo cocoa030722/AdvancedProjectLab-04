@@ -3717,6 +3717,27 @@ class DecisionConfirmTests(TestCase):
                        '원문: "'):
             self.assertGreater(step.index(marker), more, marker)
 
+    def test_an_item_without_a_recommendation_shows_context_and_direct_entry(self):
+        decision = self.warned[0]
+        decision.interpretations.all().delete()
+        decision.evidence = "보관 기간을 정해야 합니다."
+        decision.draft_hint = "로그를 ___일 동안 보관한다."
+        decision.save(update_fields=["evidence", "draft_hint"])
+        self.meeting.transcript = (
+            "지난 회의에서 로그를 검토했습니다. 이전 로그가 필요합니다. "
+            "보관 기간을 정해야 합니다. 비용도 확인해 주세요. 다음 안건입니다."
+        )
+        self.meeting.save(update_fields=["transcript"])
+
+        step = self._step_html(decision)
+
+        self.assertNotIn("<details", step)
+        context_index = step.index("이전 로그가 필요합니다. 보관 기간을 정해야 합니다. 비용도 확인해 주세요.")
+        input_index = step.index('name="custom_text_%d"' % decision.id)
+        self.assertLess(context_index, input_index)
+        self.assertIn('placeholder="누가 / 무엇을 / 언제까지 / 무엇을 보면 완료인지"', step)
+        self.assertIn(decision.draft_hint, step)
+
     def test_the_more_section_is_collapsed_by_default(self):
         for decision in self.warned + self.plain:
             step = self._step_html(decision)
