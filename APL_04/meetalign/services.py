@@ -659,6 +659,22 @@ def summarize(transcript):
     return result if result is not None else transcript
 
 
+# 대화창(chat)은 답변을 마크다운으로 그리지 않고 일반 글자로 보여준다. 그래서 모델이 **굵게**나
+# # 제목을 보내면 기호가 그대로 화면에 남는다. 프롬프트로 쓰지 말라고 하되, 모델이 지시를 어기는
+# 일이 흔해서 돌려주기 직전에 한 번 더 지운다.
+# 짝이 맞는 것만 지운다 — 짝이 없는 __는 그냥 글자일 수 있다. 제목은 # 뒤에 공백이 오는 것만
+# 지운다("#3 안건"처럼 제목이 아닌 #은 남겨야 한다).
+_CHAT_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__", re.DOTALL)
+_CHAT_HEADING = re.compile(r"(?m)^[ \t]*#{1,6}[ \t]+")
+
+
+def _strip_chat_markdown(text):
+    """대화창 답변에서 마크다운 기호만 지운다. 글자와 줄 구성은 그대로 둔다."""
+    text = _CHAT_BOLD.sub(lambda match: match.group(1) or match.group(2) or "", text)
+    # 짝이 맞지 않아 위에서 안 지워진 ** 는 어떤 경우에도 그냥 기호다.
+    return _CHAT_HEADING.sub("", text.replace("**", ""))
+
+
 def chat_reply(meeting, text, history=None):
     if not (_enabled() and meeting.record):
         return "(테스트용 가짜 AI 응답) '%s'에 대한 답변입니다." % text
@@ -671,7 +687,9 @@ def chat_reply(meeting, text, history=None):
         "- 회의에서 있었던 일·결정·누가 뭘 하기로 했는지처럼 회의 내용에 관한 질문이면, 회의록 내용만 근거로 답하라. "
         "회의록에 없는 내용이면 '회의록에 없는 내용입니다'라고 답하라.\n"
         "- 모르는 용어·기술·개념을 설명해 달라는 질문이면 회의록에 나왔는지와 상관없이 네가 아는 지식으로 명확하게 "
-        "설명하라. 이때는 '[일반 지식]'으로 답을 시작해서 회의록 근거가 아님을 표시하라.\n\n"
+        "설명하라. 이때는 '[일반 지식]'으로 답을 시작해서 회의록 근거가 아님을 표시하라.\n"
+        "답은 그대로 일반 글자로 보이므로 마크다운 기호(**, #, *, 백틱 등)를 쓰지 말고 일반 문장으로 답하라. "
+        "항목을 나눌 때는 '1.' 같은 숫자와 줄바꿈만 써라.\n\n"
         "회의록:\n" + meeting.record + history_block + "\n\n질문: " + text
     )
     try:
@@ -680,6 +698,6 @@ def chat_reply(meeting, text, history=None):
         return "(AI 연결 실패: API 키나 내 컴퓨터의 AI(Ollama) 실행 상태를 확인하세요)"
     if result is None:
         return "(AI 응답 언어 오류: 다시 시도해 주세요)"
-    return result
+    return _strip_chat_markdown(result)
 
 
