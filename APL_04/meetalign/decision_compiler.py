@@ -1,8 +1,12 @@
 """결정 사항 추출 기능(실험 기능) — 확정 문장 후보를 만들고 진행자가 고르게 한다.
 
-AI를 한 번 부른다. 녹취 원문을 보내고 결정마다
-  [안건 한 줄 · 모호 여부 · 왜 갈리나 · 원문 근거 · AI가 가장 추천하는 확정 문장 하나]
-을 한 응답으로 받는다(parse_items).
+AI를 두 번 부른다(추천 문장 검증에 걸리면 한 번 더).
+  1. 추출(_compile_prompt): 녹취 원문을 보내고 결정마다
+     [안건 한 줄 · 모호 여부 · 왜 갈리나 · 행동 영향 · 원문 근거 · (명확한 항목만) 확정 문장]
+     을 한 응답으로 받는다(parse_items).
+  2. 추천(decision_recommend): 확인이 필요한 항목만 모아 항목마다 AI가 가장 추천하는 확정 문장 하나와
+     채운 값(fills)을 받는다. 추출과 나눈 이유는 그 모듈 머리말에 있다.
+  3. 검증(decision_refine): 추천 문장을 규칙으로 되짚고, 걸린 것만 한 번 다시 쓰게 한다.
 
 - 모호한 결정: AI가 "왜 다르게 이해할 수 있나" 한 줄과 그대로 공개될 확정 문장을 가장 추천하는
   것 하나만 만든다(MAX_INTERPRETATIONS = 1). 생성한 문장에는 원문 근거를 따로 붙이지 않는다 —
@@ -228,8 +232,7 @@ def _review_hints(source):
 # candidate의 빈칸을 어떻게 채울지. 예전에는 "원문에 없는 날짜·이름을 지어내지 마라"로 막았는데,
 # 그러면 기한이 안 정해진 안건의 추천 문장이 "기한을 정한다"처럼 빈칸을 그대로 남겨서 진행자가 고를
 # 것이 없었다. 팀 합의로 채우기를 허용하고, 대신 무엇을 근거로 채웠는지(fills) 받아서 표시한다.
-# 프롬프트 본문과 따로 둔 이유: 이 파일의 호출 흐름을 같은 시기에 다른 작업자가 고치고 있어서,
-# 새 문구가 기존 프롬프트 한가운데에 끼어들지 않게 한 줄로만 끼운다.
+# 추천 문장 호출(decision_recommend)과 재생성 호출(decision_refine)이 함께 쓴다.
 #
 # 채울 근거가 없을 때 "누가 언제까지 정한다"로 물러설 길을 열어 두면, 근거가 부족한 안건마다 "~은
 # 단톡방에서 정한다" 같은 같은 문장이 반복되고 추천 문장이 원문을 말만 바꿔 되풀이했다. 그래서 그 길을
@@ -237,9 +240,18 @@ def _review_hints(source):
 # 진행자 화면에서 경고색으로 보인다(views.decision_review, base.html의 .ai-fill).
 FILL_GAPS = "기한|담당|범위|선택지|수량|장소|완료기준"
 FILL_RULES = (
-    "  원문을 다시 말하는 데서 그치지 마라. 빠진 담당·기한·범위·선택지·수량·장소·완료 기준은 위에 주어진 회의 "
+    "  원문을 다시 말하는 데서 그치지 마라. 빠진 기한·범위·선택지·수량·장소·완료 기준은 위에 주어진 회의 "
     "정보와 원문 맥락, 상식으로 가장 그럴듯한 값을 추측해서 채워 실행 문장을 완성하라. 팀원이 이 문장만 보고 바로 "
     "움직일 수 있어야 한다. 빈칸이나 \"정한다\"로 남기지 마라.\n"
+    "  담당자는 녹취 원문 안에서 최대한 추론해서 채워라. 다음 순서로 찾는다: "
+    "① 그 일을 맡은 사람의 이름이 녹취에 나오면 그 이름(\"지은 씨가 맡아 주세요\"). "
+    "② 대화에서 화자가 누구인지 드러나면 그 이름 — 이름을 불렀는데 다음 화자가 대답했거나(\"민수 씨는요?\" → 화자 B가 답함), "
+    "자기 이름을 말했다면 그 화자는 그 사람이다. "
+    "③ 이름은 알 수 없지만 누가 맡았는지는 보이면 그 화자 기호 — 하겠다고 나선 사람(\"제가 할게요\"), 맡으라는 말을 "
+    "받은 사람, 그 안건을 꺼내 끝까지 이끈 사람(\"화자 D\"). "
+    "참석자 명단에서 녹취에 근거 없이 아무 이름이나 고르지 마라 — 엉뚱한 사람이 담당자로 공개된다. "
+    "채운 담당자는 fills에 gap \"담당\"으로 남기고, ①처럼 녹취에 그 이름이 그대로 나온 경우만 source \"원문\"(quote에 "
+    "그 구절), 나머지는 \"AI추정\"이다.\n"
     "  단톡방이나 다음 회의에서 결정하겠다는 식으로 정하는 방법만 정하는 문장으로 피하지 마라 — 채울 근거가 "
     "없어도 추측해서 값을 정한 문장을 쓴다. 항목마다 그 안건에 맞는 문장을 쓰고, 다른 항목과 같은 문장 틀을 "
     "되풀이하지 마라.\n"
@@ -249,13 +261,6 @@ FILL_RULES = (
     "회의 정보(참석자·날짜·마감일·지난 회의 안건)에서 가져온 값은 \"회의정보\", 맥락으로 미뤄 짚은 값은 "
     "\"AI추정\"이다.\n"
 )
-
-# JSON 형식 안내 뒤에 붙는 한 줄. 애매 항목에만 쓴다.
-FILLS_SCHEMA_EXAMPLE = (
-    'ambiguous: true 항목에는 "fills"를 함께 담아라: '
-    '"fills": [{"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": ""}]\n'
-)
-
 
 def collect_meeting_info(meeting):
     """프롬프트에 함께 보낼 회의 정보 — 전사본에 없지만 빈칸을 채울 때 근거가 되는 것들.
@@ -292,8 +297,8 @@ def _meeting_info_block(meeting_info):
         # 화자 분리가 이름을 못 받아내면 전사본에 "화자 A"로 적힌다. 그 사람이 참석자 중 한 명이라는
         # 것은 알려 주되, 누구인지 단정하지는 말게 한다.
         lines.append(
-            "- 전사본에 \"화자 A\", \"화자 B\"처럼 적힌 발화자는 위 참석자 중 한 명이다. "
-            "누구인지 분명하지 않으면 확정 문장에 이름을 적지 마라."
+            "- 전사본에 \"화자 A\", \"화자 B\"처럼 적힌 발화자는 위 참석자 중 한 명이지만 누구인지는 알 수 없다. "
+            "참석자 명단은 녹취에 나온 이름을 알아보는 데만 쓰고, 명단에서 골라 담당자를 정하지 마라."
         )
     if meeting_info["deadline"]:
         lines.append("- 이 회의의 마감일: %s" % meeting_info["deadline"])
@@ -313,10 +318,8 @@ def _compile_prompt(source, meeting_info=None):
     여기에 규칙으로 찾은 모호 표현 문장 목록(_review_hints)을 붙여 반드시 검토하게 하고, why에는 원인이 된 원문
     표현을 인용하게 한다(PR #44).
 
-    추천 문장은 근거가 없어도 값을 추측해 채우게 한다(FILL_RULES). 결론을 미룬 안건도 한쪽을 골라 쓰고 고른 값을
-    "AI추정"으로 남기게 한다 — 예전에는 "하나를 고른 것처럼 쓰지 마라"로 막았지만, 그러면 미룬 안건의 추천 문장이
-    "아직 정해지지 않았다"를 되풀이할 뿐이었다. 고른 값은 진행자 화면에서 경고색으로 보이고, 진행자는 그 문장
-    대신 '다음 회의로 넘김'을 고를 수 있으므로 AI가 정한 것이 확인 없이 공개되지는 않는다.
+    이 호출은 추출과 판정만 한다. 확인이 필요한 항목의 추천 문장은 따로 호출해서 쓴다(decision_recommend) —
+    한 응답에 다 받으면 추천 문장이 원문을 말만 바꿔 되풀이하거나 안건마다 같은 틀을 반복했다.
     """
     hints = _review_hints(source)
     hint_block = (
@@ -369,23 +372,20 @@ def _compile_prompt(source, meeting_info=None):
         "뒤의 합의로 해결된 문제나, 회의에서 하지 말거나 기다리기로 정한 일을 하지 않는 것을 위험으로 "
         "적지 마라. 원문에 없는 이름이나 결과를 지어내지 마라. 명시적으로 미룬 안건에서 구체적 영향이 "
         "없으면 빈 문자열로 둔다.\n"
-        "  candidate에 진행자에게 가장 추천하는 '그대로 공개될 확정 문장' 하나만 쓴다.\n"
-        + FILL_RULES +
+        "  확정 문장은 쓰지 않는다 — 진행자에게 추천할 문장은 다음 단계에서 따로 쓴다.\n"
         "ambiguous: false 항목:\n"
-        "  final에 '그대로 공개될 확정 문장' 하나를 쓴다. candidate는 쓰지 않는다. final에는 원문에 나온 값만 "
+        "  final에 '그대로 공개될 확정 문장' 하나를 쓴다. final에는 원문에 나온 값만 "
         "쓴다 — 추측해야 채울 수 있는 값이 있으면 그 항목은 ambiguous: true다.\n\n"
-        "확정 문장(final, candidates의 text) 규칙: 그 문장이 팀원에게 그대로 공개된다. 누가·무엇을·언제까지가 "
+        "확정 문장(final) 규칙: 그 문장이 팀원에게 그대로 공개된다. 누가·무엇을·언제까지가 "
         "문장 안에 들어간 실행 문장으로 쓴다. \"~라는 뜻\", \"A일 수도 B일 수도\" 같은 해설체로 쓰지 마라. 어느 "
         "쪽이 맞는지 해설하지 마라 — 확정하는 것은 회의 진행자다.\n"
-        "결론을 다음으로 미루기로 한 안건(\"내일 다시 얘기\", \"일단 보류\" 등)은 ambiguous: true로 둔다. candidate에는 "
-        "원문 흐름상 가장 그럴듯한 쪽을 골라 쓰고, 고른 값은 fills에 \"AI추정\"으로 남겨라.\n"
+        "결론을 다음으로 미루기로 한 안건(\"내일 다시 얘기\", \"일단 보류\" 등)은 ambiguous: true로 둔다.\n"
         "evidence 규칙: 항목마다 그 결정이 나온 전사본 원문 구절을 토씨 하나 틀리지 않고 그대로 복사해서 써라(짧게 "
         "한 구절). 확정 문장의 근거가 아니라 회의 원문에서 이 안건이 나온 자리다.\n\n"
         "반드시 아래 JSON 배열 형식으로만 답하라. 설명이나 코드블록 표시 없이 JSON만 출력하라:\n"
         '[{"topic": "안건 한 줄", "ambiguous": true, "why": "왜 갈릴 수 있나", "impact": "팀원의 행동이 어떻게 갈릴 수 있나", '
-        '"evidence": "이 안건이 나온 원문 문장", "candidate": "가장 추천하는 확정 문장"}, '
+        '"evidence": "이 안건이 나온 원문 문장"}, '
         '{"topic": "안건 한 줄", "ambiguous": false, "final": "확정 문장", "evidence": "근거가 된 원문 문장"}]\n'
-        + FILLS_SCHEMA_EXAMPLE +
         "\n전사본:\n" + source
     )
 
@@ -428,10 +428,12 @@ def compile_specs(source, meeting=None):
     )
     if items is None:
         return parse_items(json.dumps(FAKE_DECISIONS))
-    # 추천 문장을 진행자에게 내보내기 전에 되짚는다(검증 → 1회 재생성 → 폐기). 가짜 응답 경로에는
-    # 붙이지 않는다 — LLM이 없어 다시 쓸 수 없고, 가짜 모드는 화면 시연용이다.
-    # import를 함수 안에서 하는 이유: decision_refine이 이 모듈을 쓰므로 위에서 부르면 순환 import다.
-    from . import decision_refine
+    # 확인이 필요한 항목의 추천 문장은 별도 호출로 쓰고(decision_recommend), 진행자에게 내보내기 전에
+    # 되짚는다(검증 → 1회 재생성 → 폐기). 가짜 응답 경로에는 붙이지 않는다 — LLM이 없어 쓸 수 없고,
+    # 가짜 모드는 화면 시연용이라 FAKE_DECISIONS에 추천 문장이 이미 들어 있다.
+    # import를 함수 안에서 하는 이유: 두 모듈이 이 모듈을 쓰므로 위에서 부르면 순환 import다.
+    from . import decision_recommend, decision_refine
+    items = decision_recommend.recommend_candidates(items, source, meeting_info)
     return decision_refine.refine_candidates(items, source, meeting_info)
 
 
@@ -495,6 +497,12 @@ def _parse_candidates(raw_candidates):
     return results, draft_hint
 
 
+def _evidence_found(evidence, squashed_source):
+    """근거가 녹취 원문에 있는가 — 화자 표시·띄어쓰기 차이는 무시하고, " / "로 묶인 근거는 조각마다 본다
+    (decision_checks.quote_in_source). squashed_source가 None이면 대조할 원문이 없는 경우(가짜 응답)다."""
+    return squashed_source is None or decision_checks.quote_in_source(evidence, squashed_source)
+
+
 def _legacy_candidate_evidence(raw_candidates, normalized_source):
     """예전 형식(후보마다 evidence)으로 답했을 때 결정의 근거로 쓸 첫 후보 근거.
 
@@ -505,7 +513,7 @@ def _legacy_candidate_evidence(raw_candidates, normalized_source):
         if not isinstance(item, dict):
             continue
         evidence = str(item.get("evidence", "")).strip()
-        if evidence and (normalized_source is None or services._normalize_for_match(evidence) in normalized_source):
+        if evidence and _evidence_found(evidence, normalized_source):
             return evidence
     return ""
 
@@ -536,7 +544,8 @@ def parse_fills(row, source=None, meeting_info=None):
 def parse_items(raw, source_text=None, meeting_info=None):
     """LLM 응답 → 안건별 모호 여부, 사유, 행동 영향, 문장과 원문 근거.
 
-    한 번의 호출로 받은 응답을 전부 여기서 읽는다. 항목 하나의 형식이 틀렸다고 나머지를
+    추출 호출의 응답을 전부 여기서 읽는다. 추천 문장은 다음 호출(decision_recommend)이 채운다 — 다만
+    응답에 candidate가 들어 있으면(가짜 응답, 예전 형식) 그것도 읽는다. 항목 하나의 형식이 틀렸다고 나머지를
     버리지 않는다 — 읽을 수 없는 조각만 비워서 넘기고, 그 항목은 진행자가 직접 쓰거나 다음
     회의로 넘기게 된다.
 
@@ -544,16 +553,17 @@ def parse_items(raw, source_text=None, meeting_info=None):
     - 모호 항목(ambiguous=True)은 AI 추천 문장(candidates, 최대 1개)만 쓰고 final을 버린다.
       반대로 명확 항목은 final만 쓰고 추천 문장을 버린다 — 공개 기준이 둘이 되지 않게.
       evidence(그 결정이 나온 원문 구절)는 둘 다 받는다.
-    - source_text가 주어지면 근거를 원문과 대조한다. 명확 항목의 근거가 원문에 없으면
-      final을 비워 돌려주고(호출자가 '확인 필요'로 올린다), 모호 항목은 근거만 비운다(하이라이트할
-      자리가 없을 뿐 추천 문장은 그대로 쓸 수 있다).
+    - source_text가 주어지면 근거를 원문과 대조한다(화자 표시·띄어쓰기는 무시, " / "로 묶인 근거는 조각마다).
+      명확 항목의 근거가 원문에 없으면 final을 비우고 그 문장을 unverified_final로 넘긴다(호출자가 '확인
+      필요'로 올리고 그 문장을 선택지로 보여준다). 모호 항목은 근거만 비운다(하이라이트할 자리가 없을 뿐 추천
+      문장은 그대로 쓸 수 있다).
     - 근거 문장이 겹치는 항목은 중복으로 보고 먼저 나온 것만 남긴다(_dedupe_items) — 같은
       전사 문장을 topic만 바꿔 두 번 만들어내는 LLM 응답을 걸러낸다.
     """
     data = _json_array(raw)
     if data is None:
         return []
-    normalized_source = services._normalize_for_match(source_text) if source_text is not None else None
+    normalized_source = decision_checks.squash_transcript(source_text) if source_text is not None else None
     items = []
     for row in data:
         if not isinstance(row, dict):
@@ -566,12 +576,12 @@ def parse_items(raw, source_text=None, meeting_info=None):
         evidence = str(row.get("evidence", "")).strip() or (
             _legacy_candidate_evidence(row.get("candidates"), normalized_source) if ambiguous else ""
         )
-        evidence_found = normalized_source is None or (
-            bool(evidence) and services._normalize_for_match(evidence) in normalized_source
-        )
-        # 원문을 들고 검증하는 중이라면, 근거가 없는 확정 문장은 "원문에 있다"고 볼 수 없다.
+        evidence_found = bool(evidence) and _evidence_found(evidence, normalized_source) if normalized_source is not None else True
+        # 원문을 들고 검증하는 중이라면, 근거가 없는 확정 문장은 "원문에 있다"고 볼 수 없다. 바로 공개하지 않고
+        # 진행자 확인으로 올리되, AI가 쓴 문장은 버리지 않고 'unverified_final'로 넘겨 선택지로 보여준다(_resolve_item).
+        unverified_final = ""
         if final and not evidence_found:
-            final = ""
+            final, unverified_final = "", final
         if ambiguous and not evidence_found:
             evidence = ""
         raw_candidates = row.get("candidate") if row.get("candidate") is not None else row.get("candidates")
@@ -585,6 +595,7 @@ def parse_items(raw, source_text=None, meeting_info=None):
             # 바로 공개되는 명확 항목은 원문 기준을 그대로 쓴다 — 채운 값이라는 개념이 없다.
             "fills": parse_fills(row, source_text, meeting_info) if ambiguous else [],
             "final": final,
+            "unverified_final": unverified_final,
             "evidence": evidence,
             "candidates": candidates,
             "draft_hint": draft_hint,
@@ -718,7 +729,9 @@ def _resolve_item(item):
        버린 후보에서 이미 만들어 둔 것을 그대로 쓴다.
     2. AI가 명확하다고 했지만 근거에 보류 표현이 있으면 확인 필요로 올리고 후보는 두지 않는다.
     3. AI가 명확하다고 했지만 근거를 원문에서 확인하지 못한 항목(parse_items가 final을
-       비운 경우): 확인 필요로 올리고 후보는 두지 않는다.
+       비운 경우): 확인 필요로 올리고, AI가 쓴 문장(unverified_final)을 "이 문장 그대로 공개" 후보로
+       보여준다 — 화자 분리가 말을 끊어 놓아 근거 인용이 어긋났을 뿐 문장은 맞는 경우가 많았다. 그 문장에
+       모호어·지시어가 남아 있으면 후보 대신 '직접 쓰기' 참고 문구로만 남긴다.
     4. AI가 명확하다고 하고 근거도 확인된 항목: 규칙 안전망을 돌린다. 걸리면 확인 필요로
        올리고 AI가 쓴 문장을 "이 문장 그대로 공개" 후보 하나로 보여준다. 걸리지 않으면 그
        문장이 곧 확정 내용이고 진행자는 탭하지 않는다. 경고가 모호어·지시어 때문이면 그
@@ -732,7 +745,11 @@ def _resolve_item(item):
     if _looks_deferred(item):
         return [], "녹취에 결론을 미루자는 표현이 있어요", "", [], ""
     if not item["final"]:
-        return [], "근거를 원문에서 확인하지 못했어요", "", [], ""
+        unverified = item.get("unverified_final") or ""
+        if unverified and any(phrase in unverified for phrase in AMBIGUOUS_PHRASES + REFERENT_PHRASES):
+            return [], "근거를 원문에서 확인하지 못했어요", "", [], _draft_hint_text(unverified)
+        candidates = [{"text": unverified, "evidence": "", "recommended": False}] if unverified else []
+        return [], "근거를 원문에서 확인하지 못했어요", "", candidates, ""
     warnings = safety_warnings(item["final"], item["evidence"])
     if not warnings:
         return [], "", item["final"], [], ""

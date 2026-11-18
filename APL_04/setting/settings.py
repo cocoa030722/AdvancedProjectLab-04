@@ -132,7 +132,10 @@ if len(sys.argv) > 1 and sys.argv[1] == 'test':
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+# 사용자가 모두 한국에 있다. DB에는 그대로 UTC로 저장되고(USE_TZ), 날짜 계산·화면 표시만 한국 시간을 쓴다.
+# UTC로 두면 한국 시간 오전 0~9시에 만든 회의의 날짜가 하루 앞당겨져서, 결정 추출 프롬프트의 '회의가 열린 날'과
+# 마감 D-1 배너가 하루씩 어긋났다.
+TIME_ZONE = 'Asia/Seoul'
 
 USE_I18N = True
 
@@ -164,6 +167,9 @@ MAILERS = {
 
 
 BACKGROUND_RECORDING = True
+# 결정 사항 추출도 요청 안에서 기다리지 않고 백그라운드에서 돌린다(meetalign.tasks.start_decision_compile).
+# 테스트에서는 결과를 바로 확인하도록 끈다 — 켜고 시험하는 테스트는 override_settings로 다시 켠다.
+BACKGROUND_DECISIONS = not (len(sys.argv) > 1 and sys.argv[1] == 'test')
 
 LOGIN_URL = 'login'
 LOGIN_REDIRECT_URL = 'index'

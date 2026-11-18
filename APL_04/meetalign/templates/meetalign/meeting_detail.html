@@ -84,7 +84,7 @@
               {% if rec.status == "processing" %}<span class="badge processing">{% if rec.is_text %}읽는 중{% else %}글로 옮기는 중{% endif %}</span>
               {% elif rec.status == "done" %}<span class="badge done">완료</span>
               {% else %}<span class="badge failed">실패</span>{% endif %}
-              <div class="meta">{{ rec.created_at|date:"Y.m.d H:i" }}</div>
+              <div class="meta">{{ rec.created_at|date:"Y.m.d H:i" }}{% if rec.speaker_count %} · 말한 사람 {{ rec.speaker_count }}명{% endif %}</div>
               {% if rec.status == "failed" and rec.error_message %}<div class="meta" style="color:var(--danger)">사유: {{ rec.error_message }}</div>{% endif %}
             </div>
           </div>
@@ -144,8 +144,9 @@
     {% endcomment %}
     <div class="field">
       <label for="recording">녹음 파일 올리기</label>
-      <input id="recording" type="file" name="recording" multiple accept="audio/*,video/*" data-upload-stack="recording-stack">
+      <input id="recording" type="file" name="recording" multiple accept="audio/*,video/*" data-upload-stack="recording-stack" data-speaker-count>
       <ul id="recording-stack" class="upload-stack" hidden></ul>
+      <p class="muted" style="margin:4px 0 0">녹음마다 실제로 말한 사람 수를 적으면 화자를 더 정확하게 나눕니다. 모르면 비워 두세요.</p>
       <p class="muted" style="margin:4px 0 0">마이크 녹음은 localhost 또는 https 주소에서만 동작합니다. 일반 http로 다른 기기에서 접속했다면 파일을 올려 주세요.</p>
     </div>
     <div class="field">
@@ -174,11 +175,16 @@
     .upload-stack .name { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .upload-stack .size { color:var(--ink-soft); font-size:.8rem; white-space:nowrap; }
     .upload-stack .remove { width:auto; padding:2px 9px; line-height:1.4; border-radius:6px; }
+    .upload-stack .speakers { display:inline-flex; align-items:center; gap:4px; color:var(--ink-soft); font-size:.8rem; white-space:nowrap; }
+    .upload-stack .speakers input { width:64px; padding:3px 6px; margin:0; }
   </style>
   <script>
   // 파일 칸(data-upload-stack)마다 고른 파일을 목록에 쌓는다. 브라우저 기본 동작은 새로 고르면 앞서 고른 파일을
   // 지워 버리므로, 쌓인 목록을 따로 들고 있다가 고를 때마다·뺄 때마다 그 목록으로 input.files를 다시 채운다.
   // 그래서 제출하면 목록에 보이는 파일이 그대로 올라간다.
+  // 녹음 칸(data-speaker-count)은 줄마다 '말한 사람' 칸을 둔다. 칸 이름이 모두 speaker_counts라 파일과 같은
+  // 순서로 올라가고, 서버가 n번째 녹음에 n번째 값을 붙인다(views._speaker_counts). 빼거나 더해도 값이 따라다니게
+  // 파일과 값을 한 묶음({file, count})으로 들고 있는다.
   (function () {
     if (typeof DataTransfer === "undefined") return;  // 지원하지 않는 브라우저는 기본 동작(마지막 선택만) 그대로
     var stacks = new Map();
@@ -189,14 +195,15 @@
     }
 
     function sync(input) {
-      var files = stacks.get(input);
+      var entries = stacks.get(input);
       var transfer = new DataTransfer();
-      files.forEach(function (file) { transfer.items.add(file); });
+      entries.forEach(function (entry) { transfer.items.add(entry.file); });
       input.files = transfer.files;
       var list = document.getElementById(input.dataset.uploadStack);
       list.innerHTML = "";
-      list.hidden = files.length === 0;
-      files.forEach(function (file, index) {
+      list.hidden = entries.length === 0;
+      entries.forEach(function (entry, index) {
+        var file = entry.file;
         var item = document.createElement("li");
         var name = document.createElement("span");
         name.className = "name";
@@ -211,22 +218,41 @@
         remove.textContent = "×";
         remove.setAttribute("aria-label", file.name + " 빼기");
         remove.addEventListener("click", function () {
-          files.splice(index, 1);
+          entries.splice(index, 1);
           sync(input);
         });
-        item.append(name, size, remove);
+        item.append(name, size);
+        if (input.hasAttribute("data-speaker-count")) {
+          var speakers = document.createElement("label");
+          speakers.className = "speakers";
+          var count = document.createElement("input");
+          count.type = "number";
+          count.name = "speaker_counts";
+          count.min = "1";
+          count.max = "20";
+          count.step = "1";
+          count.inputMode = "numeric";
+          count.placeholder = "자동";
+          count.value = entry.count;
+          count.setAttribute("aria-label", file.name + " 말한 사람 수");
+          count.addEventListener("input", function () { entry.count = count.value; });
+          speakers.append("말한 사람", count, "명");
+          item.appendChild(speakers);
+        }
+        item.appendChild(remove);
         list.appendChild(item);
       });
     }
 
     function add(input, newFiles) {
-      var files = stacks.get(input);
+      var entries = stacks.get(input);
       Array.prototype.forEach.call(newFiles, function (file) {
         // 같은 파일을 두 번 고르면 한 번만 쌓는다.
-        var dup = files.some(function (f) {
+        var dup = entries.some(function (entry) {
+          var f = entry.file;
           return f.name === file.name && f.size === file.size && f.lastModified === file.lastModified;
         });
-        if (!dup) files.push(file);
+        if (!dup) entries.push({ file: file, count: "" });
       });
       sync(input);
     }

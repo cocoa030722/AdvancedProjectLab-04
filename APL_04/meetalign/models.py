@@ -67,6 +67,9 @@ class Recording(models.Model):
     transcript = models.TextField(blank=True)
     status = models.CharField(max_length=20, default=STATUS_PROCESSING)
     error_message = models.CharField(max_length=300, blank=True, default="")
+    # 올릴 때 이 녹음 줄에 적은 말한 사람 수. 화자 분리가 그 수로 목소리를 묶는다(services.transcribe). 비어 있으면
+    # 화자 분리가 목소리 차이로 스스로 추정한다(DIARIZATION_THRESHOLD). 다시 시도할 때도 같은 값을 쓰려고 저장한다.
+    speaker_count = models.PositiveSmallIntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
