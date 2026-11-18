@@ -281,6 +281,13 @@ class Interpretation(models.Model):
     # 근거가 가장 강한 후보 하나에만 True. 화면의 'AI 추천' 배지로만 쓰고, 미리 선택해 두지는
     # 않는다 — 진행자가 읽고 직접 골라야 하기 때문이다.
     recommended = models.BooleanField(default=False)
+    # AI가 이 문장에서 빈칸을 채운 자리와 그 출처.
+    # [{"gap": "기한|담당|범위|선택지", "value": "채운 값", "source": "원문|회의정보|AI추정",
+    #   "quote": "source가 '원문'일 때 전사본에서 인용한 구절"}]
+    # source는 서버가 검증해서 넣는다(decision_checks.verify_fill_sources) — AI가 "원문"이라고
+    # 주장해도 그 인용이 전사본에 없으면 "AI추정"으로 내린다. 진행자 화면은 "AI추정" 자리만
+    # 색으로 강조한다. 추출과 화면은 서로 다른 요청이라 화면에서 다시 계산할 수 없어 저장한다.
+    fills = models.JSONField(default=list, blank=True)
 
     class Meta:
         ordering = ["order", "id"]
