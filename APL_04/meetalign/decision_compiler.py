@@ -37,6 +37,7 @@ AI를 한 번 부른다. 녹취 원문을 보내고 결정마다
 """
 
 import json
+import logging
 import re
 
 from django.db import IntegrityError, transaction
@@ -44,6 +45,8 @@ from django.utils import timezone
 
 from . import decision_checks, services
 from .models import Decision, Interpretation
+
+logger = logging.getLogger(__name__)
 
 # 결정 하나에 보여줄 AI 확정 문장 수. 가장 추천하는 하나만 보여준다 — 후보 여러 개를 읽고 비교하는
 # 것이 진행자에게 가장 큰 부담이었고, 고르지 않는 것은 '직접 쓰기'로 언제든 대신할 수 있다.
@@ -632,7 +635,7 @@ def compile_meeting(meeting):
         # 쪽의 결과를 그대로 두고, 늦게 온 쪽에는 사유를 보여준다(500 대신).
         raise DecisionCompileError("이미 결정 사항을 추출한 회의입니다. 화면을 새로 고쳐 주세요.")
     checks = [item["check"] for item in items if "check" in item]
-    return {
+    summary = {
         "decisions": len(items),
         "ambiguous": ambiguous_count,
         "few_candidates": few_candidates,
@@ -641,6 +644,15 @@ def compile_meeting(meeting):
         "discarded": sum(1 for check in checks if check["discarded"]),
         "regenerate_failed": sum(1 for check in checks if check["kept"]),
     }
+    # 추출마다 한 줄. decision_refine은 검증에 걸린 항목만 남기므로, 그것만으로는 '하나도 걸리지
+    # 않은 추출'과 '추출이 돌지 않은 것'을 로그에서 구분할 수 없다 — 성공률을 보려면 분모가 필요하다.
+    # 호출한 쪽(views)은 이 dict를 쓰지 않으므로 여기서 남긴다.
+    logger.info(
+        "결정 추출: 결정 %d건 / 검증 %d건 / 재생성 %d건 / 폐기 %d건 / 재생성 실패 %d건",
+        summary["decisions"], summary["checked"], summary["regenerated"],
+        summary["discarded"], summary["regenerate_failed"],
+    )
+    return summary
 
 
 def _looks_deferred(item):

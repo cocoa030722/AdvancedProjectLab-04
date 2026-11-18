@@ -464,6 +464,43 @@ class LocalLLMTests(TestCase):
             services.chat_reply(self.meeting, "q")
         self.assertNotIn("이전 대화", gen.call_args[0][0])
 
+    # ---- 대화창은 마크다운을 그리지 않는다 ----
+
+    def test_chat_reply_asks_for_plain_sentences(self):
+        """대화창은 답변을 일반 글자로 보여준다 — 마크다운을 쓰지 말라고 프롬프트에 적는다."""
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="답") as gen:
+            services.chat_reply(self.meeting, "q")
+        prompt = gen.call_args[0][0]
+        self.assertIn("마크다운", prompt)
+        self.assertIn("일반 문장", prompt)
+
+    def test_chat_reply_strips_markdown_the_model_sent_anyway(self):
+        """모델이 지시를 어기고 마크다운을 보내도 화면에 기호가 그대로 보이지 않아야 한다."""
+        answer = "**제목**" + chr(10) + "# 소제목" + chr(10) + "내용"
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value=answer):
+            reply = services.chat_reply(self.meeting, "q")
+        self.assertNotIn("**", reply)
+        self.assertNotIn("# ", reply)
+        self.assertEqual(reply, "제목" + chr(10) + "소제목" + chr(10) + "내용")
+
+    def test_chat_reply_keeps_the_words_themselves(self):
+        """기호만 지운다 — 글자를 지우거나 줄 구성을 바꾸지 않는다."""
+        answer = "1. 배포는 __금요일__까지입니다." + chr(10) + "2. 담당은 민수입니다."
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value=answer):
+            reply = services.chat_reply(self.meeting, "q")
+        self.assertEqual(reply, "1. 배포는 금요일까지입니다." + chr(10) + "2. 담당은 민수입니다.")
+
+    def test_chat_reply_leaves_a_hash_that_is_not_a_heading(self):
+        """'#3 안건'처럼 제목 기호가 아닌 #은 남긴다 — 마크다운 제목은 # 뒤에 공백이 온다."""
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="#3 안건이 남았습니다"):
+            self.assertEqual(services.chat_reply(self.meeting, "q"), "#3 안건이 남았습니다")
+
+    def test_the_summary_prompt_is_left_alone(self):
+        """회의록 요약은 마크다운 같은 머리말을 쓰는 화면이라 이 규칙을 넣지 않는다(수정 범위 밖)."""
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value="[요약]" + chr(10) + "- 내용") as gen:
+            services.summarize("전사본")
+        self.assertNotIn("마크다운 기호", gen.call_args[0][0])
+
     def test_llm_failure_falls_back(self):
         with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", side_effect=OSError("down")):
             self.assertIn("AI 연결 실패", services.chat_reply(self.meeting, "q"))
@@ -3060,6 +3097,39 @@ class DecisionRefineTests(TestCase):
         self.assertEqual((summary["checked"], summary["regenerate_failed"], summary["discarded"]), (1, 1, 0))
         self.assertIn("재생성 실패로 원본 유지", chr(10).join(logs.output))
         self.assertEqual(Interpretation.objects.get().text, self.EVIDENCE)
+
+    def test_every_extraction_logs_a_one_line_summary(self):
+        """하나도 걸리지 않은 추출도 기록돼야 한다 — 나중에 재생성 성공률을 볼 때 분모가 된다.
+
+        걸린 항목만 남기면 '깨끗하게 통과한 추출'과 '추출이 돌지 않은 것'을 로그에서 구분할 수 없다.
+        """
+        meeting, extracted, refined = self._three_item_meeting()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, refined]),              self.assertLogs("meetalign.decision_compiler", level="INFO") as logs:
+            decision_compiler.compile_meeting(meeting)
+        self.assertIn(
+            "결정 추출: 결정 3건 / 검증 3건 / 재생성 1건 / 폐기 1건 / 재생성 실패 0건",
+            chr(10).join(logs.output),
+        )
+
+    def test_an_extraction_with_nothing_flagged_is_logged_as_well(self):
+        host = User.objects.create_user("민수", password="pw12345!")
+        team = Team.objects.create(name="t")
+        team.members.add(host)
+        meeting = Meeting.objects.create(
+            team=team, title="m", host=host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+        extracted = self._response({
+            "topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
+            "evidence": self.EVIDENCE, "candidate": self.FILLED,
+        })
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted]) as gen,              self.assertLogs("meetalign.decision_compiler", level="INFO") as logs:
+            decision_compiler.compile_meeting(meeting)
+        self.assertEqual(gen.call_count, 1)
+        self.assertIn(
+            "결정 추출: 결정 1건 / 검증 1건 / 재생성 0건 / 폐기 0건 / 재생성 실패 0건",
+            chr(10).join(logs.output),
+        )
 
     # ---- 추출 흐름에 붙어 있는지 ----
 
