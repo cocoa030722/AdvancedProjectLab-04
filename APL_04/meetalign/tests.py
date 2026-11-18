@@ -2772,6 +2772,88 @@ class DecisionAmbiguityHintTests(TestCase):
         self.assertEqual(decision_compiler.warning_context("저쪽에 관한 이야기만 있는 원문입니다.", warning), "")
 
 
+class DecisionFillPromptTests(TestCase):
+    """빈칸 채우기를 허용한 프롬프트와 [회의 정보] 블록.
+
+    예전 프롬프트는 "원문에 없는 날짜·이름을 지어내지 마라"고 막아서, 기한이 없는 안건의 추천
+    문장이 "기한을 정한다"처럼 빈칸을 그대로 남겼다. 팀 합의로 채우기를 허용하고, 대신 무엇을
+    근거로 채웠는지 받아 진행자에게 표시한다.
+    """
+
+    SOURCE = "로그는 일단 한 달 정도면 충분할 것 같은데요."
+    AMBIGUOUS = {
+        "topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
+        "evidence": "로그는 일단 한 달 정도면 충분할 것 같은데요.",
+        "candidate": "민수가 12월 5일까지 30일로 바꾼다",
+    }
+
+    def setUp(self):
+        self.host = User.objects.create_user("민수", password="pw12345!")
+        self.member = User.objects.create_user("지은", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host, self.member)
+        self.earlier = Meeting.objects.create(team=self.team, title="지난 회의", host=self.host)
+        self.carried = Decision.objects.create(
+            meeting=self.earlier, order=0, what="회식 장소", status=Decision.STATUS_UNDECIDED,
+            marked_undecided=True, divergence_reason="후보가 두 곳 남았어요",
+            final_text="회식 장소 — 이번 회의에서 결론이 나지 않았음 (다음 회의로)",
+        )
+        self.meeting = Meeting.objects.create(
+            team=self.team, title="m", host=self.host, deadline=timezone.localdate() + timedelta(days=3),
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+        self.meeting.participants.add(self.host, self.member)
+
+    def test_the_prompt_no_longer_forbids_filling_in_missing_values(self):
+        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        self.assertNotIn("원문에 없는 날짜·이름을 지어내지 말고", prompt)
+        self.assertNotIn("단톡방에서 정한다", prompt)
+        self.assertIn("가장 그럴듯한 값", prompt)
+
+    def test_the_prompt_asks_for_fills_with_a_source(self):
+        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        for token in ('"fills"', '"gap"', '"source"', "원문|회의정보|AI추정"):
+            self.assertIn(token, prompt)
+
+    def test_the_meeting_info_block_carries_date_participants_deadline_and_carryover(self):
+        block = decision_compiler._meeting_info_block(decision_compiler.collect_meeting_info(self.meeting))
+        at = timezone.localtime(self.meeting.created_at)
+        self.assertIn("[회의 정보]", block)
+        self.assertIn(str(at.year), block)
+        self.assertIn("(%s)" % "월화수목금토일"[at.weekday()], block)
+        self.assertIn("민수", block)
+        self.assertIn("지은", block)
+        self.assertIn(str(self.meeting.deadline), block)
+        self.assertIn("지난 회의 미결정", block)
+        self.assertIn(self.carried.what, block)
+        # 전사본이 이름을 못 받아 "화자 A"로 적힌 경우를 AI가 참석자와 연결할 수 있게 한다.
+        self.assertIn("화자 A", block)
+
+    def test_the_prompt_works_without_a_meeting(self):
+        """회의 없이 프롬프트만 만드는 기존 호출(테스트·실험)이 그대로 동작해야 한다."""
+        self.assertNotIn("[회의 정보]", decision_compiler._compile_prompt(self.SOURCE))
+
+    def test_compile_sends_the_meeting_info_block_in_the_prompt(self):
+        raw = json.dumps([self.AMBIGUOUS], ensure_ascii=False)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", return_value=raw) as gen:
+            decision_compiler.compile_meeting(self.meeting)
+        prompt = gen.call_args_list[0][0][0]
+        self.assertIn("[회의 정보]", prompt)
+        self.assertIn("지은", prompt)
+
+    def test_a_meeting_info_value_counts_as_a_proven_source(self):
+        """참석자 이름으로 담당을 채웠다면 그것은 추정이 아니다 — 회의 정보에 있는 값이다."""
+        raw = json.dumps([dict(self.AMBIGUOUS, fills=[
+            {"gap": "담당", "value": "지은", "source": "회의정보"},
+            {"gap": "기한", "value": "12월 5일", "source": "회의정보"},
+        ])], ensure_ascii=False)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value=raw):
+            decision_compiler.compile_meeting(self.meeting)
+        self.assertEqual(
+            [f["source"] for f in Interpretation.objects.get().fills], ["회의정보", "AI추정"],
+        )
+
+
 class DecisionReviewTests(TestCase):
     """진행자 화면의 권한과 동작."""
 
