@@ -3061,6 +3061,39 @@ class DecisionRefineTests(TestCase):
         self.assertIn("재생성 실패로 원본 유지", chr(10).join(logs.output))
         self.assertEqual(Interpretation.objects.get().text, self.EVIDENCE)
 
+    def test_every_extraction_logs_a_one_line_summary(self):
+        """하나도 걸리지 않은 추출도 기록돼야 한다 — 나중에 재생성 성공률을 볼 때 분모가 된다.
+
+        걸린 항목만 남기면 '깨끗하게 통과한 추출'과 '추출이 돌지 않은 것'을 로그에서 구분할 수 없다.
+        """
+        meeting, extracted, refined = self._three_item_meeting()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, refined]),              self.assertLogs("meetalign.decision_compiler", level="INFO") as logs:
+            decision_compiler.compile_meeting(meeting)
+        self.assertIn(
+            "결정 추출: 결정 3건 / 검증 3건 / 재생성 1건 / 폐기 1건 / 재생성 실패 0건",
+            chr(10).join(logs.output),
+        )
+
+    def test_an_extraction_with_nothing_flagged_is_logged_as_well(self):
+        host = User.objects.create_user("민수", password="pw12345!")
+        team = Team.objects.create(name="t")
+        team.members.add(host)
+        meeting = Meeting.objects.create(
+            team=team, title="m", host=host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+        extracted = self._response({
+            "topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
+            "evidence": self.EVIDENCE, "candidate": self.FILLED,
+        })
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted]) as gen,              self.assertLogs("meetalign.decision_compiler", level="INFO") as logs:
+            decision_compiler.compile_meeting(meeting)
+        self.assertEqual(gen.call_count, 1)
+        self.assertIn(
+            "결정 추출: 결정 1건 / 검증 1건 / 재생성 0건 / 폐기 0건 / 재생성 실패 0건",
+            chr(10).join(logs.output),
+        )
+
     # ---- 추출 흐름에 붙어 있는지 ----
 
     def test_compile_saves_the_rewritten_sentence(self):
