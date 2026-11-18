@@ -410,7 +410,11 @@ def compile_specs(source, meeting=None):
     )
     if items is None:
         return parse_items(json.dumps(FAKE_DECISIONS))
-    return items
+    # 추천 문장을 진행자에게 내보내기 전에 되짚는다(검증 → 1회 재생성 → 폐기). 가짜 응답 경로에는
+    # 붙이지 않는다 — LLM이 없어 다시 쓸 수 없고, 가짜 모드는 화면 시연용이다.
+    # import를 함수 안에서 하는 이유: decision_refine이 이 모듈을 쓰므로 위에서 부르면 순환 import다.
+    from . import decision_refine
+    return decision_refine.refine_candidates(items, source, meeting_info)
 
 
 # ---------------------------------------------------------------------------

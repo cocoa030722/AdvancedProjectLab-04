@@ -16,7 +16,7 @@ from django.test.utils import CaptureQueriesContext
 from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
 
-from . import decision_checks, decision_compiler, services, tasks, views, whisper_worker
+from . import decision_checks, decision_compiler, decision_refine, services, tasks, views, whisper_worker
 from .models import (
     ChatMessage, Checkpoint, Decision, DecisionAgreement,
     Interpretation, Meeting, Notification, Question, Recording, SttUsage, Team,
@@ -2852,6 +2852,171 @@ class DecisionFillPromptTests(TestCase):
         self.assertEqual(
             [f["source"] for f in Interpretation.objects.get().fills], ["회의정보", "AI추정"],
         )
+
+
+class DecisionRefineTests(TestCase):
+    """추천 문장 검증 → 걸린 것만 1회 재생성 → 그래도 걸리면 폐기(decision_refine).
+
+    빈칸 채우기를 허용하면 AI는 두 방향으로 미끄러진다 — 아무것도 못 채우고 근거를 그대로
+    옮겨 쓰거나, 서로 다른 안건에 같은 문장을 붙인다. 진행자에게 내보내기 전에 서버가 되짚는다.
+    """
+
+    SOURCE = ("로그 보관 얘기를 해 봅시다. "
+              "로그는 일단 한 달 정도면 충분할 것 같은데요. "
+              "그럼 그렇게 하죠. "
+              "발표 자료는 누가 할까요.")
+    EVIDENCE = "로그는 일단 한 달 정도면 충분할 것 같은데요."
+    FILLED = "민수가 12월 5일까지 로그 보관 기간을 30일로 바꾼다"
+    INFO = {"date": "2026년 11월 18일 (수)", "participants": ["민수", "지은"],
+            "deadline": "2026-11-21", "carryover": []}
+
+    def _item(self, candidate, topic="로그 보관 기간", evidence=None, fills=None, final=""):
+        return {
+            "topic": topic, "ambiguous": not final, "impact": "", "why": "갈립니다",
+            "fills": fills if fills is not None else [],
+            "final": final, "evidence": evidence if evidence is not None else self.EVIDENCE,
+            "candidates": ([{"text": candidate, "evidence": "", "recommended": True}]
+                           if candidate else []),
+            "draft_hint": "",
+        }
+
+    def _refine(self, items, *responses):
+        """재생성 응답을 흉내내며 refine_candidates를 돌리고 (결과, 호출 mock)을 돌려준다."""
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=list(responses) or OSError("no call")) as gen:
+            refined = decision_refine.refine_candidates(items, self.SOURCE, self.INFO)
+        return refined, gen
+
+    def _response(self, *rows):
+        return json.dumps(list(rows), ensure_ascii=False)
+
+    # ---- 걸린 게 없으면 부르지 않는다 ----
+
+    def test_a_passing_candidate_does_not_call_the_llm(self):
+        refined, gen = self._refine([self._item(self.FILLED)])
+        gen.assert_not_called()
+        self.assertEqual(refined[0]["candidates"][0]["text"], self.FILLED)
+
+    def test_a_clear_item_is_not_checked(self):
+        """바로 공개되는 항목의 확정 문장은 원문 기준 그대로다 — 이 단계가 건드리지 않는다."""
+        item = self._item("", final="민수가 금요일까지 배포한다")
+        refined, gen = self._refine([item])
+        gen.assert_not_called()
+        self.assertEqual(refined[0]["final"], "민수가 금요일까지 배포한다")
+
+    # ---- 재생성 ----
+
+    def test_a_copied_candidate_is_regenerated_once_and_kept(self):
+        rewritten = "지은이 2026-11-21까지 로그 보관 기간을 30일로 줄인다"
+        refined, gen = self._refine(
+            [self._item(self.EVIDENCE)],
+            self._response({"n": 1, "candidate": rewritten,
+                            "fills": [{"gap": "담당", "value": "지은", "source": "회의정보"}]}),
+        )
+        self.assertEqual(gen.call_count, 1)
+        self.assertEqual(refined[0]["candidates"][0]["text"], rewritten)
+        self.assertEqual(refined[0]["fills"], [
+            {"gap": "담당", "value": "지은", "source": "회의정보", "quote": ""},
+        ])
+        self.assertTrue(refined[0]["check"]["regenerated"])
+        self.assertFalse(refined[0]["check"]["discarded"])
+
+    def test_the_refine_prompt_carries_the_reasons_context_and_other_sentences(self):
+        other = "지은이 11월 20일까지 발표 자료를 만든다"
+        items = [self._item(self.EVIDENCE), self._item(other, topic="발표 자료",
+                                                       evidence="발표 자료는 누가 할까요.")]
+        _, gen = self._refine(items, self._response({"n": 1, "candidate": self.FILLED}))
+        prompt = gen.call_args_list[0][0][0]
+        self.assertIn(decision_checks.REASON_COPIED, prompt)
+        # 근거 앞뒤 대화를 함께 줘야 AI가 무엇을 채울 수 있는지 보인다(context_around).
+        self.assertIn("로그 보관 얘기를 해 봅시다.", prompt)
+        # 이미 쓴 다른 결정 문장을 줘서 같은 문장을 또 쓰지 않게 한다.
+        self.assertIn(other, prompt)
+        self.assertIn("[회의 정보]", prompt)
+
+    def test_only_the_flagged_items_are_sent_for_regeneration(self):
+        items = [self._item(self.FILLED), self._item(self.EVIDENCE, topic="로그 보관")]
+        _, gen = self._refine(items, self._response({"n": 1, "candidate": "지은이 30일로 줄인다"}))
+        prompt = gen.call_args_list[0][0][0]
+        self.assertIn("로그 보관", prompt)
+        self.assertNotIn(self.FILLED, prompt.split("[회의 정보]")[0])
+
+    def test_the_llm_is_called_once_even_with_several_flagged_items(self):
+        items = [self._item(self.EVIDENCE), self._item(self.EVIDENCE, topic="로그 보관")]
+        _, gen = self._refine(
+            items,
+            self._response({"n": 1, "candidate": "민수가 30일로 줄인다"},
+                           {"n": 2, "candidate": "지은이 90일로 늘린다"}),
+        )
+        self.assertEqual(gen.call_count, 1)
+
+    # ---- 폐기 ----
+
+    def test_a_candidate_that_fails_twice_is_discarded_into_the_custom_flow(self):
+        refined, _ = self._refine(
+            [self._item(self.EVIDENCE)],
+            self._response({"n": 1, "candidate": self.EVIDENCE}),
+        )
+        self.assertEqual(refined[0]["candidates"], [])
+        self.assertTrue(refined[0]["check"]["discarded"])
+        # 진행자가 맨 빈칸에서 시작하지 않게 폐기한 문장을 '직접 쓰기'의 출발점으로 남긴다.
+        self.assertTrue(refined[0]["draft_hint"])
+
+    def test_a_discarded_candidate_drops_its_fills(self):
+        """폐기한 문장의 채운 값이 남으면 화면이 없는 문장에 색을 칠하려 한다."""
+        item = self._item(self.EVIDENCE, fills=[{"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": ""}])
+        refined, _ = self._refine([item], self._response({"n": 1, "candidate": self.EVIDENCE}))
+        self.assertEqual(refined[0]["fills"], [])
+
+    # ---- 재생성 자체가 실패했을 때 ----
+
+    def test_a_failed_regeneration_call_keeps_the_original_candidate(self):
+        """AI 연결이 끊겼다는 이유로 진행자 화면을 비우면 손해가 더 크다 — 원본을 남긴다."""
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=OSError("down")):
+            refined = decision_refine.refine_candidates([self._item(self.EVIDENCE)], self.SOURCE, self.INFO)
+        self.assertEqual(refined[0]["candidates"][0]["text"], self.EVIDENCE)
+        self.assertTrue(refined[0]["check"]["kept"])
+        self.assertFalse(refined[0]["check"]["discarded"])
+
+    def test_an_unreadable_regeneration_response_keeps_the_original_candidate(self):
+        refined, _ = self._refine([self._item(self.EVIDENCE)], "JSON이 아닌 답")
+        self.assertEqual(refined[0]["candidates"][0]["text"], self.EVIDENCE)
+        self.assertTrue(refined[0]["check"]["kept"])
+
+    def test_a_rewritten_sentence_with_a_vague_phrase_is_not_accepted(self):
+        """다시 쓴 문장에 모호어가 남으면 고를 의미가 없다 — 첫 추출 때와 같은 기준이다."""
+        refined, _ = self._refine([self._item(self.EVIDENCE)],
+                                  self._response({"n": 1, "candidate": "민수가 나중에 30일로 바꾼다"}))
+        self.assertEqual(refined[0]["candidates"], [])
+        self.assertTrue(refined[0]["check"]["discarded"])
+
+    # ---- 추출 흐름에 붙어 있는지 ----
+
+    def test_compile_saves_the_rewritten_sentence(self):
+        """compile_specs가 저장 전에 이 단계를 거친다 — AI를 두 번 부른다(추출 1 + 재생성 1)."""
+        host = User.objects.create_user("민수", password="pw12345!")
+        team = Team.objects.create(name="t")
+        team.members.add(host)
+        meeting = Meeting.objects.create(
+            team=team, title="m", host=host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+        extracted = self._response({
+            "topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
+            "evidence": self.EVIDENCE, "candidate": self.EVIDENCE,
+        })
+        rewritten = "민수가 12월 5일까지 로그 보관 기간을 30일로 줄인다"
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, self._response(
+                 {"n": 1, "candidate": rewritten})]) as gen:
+            decision_compiler.compile_meeting(meeting)
+        self.assertEqual(gen.call_count, 2)
+        self.assertEqual(Interpretation.objects.get().text, rewritten)
+
+    def test_a_missing_row_in_the_regeneration_response_keeps_that_candidate(self):
+        items = [self._item(self.EVIDENCE), self._item(self.EVIDENCE, topic="로그 보관")]
+        refined, _ = self._refine(items, self._response({"n": 1, "candidate": self.FILLED}))
+        self.assertEqual(refined[0]["candidates"][0]["text"], self.FILLED)
+        self.assertEqual(refined[1]["candidates"][0]["text"], self.EVIDENCE)
+        self.assertTrue(refined[1]["check"]["kept"])
 
 
 class DecisionReviewTests(TestCase):
