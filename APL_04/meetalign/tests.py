@@ -2989,6 +2989,69 @@ class DecisionRefineTests(TestCase):
         self.assertEqual(refined[0]["candidates"], [])
         self.assertTrue(refined[0]["check"]["discarded"])
 
+    # ---- 기록 ----
+
+    def _three_item_meeting(self):
+        """통과 1건 + 재생성 성공 1건 + 폐기 1건이 나오는 회의와 응답 두 개."""
+        host = User.objects.create_user("민수", password="pw12345!")
+        team = Team.objects.create(name="t")
+        team.members.add(host)
+        meeting = Meeting.objects.create(
+            team=team, title="m", host=host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+        extracted = self._response(
+            {"topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
+             "evidence": self.EVIDENCE, "candidate": self.FILLED},
+            {"topic": "발표 자료", "ambiguous": True, "why": "담당이 없어요",
+             "evidence": "발표 자료는 누가 할까요.", "candidate": "발표 자료는 누가 할까요."},
+            {"topic": "안건 소개", "ambiguous": True, "why": "범위가 없어요",
+             "evidence": "로그 보관 얘기를 해 봅시다.", "candidate": "로그 보관 얘기를 해 봅시다."},
+        )
+        refined = self._response(
+            {"n": 1, "candidate": "민수가 11월 20일까지 발표 자료를 만든다"},
+            {"n": 2, "candidate": "로그 보관 얘기를 해 봅시다."},
+        )
+        return meeting, extracted, refined
+
+    def test_compile_meeting_reports_the_verification_counts(self):
+        """재생성 성공률을 보고 이 단계를 유지할지 정하려면 숫자가 남아야 한다."""
+        meeting, extracted, refined = self._three_item_meeting()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, refined]):
+            summary = decision_compiler.compile_meeting(meeting)
+        self.assertEqual(
+            (summary["checked"], summary["regenerated"], summary["discarded"], summary["regenerate_failed"]),
+            (3, 1, 1, 0),
+        )
+
+    def test_the_verification_result_is_logged(self):
+        meeting, extracted, refined = self._three_item_meeting()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, refined]),              self.assertLogs("meetalign.decision_refine", level="INFO") as logs:
+            decision_compiler.compile_meeting(meeting)
+        recorded = chr(10).join(logs.output)
+        self.assertIn("추천 문장 검증", recorded)
+        self.assertIn(decision_checks.REASON_COPIED, recorded)
+        self.assertIn("재생성 성공", recorded)
+        self.assertIn("폐기", recorded)
+
+    def test_a_failed_regeneration_is_recorded_as_keeping_the_original(self):
+        host = User.objects.create_user("민수", password="pw12345!")
+        team = Team.objects.create(name="t")
+        team.members.add(host)
+        meeting = Meeting.objects.create(
+            team=team, title="m", host=host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+        extracted = self._response({
+            "topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
+            "evidence": self.EVIDENCE, "candidate": self.EVIDENCE,
+        })
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, OSError("down")]),              self.assertLogs("meetalign.decision_refine", level="INFO") as logs:
+            summary = decision_compiler.compile_meeting(meeting)
+        self.assertEqual((summary["checked"], summary["regenerate_failed"], summary["discarded"]), (1, 1, 0))
+        self.assertIn("재생성 실패로 원본 유지", chr(10).join(logs.output))
+        self.assertEqual(Interpretation.objects.get().text, self.EVIDENCE)
+
     # ---- 추출 흐름에 붙어 있는지 ----
 
     def test_compile_saves_the_rewritten_sentence(self):

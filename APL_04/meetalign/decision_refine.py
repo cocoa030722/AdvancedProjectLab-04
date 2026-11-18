@@ -205,7 +205,10 @@ def refine_candidates(items, source, meeting_info=None):
             )
             continue
         check["discarded"] = True
-        check["reasons"] = check["reasons"] + ([vague] if vague else reasons)
+        # 두 번째 시도도 같은 이유로 걸리는 일이 많다 — 로그에 같은 문구가 두 번 찍히지 않게 합친다.
+        for reason in ([vague] if vague else reasons):
+            if reason not in check["reasons"]:
+                check["reasons"].append(reason)
         _discard(item, candidate["text"] or original)
         logger.info(
             "추천 문장 검증: '%s' — %s / 재생성 뒤에도 걸려 폐기",

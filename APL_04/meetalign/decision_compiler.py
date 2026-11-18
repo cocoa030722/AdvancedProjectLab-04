@@ -603,10 +603,14 @@ def _dedupe_items(items):
 def compile_meeting(meeting):
     """회의 녹취 원문을 추출해 Decision/Interpretation을 저장하고 요약을 돌려준다.
 
-    {"decisions": n, "ambiguous": n, "few_candidates": n}
+    {"decisions": n, "ambiguous": n, "few_candidates": n,
+     "checked": n, "regenerated": n, "discarded": n, "regenerate_failed": n}
     - ambiguous: 진행자가 확인해야 하는 항목 수(AI가 갈린다고 봤거나 규칙이 걸린 것)
     - few_candidates: 확인이 필요한데 AI 추천 문장이 없는 항목 수. AI가 문장을 못 만들었거나
       모호어가 남아 버려진 경우다 — 진행자는 직접 쓰기나 '다음 회의로 넘김'으로만 처리할 수 있다.
+    - 뒤의 네 칸은 추천 문장 검증 결과다(decision_refine). 나중에 재생성 성공률을 보고 이 단계를
+      유지할지 정하려고 남긴다. checked는 검사한 추천 문장 수, regenerate_failed는 재생성 호출이
+      실패해서 원본을 그대로 남긴 수다(폐기와 구분한다). 가짜 응답 모드에서는 모두 0이다.
 
     이미 Decision이 있는 회의는 건드리지 않는다(공개 뒤에 결정이 바뀌면 팀원이 확인한 내용과
     달라진다). 다시 추출하려면 호출 전에 draft 상태인 Decision을 지워야 한다.
@@ -627,10 +631,15 @@ def compile_meeting(meeting):
         # 있으므로 두 요청이 모두 빈 상태를 보고 통과해 같은 order를 쓰려 한다. 먼저 저장한
         # 쪽의 결과를 그대로 두고, 늦게 온 쪽에는 사유를 보여준다(500 대신).
         raise DecisionCompileError("이미 결정 사항을 추출한 회의입니다. 화면을 새로 고쳐 주세요.")
+    checks = [item["check"] for item in items if "check" in item]
     return {
         "decisions": len(items),
         "ambiguous": ambiguous_count,
         "few_candidates": few_candidates,
+        "checked": len(checks),
+        "regenerated": sum(1 for check in checks if check["regenerated"]),
+        "discarded": sum(1 for check in checks if check["discarded"]),
+        "regenerate_failed": sum(1 for check in checks if check["kept"]),
     }
 
 
