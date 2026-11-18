@@ -15,7 +15,7 @@ from django.utils.dateparse import parse_date
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
-from . import decision_compiler, notifications, services, tasks
+from . import decision_checks, decision_compiler, notifications, services, tasks
 from .models import (
     ChatMessage, Decision, DecisionAgreement, Interpretation, Meeting,
     Notification, Question, Recording, Team, TEXT_TRANSCRIPT_EXTENSIONS,
@@ -714,6 +714,17 @@ def decision_review(request, meeting_id):
                 decision_compiler.CHOICE_CANDIDATE_PREFIX, interpretation.id,
             )
             interpretation.chosen = choice == interpretation.choice_value
+            # AI가 짐작으로 채운 자리만 색으로 칠한다. 원문·회의정보에서 가져온 값은 표시하지
+            # 않는다 — 전부 칠하면 아무것도 칠하지 않은 것과 같다.
+            guessed = decision_checks.guessed_fills(interpretation.fills)
+            interpretation.segments = decision_checks.fill_segments(
+                interpretation.text, [fill["value"] for fill in guessed],
+            )
+            # 문장에서 찾지 못한 값으로는 경고하지 않는다 — 진행자가 어디를 봐야 할지 알 수 없다.
+            marked = {segment["text"] for segment in interpretation.segments if segment["estimated"]}
+            interpretation.estimate_gaps = list(dict.fromkeys(
+                fill["gap"] for fill in guessed if fill["value"] in marked and fill["gap"]
+            ))
         rows.append({
             "decision": decision,
             "interpretations": interpretations,

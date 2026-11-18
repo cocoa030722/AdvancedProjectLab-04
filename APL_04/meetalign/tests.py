@@ -16,7 +16,7 @@ from django.test.utils import CaptureQueriesContext
 from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
 
-from . import decision_compiler, services, tasks, views, whisper_worker
+from . import decision_checks, decision_compiler, decision_refine, services, tasks, views, whisper_worker
 from .models import (
     ChatMessage, Checkpoint, Decision, DecisionAgreement,
     Interpretation, Meeting, Notification, Question, Recording, SttUsage, Team,
@@ -2037,6 +2037,146 @@ class DecisionWarningTests(TestCase):
         )
 
 
+class DecisionCandidateCheckTests(TestCase):
+    """AI 추천 문장을 그대로 쓸 만한지 보는 세 가지 검사(decision_checks). DB·LLM 없이 도는 순수 함수다."""
+
+    COPIED = "로그는 일단 한 달 정도면 충분할 것 같은데요"
+    FILLED = "민수가 12월 5일까지 로그 보관 기간을 30일로 바꾼다"
+
+    def test_a_candidate_that_copies_the_evidence_is_flagged(self):
+        """근거를 그대로 옮긴 문장은 빈칸을 채운 것이 아니다."""
+        ok, reasons = decision_checks.check_candidate(self.COPIED, self.COPIED)
+        self.assertFalse(ok)
+        self.assertIn("추천 문장이 원문 근거와 거의 같아요", reasons)
+
+    def test_a_candidate_with_no_new_information_is_flagged(self):
+        ok, reasons = decision_checks.check_candidate("로그 보관 기간을 정한다", "로그 보관 기간을 정해야 해요")
+        self.assertFalse(ok)
+        self.assertIn("원문에 없던 담당자·기한·수치가 하나도 없어요", reasons)
+
+    def test_a_filled_candidate_passes(self):
+        ok, reasons = decision_checks.check_candidate(self.FILLED, self.COPIED, participant_names=["민수"])
+        self.assertEqual((ok, reasons), (True, []))
+
+    def test_a_participant_name_counts_as_new_information(self):
+        """숫자가 하나도 없어도 담당자를 정했으면 채운 것이다."""
+        ok, _ = decision_checks.check_candidate(
+            "민수가 발표 자료를 맡는다", "발표 자료는 누가 할까요", participant_names=["민수"])
+        self.assertTrue(ok)
+
+    def test_a_number_with_a_particle_counts_as_new_information(self):
+        """'한 달'을 '30일로'로 바꾼 것은 채운 값이다 — 날짜 정규식은 조사가 붙은 기간을 일부러 안 잡는다."""
+        ok, _ = decision_checks.check_candidate("민수가 30일로 바꾼다", "로그는 한 달 정도면 충분할 것 같은데요")
+        self.assertTrue(ok)
+
+    def test_a_candidate_almost_identical_to_another_decision_is_flagged(self):
+        ok, reasons = decision_checks.check_candidate(
+            self.FILLED + ".", "로그 얘기였어요", others=[self.FILLED], participant_names=["민수"])
+        self.assertFalse(ok)
+        self.assertIn("다른 결정의 문장과 거의 같아요: %s" % self.FILLED, reasons)
+
+    def test_an_empty_candidate_has_nothing_to_verify(self):
+        """후보가 없는 항목은 이미 '직접 쓰기'로 가 있다 — 검사할 문장이 없다."""
+        self.assertEqual(decision_checks.check_candidate("", "근거"), (True, []))
+
+    def test_the_module_stays_free_of_django_and_llm_imports(self):
+        """순수 모듈이어야 추출 흐름과 따로 검사만 떼어 쓸 수 있다 — import 줄만 본다."""
+        lines = io.open(decision_checks.__file__, encoding="utf-8").read().splitlines()
+        self.assertEqual([line for line in lines if line.startswith(("import ", "from "))], ["import re"])
+
+
+class DecisionFillSourceTests(TestCase):
+    """AI가 채운 값(fills)과 그 출처 — 서버가 검증해서 저장한다.
+
+    AI는 "이건 원문에 있었다"고 주장하면서 전사본에 없는 구절을 인용하기도 한다. 그 주장을
+    그대로 믿으면 진행자 화면이 "원문 근거 있음"이라고 거짓말을 하게 되므로 서버가 대조한다.
+    """
+
+    SOURCE = "로그는 일단 한 달 정도면 충분할 것 같은데요. 민수가 발표를 맡을게요."
+    AMBIGUOUS = {
+        "topic": "로그 보관 기간", "ambiguous": True, "why": "30일인지 90일인지 갈립니다",
+        "evidence": "로그는 일단 한 달 정도면 충분할 것 같은데요",
+        "candidate": "민수가 12월 5일까지 30일로 바꾼다",
+    }
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host)
+        self.meeting = Meeting.objects.create(
+            team=self.team, title="m", host=self.host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+
+    # ---- 출처 검증(순수 함수) ----
+
+    def test_a_quote_that_is_not_in_the_transcript_becomes_a_guess(self):
+        fills = [{"gap": "기한", "value": "12월 5일", "source": "원문", "quote": "12월 5일까지 하죠"}]
+        self.assertEqual(decision_checks.verify_fill_sources(fills, self.SOURCE)[0]["source"], "AI추정")
+
+    def test_a_quote_that_is_in_the_transcript_stays(self):
+        fills = [{"gap": "담당", "value": "민수", "source": "원문", "quote": "민수가 발표를 맡을게요"}]
+        verified = decision_checks.verify_fill_sources(fills, self.SOURCE)
+        self.assertEqual(verified[0]["source"], "원문")
+
+    def test_meeting_info_is_checked_against_the_real_meeting_info(self):
+        fills = [{"gap": "담당", "value": "민수", "source": "회의정보"},
+                 {"gap": "기한", "value": "12월 9일", "source": "회의정보"}]
+        verified = decision_checks.verify_fill_sources(fills, self.SOURCE, info_text="참석자: 민수, 지은")
+        self.assertEqual([f["source"] for f in verified], ["회의정보", "AI추정"])
+
+    def test_broken_fills_are_dropped_without_failing(self):
+        """항목 하나의 형식이 틀렸다고 회의 전체를 실패시키지 않는다 — 기존 파서와 같은 원칙이다."""
+        for broken in (None, "기한", [{"gap": "기한"}], ["문자열"], [{"value": ""}], 7):
+            self.assertEqual(decision_checks.verify_fill_sources(broken, self.SOURCE), [])
+
+    def test_an_unknown_source_label_becomes_a_guess(self):
+        fills = [{"gap": "범위", "value": "세 장", "source": "추측"}]
+        self.assertEqual(decision_checks.verify_fill_sources(fills, self.SOURCE)[0]["source"], "AI추정")
+
+    # ---- 응답 파싱 ----
+
+    def test_parse_items_keeps_verified_fills_for_ambiguous_items(self):
+        raw = json.dumps([dict(self.AMBIGUOUS, fills=[
+            {"gap": "기한", "value": "12월 5일", "source": "원문", "quote": "12월 5일까지 하죠"},
+        ])], ensure_ascii=False)
+        item = decision_compiler.parse_items(raw, source_text=self.SOURCE)[0]
+        # 인용이 전사본에 없으므로 AI추정으로 내려간다.
+        self.assertEqual(item["fills"], [
+            {"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": "12월 5일까지 하죠"},
+        ])
+
+    def test_a_clear_item_carries_no_fills(self):
+        """바로 공개되는 항목은 원문 기준을 그대로 쓴다 — 채운 값이라는 개념이 없다."""
+        raw = json.dumps([{
+            "topic": "발표", "ambiguous": False, "final": "민수가 발표를 맡는다",
+            "evidence": "민수가 발표를 맡을게요",
+            "fills": [{"gap": "담당", "value": "민수", "source": "AI추정"}],
+        }], ensure_ascii=False)
+        self.assertEqual(decision_compiler.parse_items(raw, source_text=self.SOURCE)[0]["fills"], [])
+
+    def test_parse_items_without_a_transcript_keeps_the_shape_without_verifying(self):
+        """가짜 모드는 원문이 없어 대조할 수 없다 — 근거 검증을 건너뛰는 기존 규칙과 같다."""
+        raw = json.dumps([dict(self.AMBIGUOUS, fills=[
+            {"gap": "담당", "value": "민수", "source": "원문", "quote": "아무 말"},
+        ])], ensure_ascii=False)
+        self.assertEqual(decision_compiler.parse_items(raw)[0]["fills"][0]["source"], "원문")
+
+    # ---- 저장 ----
+
+    def test_compile_stores_fills_on_the_saved_candidate(self):
+        """진행자 화면은 다음 요청에서 그려진다 — 저장돼 있지 않으면 색을 칠할 수 없다."""
+        raw = json.dumps([dict(self.AMBIGUOUS, fills=[
+            {"gap": "기한", "value": "12월 5일", "source": "AI추정"},
+        ])], ensure_ascii=False)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value=raw):
+            decision_compiler.compile_meeting(self.meeting)
+        interpretation = Interpretation.objects.get()
+        self.assertEqual(interpretation.fills, [
+            {"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": ""},
+        ])
+
+
 class DecisionParseTests(TestCase):
     """통합 응답 파서(parse_items)의 스키마 검증과 근거 검증."""
 
@@ -2468,6 +2608,15 @@ class DecisionCompileTests(TestCase):
         self.assertEqual(
             Interpretation.objects.filter(decision__meeting=self.meeting, recommended=True).count(), 2)
 
+    def test_fake_mode_does_not_verify_candidates(self):
+        """가짜 모드는 LLM이 없어 다시 쓸 수 없다 — 검증 단계를 아예 타지 않는다(시연용 경로)."""
+        with patch.dict(os.environ, {}, clear=True):
+            summary = decision_compiler.compile_meeting(self.meeting)
+        self.assertEqual(
+            (summary["checked"], summary["regenerated"], summary["discarded"], summary["regenerate_failed"]),
+            (0, 0, 0, 0),
+        )
+
     def test_fake_mode_decisions_carry_evidence(self):
         """가짜 모드도 '원문: …'이 보이도록 결정마다 원문 인용을 담는다 — 시연에서 가장 중요한 칸이다."""
         with patch.dict(os.environ, {}, clear=True):
@@ -2630,6 +2779,316 @@ class DecisionAmbiguityHintTests(TestCase):
     def test_warning_context_is_empty_when_the_phrase_is_not_in_the_transcript(self):
         warning = "확정 문장에 모호한 표현이 있어요: '그쪽'"
         self.assertEqual(decision_compiler.warning_context("저쪽에 관한 이야기만 있는 원문입니다.", warning), "")
+
+
+class DecisionFillPromptTests(TestCase):
+    """빈칸 채우기를 허용한 프롬프트와 [회의 정보] 블록.
+
+    예전 프롬프트는 "원문에 없는 날짜·이름을 지어내지 마라"고 막아서, 기한이 없는 안건의 추천
+    문장이 "기한을 정한다"처럼 빈칸을 그대로 남겼다. 팀 합의로 채우기를 허용하고, 대신 무엇을
+    근거로 채웠는지 받아 진행자에게 표시한다.
+    """
+
+    SOURCE = "로그는 일단 한 달 정도면 충분할 것 같은데요."
+    AMBIGUOUS = {
+        "topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
+        "evidence": "로그는 일단 한 달 정도면 충분할 것 같은데요.",
+        "candidate": "민수가 12월 5일까지 30일로 바꾼다",
+    }
+
+    def setUp(self):
+        self.host = User.objects.create_user("민수", password="pw12345!")
+        self.member = User.objects.create_user("지은", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host, self.member)
+        self.earlier = Meeting.objects.create(team=self.team, title="지난 회의", host=self.host)
+        self.carried = Decision.objects.create(
+            meeting=self.earlier, order=0, what="회식 장소", status=Decision.STATUS_UNDECIDED,
+            marked_undecided=True, divergence_reason="후보가 두 곳 남았어요",
+            final_text="회식 장소 — 이번 회의에서 결론이 나지 않았음 (다음 회의로)",
+        )
+        self.meeting = Meeting.objects.create(
+            team=self.team, title="m", host=self.host, deadline=timezone.localdate() + timedelta(days=3),
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+        self.meeting.participants.add(self.host, self.member)
+
+    def test_the_prompt_no_longer_forbids_filling_in_missing_values(self):
+        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        self.assertNotIn("원문에 없는 날짜·이름을 지어내지 말고", prompt)
+        self.assertNotIn("단톡방에서 정한다", prompt)
+        self.assertIn("가장 그럴듯한 값", prompt)
+
+    def test_the_prompt_asks_for_fills_with_a_source(self):
+        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        for token in ('"fills"', '"gap"', '"source"', "원문|회의정보|AI추정"):
+            self.assertIn(token, prompt)
+
+    def test_the_meeting_info_block_carries_date_participants_deadline_and_carryover(self):
+        block = decision_compiler._meeting_info_block(decision_compiler.collect_meeting_info(self.meeting))
+        at = timezone.localtime(self.meeting.created_at)
+        self.assertIn("[회의 정보]", block)
+        self.assertIn(str(at.year), block)
+        self.assertIn("(%s)" % "월화수목금토일"[at.weekday()], block)
+        self.assertIn("민수", block)
+        self.assertIn("지은", block)
+        self.assertIn(str(self.meeting.deadline), block)
+        self.assertIn("지난 회의 미결정", block)
+        self.assertIn(self.carried.what, block)
+        # 전사본이 이름을 못 받아 "화자 A"로 적힌 경우를 AI가 참석자와 연결할 수 있게 한다.
+        self.assertIn("화자 A", block)
+
+    def test_the_prompt_works_without_a_meeting(self):
+        """회의 없이 프롬프트만 만드는 기존 호출(테스트·실험)이 그대로 동작해야 한다."""
+        self.assertNotIn("[회의 정보]", decision_compiler._compile_prompt(self.SOURCE))
+
+    def test_compile_sends_the_meeting_info_block_in_the_prompt(self):
+        raw = json.dumps([self.AMBIGUOUS], ensure_ascii=False)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", return_value=raw) as gen:
+            decision_compiler.compile_meeting(self.meeting)
+        prompt = gen.call_args_list[0][0][0]
+        self.assertIn("[회의 정보]", prompt)
+        self.assertIn("지은", prompt)
+
+    def test_a_meeting_info_value_counts_as_a_proven_source(self):
+        """참석자 이름으로 담당을 채웠다면 그것은 추정이 아니다 — 회의 정보에 있는 값이다."""
+        raw = json.dumps([dict(self.AMBIGUOUS, fills=[
+            {"gap": "담당", "value": "지은", "source": "회의정보"},
+            {"gap": "기한", "value": "12월 5일", "source": "회의정보"},
+        ])], ensure_ascii=False)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value=raw):
+            decision_compiler.compile_meeting(self.meeting)
+        self.assertEqual(
+            [f["source"] for f in Interpretation.objects.get().fills], ["회의정보", "AI추정"],
+        )
+
+
+class DecisionRefineTests(TestCase):
+    """추천 문장 검증 → 걸린 것만 1회 재생성 → 그래도 걸리면 폐기(decision_refine).
+
+    빈칸 채우기를 허용하면 AI는 두 방향으로 미끄러진다 — 아무것도 못 채우고 근거를 그대로
+    옮겨 쓰거나, 서로 다른 안건에 같은 문장을 붙인다. 진행자에게 내보내기 전에 서버가 되짚는다.
+    """
+
+    SOURCE = ("로그 보관 얘기를 해 봅시다. "
+              "로그는 일단 한 달 정도면 충분할 것 같은데요. "
+              "그럼 그렇게 하죠. "
+              "발표 자료는 누가 할까요.")
+    EVIDENCE = "로그는 일단 한 달 정도면 충분할 것 같은데요."
+    FILLED = "민수가 12월 5일까지 로그 보관 기간을 30일로 바꾼다"
+    INFO = {"date": "2026년 11월 18일 (수)", "participants": ["민수", "지은"],
+            "deadline": "2026-11-21", "carryover": []}
+
+    def _item(self, candidate, topic="로그 보관 기간", evidence=None, fills=None, final=""):
+        return {
+            "topic": topic, "ambiguous": not final, "impact": "", "why": "갈립니다",
+            "fills": fills if fills is not None else [],
+            "final": final, "evidence": evidence if evidence is not None else self.EVIDENCE,
+            "candidates": ([{"text": candidate, "evidence": "", "recommended": True}]
+                           if candidate else []),
+            "draft_hint": "",
+        }
+
+    def _refine(self, items, *responses):
+        """재생성 응답을 흉내내며 refine_candidates를 돌리고 (결과, 호출 mock)을 돌려준다."""
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=list(responses) or OSError("no call")) as gen:
+            refined = decision_refine.refine_candidates(items, self.SOURCE, self.INFO)
+        return refined, gen
+
+    def _response(self, *rows):
+        return json.dumps(list(rows), ensure_ascii=False)
+
+    # ---- 걸린 게 없으면 부르지 않는다 ----
+
+    def test_a_passing_candidate_does_not_call_the_llm(self):
+        refined, gen = self._refine([self._item(self.FILLED)])
+        gen.assert_not_called()
+        self.assertEqual(refined[0]["candidates"][0]["text"], self.FILLED)
+
+    def test_a_clear_item_is_not_checked(self):
+        """바로 공개되는 항목의 확정 문장은 원문 기준 그대로다 — 이 단계가 건드리지 않는다."""
+        item = self._item("", final="민수가 금요일까지 배포한다")
+        refined, gen = self._refine([item])
+        gen.assert_not_called()
+        self.assertEqual(refined[0]["final"], "민수가 금요일까지 배포한다")
+
+    # ---- 재생성 ----
+
+    def test_a_copied_candidate_is_regenerated_once_and_kept(self):
+        rewritten = "지은이 2026-11-21까지 로그 보관 기간을 30일로 줄인다"
+        refined, gen = self._refine(
+            [self._item(self.EVIDENCE)],
+            self._response({"n": 1, "candidate": rewritten,
+                            "fills": [{"gap": "담당", "value": "지은", "source": "회의정보"}]}),
+        )
+        self.assertEqual(gen.call_count, 1)
+        self.assertEqual(refined[0]["candidates"][0]["text"], rewritten)
+        self.assertEqual(refined[0]["fills"], [
+            {"gap": "담당", "value": "지은", "source": "회의정보", "quote": ""},
+        ])
+        self.assertTrue(refined[0]["check"]["regenerated"])
+        self.assertFalse(refined[0]["check"]["discarded"])
+
+    def test_the_refine_prompt_carries_the_reasons_context_and_other_sentences(self):
+        other = "지은이 11월 20일까지 발표 자료를 만든다"
+        items = [self._item(self.EVIDENCE), self._item(other, topic="발표 자료",
+                                                       evidence="발표 자료는 누가 할까요.")]
+        _, gen = self._refine(items, self._response({"n": 1, "candidate": self.FILLED}))
+        prompt = gen.call_args_list[0][0][0]
+        self.assertIn(decision_checks.REASON_COPIED, prompt)
+        # 근거 앞뒤 대화를 함께 줘야 AI가 무엇을 채울 수 있는지 보인다(context_around).
+        self.assertIn("로그 보관 얘기를 해 봅시다.", prompt)
+        # 이미 쓴 다른 결정 문장을 줘서 같은 문장을 또 쓰지 않게 한다.
+        self.assertIn(other, prompt)
+        self.assertIn("[회의 정보]", prompt)
+
+    def test_only_the_flagged_items_are_sent_for_regeneration(self):
+        items = [self._item(self.FILLED), self._item(self.EVIDENCE, topic="로그 보관")]
+        _, gen = self._refine(items, self._response({"n": 1, "candidate": "지은이 30일로 줄인다"}))
+        prompt = gen.call_args_list[0][0][0]
+        self.assertIn("로그 보관", prompt)
+        self.assertNotIn(self.FILLED, prompt.split("[회의 정보]")[0])
+
+    def test_the_llm_is_called_once_even_with_several_flagged_items(self):
+        items = [self._item(self.EVIDENCE), self._item(self.EVIDENCE, topic="로그 보관")]
+        _, gen = self._refine(
+            items,
+            self._response({"n": 1, "candidate": "민수가 30일로 줄인다"},
+                           {"n": 2, "candidate": "지은이 90일로 늘린다"}),
+        )
+        self.assertEqual(gen.call_count, 1)
+
+    # ---- 폐기 ----
+
+    def test_a_candidate_that_fails_twice_is_discarded_into_the_custom_flow(self):
+        refined, _ = self._refine(
+            [self._item(self.EVIDENCE)],
+            self._response({"n": 1, "candidate": self.EVIDENCE}),
+        )
+        self.assertEqual(refined[0]["candidates"], [])
+        self.assertTrue(refined[0]["check"]["discarded"])
+        # 진행자가 맨 빈칸에서 시작하지 않게 폐기한 문장을 '직접 쓰기'의 출발점으로 남긴다.
+        self.assertTrue(refined[0]["draft_hint"])
+
+    def test_a_discarded_candidate_drops_its_fills(self):
+        """폐기한 문장의 채운 값이 남으면 화면이 없는 문장에 색을 칠하려 한다."""
+        item = self._item(self.EVIDENCE, fills=[{"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": ""}])
+        refined, _ = self._refine([item], self._response({"n": 1, "candidate": self.EVIDENCE}))
+        self.assertEqual(refined[0]["fills"], [])
+
+    # ---- 재생성 자체가 실패했을 때 ----
+
+    def test_a_failed_regeneration_call_keeps_the_original_candidate(self):
+        """AI 연결이 끊겼다는 이유로 진행자 화면을 비우면 손해가 더 크다 — 원본을 남긴다."""
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=OSError("down")):
+            refined = decision_refine.refine_candidates([self._item(self.EVIDENCE)], self.SOURCE, self.INFO)
+        self.assertEqual(refined[0]["candidates"][0]["text"], self.EVIDENCE)
+        self.assertTrue(refined[0]["check"]["kept"])
+        self.assertFalse(refined[0]["check"]["discarded"])
+
+    def test_an_unreadable_regeneration_response_keeps_the_original_candidate(self):
+        refined, _ = self._refine([self._item(self.EVIDENCE)], "JSON이 아닌 답")
+        self.assertEqual(refined[0]["candidates"][0]["text"], self.EVIDENCE)
+        self.assertTrue(refined[0]["check"]["kept"])
+
+    def test_a_rewritten_sentence_with_a_vague_phrase_is_not_accepted(self):
+        """다시 쓴 문장에 모호어가 남으면 고를 의미가 없다 — 첫 추출 때와 같은 기준이다."""
+        refined, _ = self._refine([self._item(self.EVIDENCE)],
+                                  self._response({"n": 1, "candidate": "민수가 나중에 30일로 바꾼다"}))
+        self.assertEqual(refined[0]["candidates"], [])
+        self.assertTrue(refined[0]["check"]["discarded"])
+
+    # ---- 기록 ----
+
+    def _three_item_meeting(self):
+        """통과 1건 + 재생성 성공 1건 + 폐기 1건이 나오는 회의와 응답 두 개."""
+        host = User.objects.create_user("민수", password="pw12345!")
+        team = Team.objects.create(name="t")
+        team.members.add(host)
+        meeting = Meeting.objects.create(
+            team=team, title="m", host=host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+        extracted = self._response(
+            {"topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
+             "evidence": self.EVIDENCE, "candidate": self.FILLED},
+            {"topic": "발표 자료", "ambiguous": True, "why": "담당이 없어요",
+             "evidence": "발표 자료는 누가 할까요.", "candidate": "발표 자료는 누가 할까요."},
+            {"topic": "안건 소개", "ambiguous": True, "why": "범위가 없어요",
+             "evidence": "로그 보관 얘기를 해 봅시다.", "candidate": "로그 보관 얘기를 해 봅시다."},
+        )
+        refined = self._response(
+            {"n": 1, "candidate": "민수가 11월 20일까지 발표 자료를 만든다"},
+            {"n": 2, "candidate": "로그 보관 얘기를 해 봅시다."},
+        )
+        return meeting, extracted, refined
+
+    def test_compile_meeting_reports_the_verification_counts(self):
+        """재생성 성공률을 보고 이 단계를 유지할지 정하려면 숫자가 남아야 한다."""
+        meeting, extracted, refined = self._three_item_meeting()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, refined]):
+            summary = decision_compiler.compile_meeting(meeting)
+        self.assertEqual(
+            (summary["checked"], summary["regenerated"], summary["discarded"], summary["regenerate_failed"]),
+            (3, 1, 1, 0),
+        )
+
+    def test_the_verification_result_is_logged(self):
+        meeting, extracted, refined = self._three_item_meeting()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, refined]),              self.assertLogs("meetalign.decision_refine", level="INFO") as logs:
+            decision_compiler.compile_meeting(meeting)
+        recorded = chr(10).join(logs.output)
+        self.assertIn("추천 문장 검증", recorded)
+        self.assertIn(decision_checks.REASON_COPIED, recorded)
+        self.assertIn("재생성 성공", recorded)
+        self.assertIn("폐기", recorded)
+
+    def test_a_failed_regeneration_is_recorded_as_keeping_the_original(self):
+        host = User.objects.create_user("민수", password="pw12345!")
+        team = Team.objects.create(name="t")
+        team.members.add(host)
+        meeting = Meeting.objects.create(
+            team=team, title="m", host=host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+        extracted = self._response({
+            "topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
+            "evidence": self.EVIDENCE, "candidate": self.EVIDENCE,
+        })
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, OSError("down")]),              self.assertLogs("meetalign.decision_refine", level="INFO") as logs:
+            summary = decision_compiler.compile_meeting(meeting)
+        self.assertEqual((summary["checked"], summary["regenerate_failed"], summary["discarded"]), (1, 1, 0))
+        self.assertIn("재생성 실패로 원본 유지", chr(10).join(logs.output))
+        self.assertEqual(Interpretation.objects.get().text, self.EVIDENCE)
+
+    # ---- 추출 흐름에 붙어 있는지 ----
+
+    def test_compile_saves_the_rewritten_sentence(self):
+        """compile_specs가 저장 전에 이 단계를 거친다 — AI를 두 번 부른다(추출 1 + 재생성 1)."""
+        host = User.objects.create_user("민수", password="pw12345!")
+        team = Team.objects.create(name="t")
+        team.members.add(host)
+        meeting = Meeting.objects.create(
+            team=team, title="m", host=host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+        extracted = self._response({
+            "topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
+            "evidence": self.EVIDENCE, "candidate": self.EVIDENCE,
+        })
+        rewritten = "민수가 12월 5일까지 로그 보관 기간을 30일로 줄인다"
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, self._response(
+                 {"n": 1, "candidate": rewritten})]) as gen:
+            decision_compiler.compile_meeting(meeting)
+        self.assertEqual(gen.call_count, 2)
+        self.assertEqual(Interpretation.objects.get().text, rewritten)
+
+    def test_a_missing_row_in_the_regeneration_response_keeps_that_candidate(self):
+        items = [self._item(self.EVIDENCE), self._item(self.EVIDENCE, topic="로그 보관")]
+        refined, _ = self._refine(items, self._response({"n": 1, "candidate": self.FILLED}))
+        self.assertEqual(refined[0]["candidates"][0]["text"], self.FILLED)
+        self.assertEqual(refined[1]["candidates"][0]["text"], self.EVIDENCE)
+        self.assertTrue(refined[1]["check"]["kept"])
 
 
 class DecisionReviewTests(TestCase):
@@ -2965,6 +3424,109 @@ class DecisionReviewTests(TestCase):
         self.assertEqual(decision.who, "")
         self.assertEqual(decision.what, before)
         self.assertEqual(decision.due_text, "")
+
+
+class DecisionFillDisplayTests(TestCase):
+    """AI가 추정으로 채운 값을 진행자 화면에서 색으로 표시하기.
+
+    채우기를 허용한 대가로, 진행자는 어디가 회의에서 정해진 것이고 어디가 AI의 짐작인지
+    구분할 수 있어야 한다. 원문·회의정보에서 가져온 값은 표시하지 않는다 — 전부 칠하면
+    아무것도 칠하지 않은 것과 같다.
+    """
+
+    GUESS = {"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": ""}
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.member = User.objects.create_user("member", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host, self.member)
+        self.meeting = Meeting.objects.create(
+            team=self.team, title="m", host=self.host, processing_status=Meeting.STATUS_DONE,
+            transcript="로그는 한 달 정도면 충분할 것 같은데요.",
+        )
+        self.decision = Decision.objects.create(
+            meeting=self.meeting, order=0, what="로그 보관 기간",
+            divergence_reason="30일인지 90일인지 갈립니다",
+            evidence="로그는 한 달 정도면 충분할 것 같은데요.",
+        )
+        self.url = reverse("decision_review", args=[self.meeting.id])
+        self.client.force_login(self.host)
+
+    def _candidate(self, text="민수가 12월 5일까지 30일로 바꾼다", fills=None):
+        return Interpretation.objects.create(
+            decision=self.decision, order=0, text=text, recommended=True,
+            fills=[self.GUESS] if fills is None else fills,
+        )
+
+    # ---- 문장 쪼개기(순수 함수) ----
+
+    def test_fill_segments_marks_only_the_estimated_values(self):
+        self.assertEqual(
+            decision_checks.fill_segments("민수가 12월 5일까지 바꾼다", ["12월 5일"]),
+            [{"text": "민수가 ", "estimated": False},
+             {"text": "12월 5일", "estimated": True},
+             {"text": "까지 바꾼다", "estimated": False}],
+        )
+
+    def test_fill_segments_handles_regex_characters_in_a_value(self):
+        segments = decision_checks.fill_segments("범위는 A/B(주) 두 개", ["A/B(주)"])
+        self.assertEqual([seg["text"] for seg in segments if seg["estimated"]], ["A/B(주)"])
+
+    def test_fill_segments_leaves_the_sentence_whole_when_the_value_is_absent(self):
+        """AI가 문장과 다른 표기로 value를 보낼 수 있다 — 칠할 자리가 없으면 그냥 한 조각이다."""
+        self.assertEqual(
+            decision_checks.fill_segments("민수가 바꾼다", ["12월 5일"]),
+            [{"text": "민수가 바꾼다", "estimated": False}],
+        )
+
+    def test_fill_segments_without_any_value(self):
+        self.assertEqual(decision_checks.fill_segments("민수가 바꾼다", []),
+                         [{"text": "민수가 바꾼다", "estimated": False}])
+
+    # ---- 진행자 화면 ----
+
+    def test_the_host_screen_highlights_a_guessed_value_and_warns_once(self):
+        self._candidate()
+        response = self.client.get(self.url)
+        self.assertContains(response, 'class="ai-fill"')
+        self.assertContains(response, "12월 5일")
+        self.assertContains(response, "AI가 추정한 값이 있어요: 기한")
+
+    def test_proven_values_are_not_marked(self):
+        self._candidate(fills=[
+            {"gap": "담당", "value": "민수", "source": "원문", "quote": "민수가 할게요"},
+            {"gap": "기한", "value": "12월 5일", "source": "회의정보", "quote": ""},
+        ])
+        response = self.client.get(self.url)
+        self.assertNotContains(response, 'class="ai-fill"')
+        self.assertNotContains(response, "AI가 추정한 값이 있어요")
+
+    def test_a_candidate_without_fills_looks_the_same_as_before(self):
+        """이 기능 전에 추출한 결정(fills가 빈 목록)도 그대로 보여야 한다."""
+        self._candidate(fills=[])
+        response = self.client.get(self.url)
+        self.assertContains(response, "민수가 12월 5일까지 30일로 바꾼다")
+        self.assertNotContains(response, 'class="ai-fill"')
+
+    def test_a_value_with_html_is_escaped(self):
+        self._candidate(text="민수가 <b>x</b>까지 바꾼다",
+                        fills=[{"gap": "기한", "value": "<b>x</b>", "source": "AI추정", "quote": ""}])
+        response = self.client.get(self.url)
+        self.assertNotContains(response, "<b>x</b>")
+        self.assertContains(response, "&lt;b&gt;x&lt;/b&gt;")
+
+    def test_the_team_screen_never_shows_the_fill_markup(self):
+        """팀원은 확정 문장 하나만 본다 — AI가 어디를 짐작했는지는 진행자만 본다."""
+        self._candidate()
+        self.decision.final_text = "민수가 12월 5일까지 30일로 바꾼다"
+        self.decision.status = Decision.STATUS_PUBLISHED
+        self.decision.save()
+        client = Client()
+        client.force_login(self.member)
+        response = client.get(reverse("decision_ack", args=[self.meeting.id]))
+        self.assertNotContains(response, 'class="ai-fill"')
+        self.assertNotContains(response, "AI가 추정한 값이 있어요")
 
 
 class DecisionEntryLinkTests(TestCase):

@@ -40,8 +40,9 @@ import json
 import re
 
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 
-from . import services
+from . import decision_checks, services
 from .models import Decision, Interpretation
 
 # 결정 하나에 보여줄 AI 확정 문장 수. 가장 추천하는 하나만 보여준다 — 후보 여러 개를 읽고 비교하는
@@ -221,7 +222,76 @@ def _review_hints(source):
     return [s for s in sentences if any(phrase in s for phrase in hint_phrases)]
 
 
-def _compile_prompt(source):
+# candidate의 빈칸을 어떻게 채울지. 예전에는 "원문에 없는 날짜·이름을 지어내지 마라"로 막았는데,
+# 그러면 기한이 안 정해진 안건의 추천 문장이 "기한을 정한다"처럼 빈칸을 그대로 남겨서 진행자가 고를
+# 것이 없었다. 팀 합의로 채우기를 허용하고, 대신 무엇을 근거로 채웠는지(fills) 받아서 표시한다.
+# 프롬프트 본문과 따로 둔 이유: 이 파일의 호출 흐름을 같은 시기에 다른 작업자가 고치고 있어서,
+# 새 문구가 기존 프롬프트 한가운데에 끼어들지 않게 한 줄로만 끼운다.
+FILL_RULES = (
+    "  빠진 담당·기한·범위·선택지는 위에 주어진 회의 정보와 원문 맥락에서 가장 그럴듯한 값으로 채워서 실행 문장을 "
+    "완성하라 — 빈칸이나 \"정한다\"로 남기지 마라. 채울 근거가 전혀 없을 때만 누가 정하는지와 언제까지 "
+    "정하는지가 들어간 문장으로 쓴다.\n"
+    "  채운 자리마다 fills에 한 줄씩 남겨라. gap은 기한|담당|범위|선택지 중 하나, value는 채운 값, "
+    "source는 원문|회의정보|AI추정 중 하나다. source가 \"원문\"이면 quote에 그 근거가 된 전사본 구절을 "
+    "토씨 하나 틀리지 않고 그대로 복사해라 — 서버가 전사본과 대조해서 찾지 못하면 \"AI추정\"으로 바꾼다. "
+    "회의 정보(참석자·날짜·마감일·지난 회의 안건)에서 가져온 값은 \"회의정보\", 맥락으로 미뤄 짚은 값은 "
+    "\"AI추정\"이다.\n"
+)
+
+# JSON 형식 안내 뒤에 붙는 한 줄. 애매 항목에만 쓴다.
+FILLS_SCHEMA_EXAMPLE = (
+    'ambiguous: true 항목에는 "fills"를 함께 담아라: '
+    '"fills": [{"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": ""}]\n'
+)
+
+
+def collect_meeting_info(meeting):
+    """프롬프트에 함께 보낼 회의 정보 — 전사본에 없지만 빈칸을 채울 때 근거가 되는 것들.
+
+    "다음 주 금요일까지"를 날짜로 옮기려면 회의가 언제 열렸는지 알아야 하고, "자료는 제가
+    맡을게요"의 담당자를 적으려면 참석자가 누구인지 알아야 한다. 전사본만으로는 둘 다 알 수 없다.
+
+    여기서 돌려준 값은 두 군데서 쓴다 — 프롬프트의 [회의 정보] 블록(_meeting_info_block)과,
+    AI가 "회의정보에서 가져왔다"고 주장한 값의 대조(_info_text).
+    """
+    at = timezone.localtime(meeting.created_at)
+    return {
+        "date": "%d년 %d월 %d일 (%s)" % (at.year, at.month, at.day, "월화수목금토일"[at.weekday()]),
+        "participants": _participant_names(meeting),
+        "deadline": str(meeting.deadline) if meeting.deadline else "",
+        "carryover": [
+            "%s — %s" % (decision.what, decision.undecided_reason)
+            for decision in carryover_decisions(meeting)
+        ],
+    }
+
+
+def _meeting_info_block(meeting_info):
+    """프롬프트에 끼울 [회의 정보] 조각. collect_meeting_info()의 dict를 받는다.
+
+    모델이 아니라 dict를 받는 이유: 재생성 프롬프트(decision_refine)가 같은 블록을 다시 쓰는데,
+    거기서 회의를 또 조회하면 이월 안건 쿼리가 회의마다 두 번 돈다.
+    """
+    if not meeting_info:
+        return ""
+    lines = ["[회의 정보]", "- 회의가 열린 날: %s" % meeting_info["date"]]
+    if meeting_info["participants"]:
+        lines.append("- 참석자: %s" % ", ".join(meeting_info["participants"]))
+        # 화자 분리가 이름을 못 받아내면 전사본에 "화자 A"로 적힌다. 그 사람이 참석자 중 한 명이라는
+        # 것은 알려 주되, 누구인지 단정하지는 말게 한다.
+        lines.append(
+            "- 전사본에 \"화자 A\", \"화자 B\"처럼 적힌 발화자는 위 참석자 중 한 명이다. "
+            "누구인지 분명하지 않으면 확정 문장에 이름을 적지 마라."
+        )
+    if meeting_info["deadline"]:
+        lines.append("- 이 회의의 마감일: %s" % meeting_info["deadline"])
+    if meeting_info["carryover"]:
+        lines.append("- 지난 회의 미결정 안건(이번에 다시 다뤄질 수 있다):")
+        lines.extend("  · %s" % row for row in meeting_info["carryover"])
+    return "\n" + "\n".join(lines) + "\n"
+
+
+def _compile_prompt(source, meeting_info=None):
     """'결정'만 찾게 하면 "최대한 빨리 할게요" 같은 약속이나 "이따 단톡에서 정해요"로 미룬 안건이 검사 대상에서
     빠지고, '다르게 이해될 수 있나'만 물으면 미룬 것을 '미루기로 확정'으로 읽는다. 그래서 실행 항목을 빠짐없이 뽑게
     한 뒤 점검표로 하나씩 대조하게 한다. 애매한 결정 4개·5개를 심은 합성 회의 두 개에서 기존 프롬프트는 4개 중
@@ -241,7 +311,7 @@ def _compile_prompt(source):
         "다음은 회의 녹음의 녹취 원문이다. 회의가 끝난 뒤 팀원들이 각자 움직이려면 무엇을 알아야 하는지 기준으로 "
         "이 회의의 '실행 항목'을 빠짐없이 뽑고, 항목마다 팀원들이 다르게 이해하거나 다르게 행동할 수 있는지 "
         "판단하라.\n"
-        + hint_block +
+        + _meeting_info_block(meeting_info) + hint_block +
         "\n실행 항목에 넣을 것(하나도 빠뜨리지 마라):\n"
         "- 확정된 결정 (예: 주제, 역할 분담)\n"
         "- 누군가 하겠다고 한 일 (예: \"자료는 제가 찾아볼게요\", \"단톡방은 제가 만들게요\")\n"
@@ -282,10 +352,8 @@ def _compile_prompt(source):
         "뒤의 합의로 해결된 문제나, 회의에서 하지 말거나 기다리기로 정한 일을 하지 않는 것을 위험으로 "
         "적지 마라. 원문에 없는 이름이나 결과를 지어내지 마라. 명시적으로 미룬 안건에서 구체적 영향이 "
         "없으면 빈 문자열로 둔다.\n"
-        "  candidate에 진행자에게 가장 추천하는 '그대로 공개될 확정 문장' 하나만 쓴다. 빠진 부분을 원문 흐름상 "
-        "가장 그럴듯한 쪽으로 채운 실행 문장이다. 원문에 없는 날짜·이름을 지어내지 말고, 원문에 나온 날짜·요일·"
-        "시간·장소 안에서만 고른다. 채울 근거가 원문에 전혀 없으면 \"~은 다음 회의 전까지 단톡방에서 정한다\"처럼 "
-        "정하는 방법을 확정하는 문장을 쓴다.\n"
+        "  candidate에 진행자에게 가장 추천하는 '그대로 공개될 확정 문장' 하나만 쓴다.\n"
+        + FILL_RULES +
         "ambiguous: false 항목:\n"
         "  final에 '그대로 공개될 확정 문장' 하나를 쓴다. candidate는 쓰지 않는다.\n\n"
         "확정 문장(final, candidates의 text) 규칙: 그 문장이 팀원에게 그대로 공개된다. 누가·무엇을·언제까지가 "
@@ -298,8 +366,9 @@ def _compile_prompt(source):
         "반드시 아래 JSON 배열 형식으로만 답하라. 설명이나 코드블록 표시 없이 JSON만 출력하라:\n"
         '[{"topic": "안건 한 줄", "ambiguous": true, "why": "왜 갈릴 수 있나", "impact": "팀원의 행동이 어떻게 갈릴 수 있나", '
         '"evidence": "이 안건이 나온 원문 문장", "candidate": "가장 추천하는 확정 문장"}, '
-        '{"topic": "안건 한 줄", "ambiguous": false, "final": "확정 문장", "evidence": "근거가 된 원문 문장"}]\n\n'
-        "전사본:\n" + source
+        '{"topic": "안건 한 줄", "ambiguous": false, "final": "확정 문장", "evidence": "근거가 된 원문 문장"}]\n'
+        + FILLS_SCHEMA_EXAMPLE +
+        "\n전사본:\n" + source
     )
 
 
@@ -326,16 +395,26 @@ def _generate_parsed(prompt, parser, what_failed):
     )
 
 
-def compile_specs(source):
-    """녹취 원문 → [응답 항목, ...]. LLM이 없거나 연결이 안 되면 가짜 응답을 돌려준다."""
+def compile_specs(source, meeting=None):
+    """녹취 원문 → [응답 항목, ...]. LLM이 없거나 연결이 안 되면 가짜 응답을 돌려준다.
+
+    meeting을 주면 회의 정보(날짜·참석자·마감일·이월 안건)를 프롬프트에 함께 보내고, AI가 채운
+    값의 출처를 그 정보와 대조한다.
+    """
+    meeting_info = collect_meeting_info(meeting) if meeting is not None else None
     if not (services._enabled() and source):
         return parse_items(json.dumps(FAKE_DECISIONS))
     items = _generate_parsed(
-        _compile_prompt(source), lambda raw: parse_items(raw, source_text=source), "결정",
+        _compile_prompt(source, meeting_info),
+        lambda raw: parse_items(raw, source_text=source, meeting_info=meeting_info), "결정",
     )
     if items is None:
         return parse_items(json.dumps(FAKE_DECISIONS))
-    return items
+    # 추천 문장을 진행자에게 내보내기 전에 되짚는다(검증 → 1회 재생성 → 폐기). 가짜 응답 경로에는
+    # 붙이지 않는다 — LLM이 없어 다시 쓸 수 없고, 가짜 모드는 화면 시연용이다.
+    # import를 함수 안에서 하는 이유: decision_refine이 이 모듈을 쓰므로 위에서 부르면 순환 import다.
+    from . import decision_refine
+    return decision_refine.refine_candidates(items, source, meeting_info)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +492,30 @@ def _legacy_candidate_evidence(raw_candidates, normalized_source):
     return ""
 
 
-def parse_items(raw, source_text=None):
+def _info_text(meeting_info):
+    """회의 정보를 한 덩어리 문자열로 — fills의 "회의정보" 출처를 대조할 때 쓴다.
+
+    collect_meeting_info()가 만든 dict를 받는다. 비어 있으면 빈 문자열이고, 그러면 "회의정보"라고
+    주장한 값은 전부 추정으로 내려간다(대조할 것이 없으니 증명되지 않았다).
+    """
+    if not meeting_info:
+        return ""
+    parts = []
+    for value in meeting_info.values():
+        parts.extend(value if isinstance(value, (list, tuple)) else [value])
+    return " / ".join(str(part) for part in parts if part)
+
+
+def parse_fills(row, source=None, meeting_info=None):
+    """응답 한 줄에서 AI가 채운 값(fills)을 읽어 출처까지 검증한다.
+
+    검증 규칙은 decision_checks.verify_fill_sources에 있다 — 모델도 네트워크도 모르는 순수 함수라
+    같은 입력이면 늘 같은 결과가 나온다. 여기서는 회의 정보를 문자열로 펴 주기만 한다.
+    """
+    return decision_checks.verify_fill_sources(row.get("fills"), source, _info_text(meeting_info))
+
+
+def parse_items(raw, source_text=None, meeting_info=None):
     """LLM 응답 → 안건별 모호 여부, 사유, 행동 영향, 문장과 원문 근거.
 
     한 번의 호출로 받은 응답을 전부 여기서 읽는다. 항목 하나의 형식이 틀렸다고 나머지를
@@ -462,6 +564,8 @@ def parse_items(raw, source_text=None):
             "ambiguous": ambiguous,
             "impact": " ".join(impact.split()) if ambiguous and isinstance(impact, str) else "",
             "why": str(row.get("why", "")).strip() if ambiguous else "",
+            # 바로 공개되는 명확 항목은 원문 기준을 그대로 쓴다 — 채운 값이라는 개념이 없다.
+            "fills": parse_fills(row, source_text, meeting_info) if ambiguous else [],
             "final": final,
             "evidence": evidence,
             "candidates": candidates,
@@ -499,10 +603,14 @@ def _dedupe_items(items):
 def compile_meeting(meeting):
     """회의 녹취 원문을 추출해 Decision/Interpretation을 저장하고 요약을 돌려준다.
 
-    {"decisions": n, "ambiguous": n, "few_candidates": n}
+    {"decisions": n, "ambiguous": n, "few_candidates": n,
+     "checked": n, "regenerated": n, "discarded": n, "regenerate_failed": n}
     - ambiguous: 진행자가 확인해야 하는 항목 수(AI가 갈린다고 봤거나 규칙이 걸린 것)
     - few_candidates: 확인이 필요한데 AI 추천 문장이 없는 항목 수. AI가 문장을 못 만들었거나
       모호어가 남아 버려진 경우다 — 진행자는 직접 쓰기나 '다음 회의로 넘김'으로만 처리할 수 있다.
+    - 뒤의 네 칸은 추천 문장 검증 결과다(decision_refine). 나중에 재생성 성공률을 보고 이 단계를
+      유지할지 정하려고 남긴다. checked는 검사한 추천 문장 수, regenerate_failed는 재생성 호출이
+      실패해서 원본을 그대로 남긴 수다(폐기와 구분한다). 가짜 응답 모드에서는 모두 0이다.
 
     이미 Decision이 있는 회의는 건드리지 않는다(공개 뒤에 결정이 바뀌면 팀원이 확인한 내용과
     달라진다). 다시 추출하려면 호출 전에 draft 상태인 Decision을 지워야 한다.
@@ -510,7 +618,7 @@ def compile_meeting(meeting):
     if meeting.decisions.exists():
         raise DecisionCompileError("이미 결정 사항을 추출한 회의입니다. 다시 하려면 기존 결정을 먼저 지워 주세요.")
     source = meeting.transcript
-    items = compile_specs(source)
+    items = compile_specs(source, meeting)
     if not items:
         raise DecisionCompileError("녹취 원문에서 공개할 결정을 찾지 못했습니다.")
 
@@ -523,10 +631,15 @@ def compile_meeting(meeting):
         # 있으므로 두 요청이 모두 빈 상태를 보고 통과해 같은 order를 쓰려 한다. 먼저 저장한
         # 쪽의 결과를 그대로 두고, 늦게 온 쪽에는 사유를 보여준다(500 대신).
         raise DecisionCompileError("이미 결정 사항을 추출한 회의입니다. 화면을 새로 고쳐 주세요.")
+    checks = [item["check"] for item in items if "check" in item]
     return {
         "decisions": len(items),
         "ambiguous": ambiguous_count,
         "few_candidates": few_candidates,
+        "checked": len(checks),
+        "regenerated": sum(1 for check in checks if check["regenerated"]),
+        "discarded": sum(1 for check in checks if check["discarded"]),
+        "regenerate_failed": sum(1 for check in checks if check["kept"]),
     }
 
 
@@ -559,6 +672,8 @@ def _save_items(meeting, items):
                     decision=decision, order=candidate_order,
                     text=candidate["text"], evidence=candidate["evidence"],
                     recommended=candidate["recommended"],
+                    # 채운 값은 추천 문장 하나에 딸린 것이다(MAX_INTERPRETATIONS = 1).
+                    fills=item["fills"] if candidate_order == 0 else [],
                 )
             if decision.has_warning:
                 ambiguous_count += 1
