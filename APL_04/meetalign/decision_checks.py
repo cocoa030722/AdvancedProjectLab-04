@@ -82,7 +82,62 @@ def jaccard(left, right):
 
 
 # ---------------------------------------------------------------------------
-# ① 추천 문장 검사
+# ① AI가 채운 값의 출처
+# ---------------------------------------------------------------------------
+
+# AI가 주장할 수 있는 출처. 서버가 대조해서 증명된 것만 남기고 나머지는 전부 SOURCE_GUESS가 된다.
+SOURCE_QUOTE = "원문"
+SOURCE_INFO = "회의정보"
+SOURCE_GUESS = "AI추정"
+FILL_SOURCES = (SOURCE_QUOTE, SOURCE_INFO, SOURCE_GUESS)
+
+
+def verify_fill_sources(fills, source=None, info_text=""):
+    """AI가 보낸 fills를 네 칸짜리 dict 목록으로 정리하고, 증명되지 않은 출처는 '추정'으로 내린다.
+
+    AI는 "이건 원문에 있었다"면서 전사본에 없는 구절을 인용하기도 한다. 그 주장을 그대로 믿으면
+    진행자 화면이 "원문 근거 있음"이라고 거짓말을 하게 되므로, 서버가 대조한 것만 인정한다.
+    - "원문": quote를 전사본에서 찾을 수 있어야 한다.
+    - "회의정보": 그 값이 실제 회의 정보(참석자·날짜·마감일·이월 안건) 안에 있어야 한다.
+    - 그 밖의 값(모르는 라벨 포함): 추정.
+
+    source가 None이면 대조할 원문이 없다는 뜻이라(가짜 응답 모드) 형식만 맞추고 출처는 그대로 둔다 —
+    근거 검증을 건너뛰는 기존 파서 규칙과 같은 기준이다.
+
+    형식이 틀린 원소는 조용히 버린다. 항목 하나의 형식 때문에 회의 전체를 실패시키지 않는다.
+    """
+    if not isinstance(fills, list):
+        return []
+    trust_claim = source is None
+    in_source, in_info = squash(source), squash(info_text)
+    verified = []
+    for row in fills:
+        if not isinstance(row, dict):
+            continue
+        value = str(row.get("value", "")).strip()
+        if not value:
+            continue
+        claimed = str(row.get("source", "")).strip()
+        quote = str(row.get("quote", "")).strip()
+        if trust_claim:
+            proven = claimed in FILL_SOURCES
+        elif claimed == SOURCE_QUOTE:
+            proven = bool(quote) and squash(quote) in in_source
+        elif claimed == SOURCE_INFO:
+            proven = bool(in_info) and squash(value) in in_info
+        else:
+            proven = False
+        verified.append({
+            "gap": str(row.get("gap", "")).strip(),
+            "value": value,
+            "source": claimed if proven else SOURCE_GUESS,
+            "quote": quote,
+        })
+    return verified
+
+
+# ---------------------------------------------------------------------------
+# ② 추천 문장 검사
 # ---------------------------------------------------------------------------
 
 # 근거를 거의 그대로 옮겼다고 볼 선. 추천 문장은 근거를 바탕으로 쓰므로 어느 정도 겹치는 것이

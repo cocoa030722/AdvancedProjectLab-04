@@ -2085,6 +2085,98 @@ class DecisionCandidateCheckTests(TestCase):
         self.assertEqual([line for line in lines if line.startswith(("import ", "from "))], ["import re"])
 
 
+class DecisionFillSourceTests(TestCase):
+    """AI가 채운 값(fills)과 그 출처 — 서버가 검증해서 저장한다.
+
+    AI는 "이건 원문에 있었다"고 주장하면서 전사본에 없는 구절을 인용하기도 한다. 그 주장을
+    그대로 믿으면 진행자 화면이 "원문 근거 있음"이라고 거짓말을 하게 되므로 서버가 대조한다.
+    """
+
+    SOURCE = "로그는 일단 한 달 정도면 충분할 것 같은데요. 민수가 발표를 맡을게요."
+    AMBIGUOUS = {
+        "topic": "로그 보관 기간", "ambiguous": True, "why": "30일인지 90일인지 갈립니다",
+        "evidence": "로그는 일단 한 달 정도면 충분할 것 같은데요",
+        "candidate": "민수가 12월 5일까지 30일로 바꾼다",
+    }
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host)
+        self.meeting = Meeting.objects.create(
+            team=self.team, title="m", host=self.host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+
+    # ---- 출처 검증(순수 함수) ----
+
+    def test_a_quote_that_is_not_in_the_transcript_becomes_a_guess(self):
+        fills = [{"gap": "기한", "value": "12월 5일", "source": "원문", "quote": "12월 5일까지 하죠"}]
+        self.assertEqual(decision_checks.verify_fill_sources(fills, self.SOURCE)[0]["source"], "AI추정")
+
+    def test_a_quote_that_is_in_the_transcript_stays(self):
+        fills = [{"gap": "담당", "value": "민수", "source": "원문", "quote": "민수가 발표를 맡을게요"}]
+        verified = decision_checks.verify_fill_sources(fills, self.SOURCE)
+        self.assertEqual(verified[0]["source"], "원문")
+
+    def test_meeting_info_is_checked_against_the_real_meeting_info(self):
+        fills = [{"gap": "담당", "value": "민수", "source": "회의정보"},
+                 {"gap": "기한", "value": "12월 9일", "source": "회의정보"}]
+        verified = decision_checks.verify_fill_sources(fills, self.SOURCE, info_text="참석자: 민수, 지은")
+        self.assertEqual([f["source"] for f in verified], ["회의정보", "AI추정"])
+
+    def test_broken_fills_are_dropped_without_failing(self):
+        """항목 하나의 형식이 틀렸다고 회의 전체를 실패시키지 않는다 — 기존 파서와 같은 원칙이다."""
+        for broken in (None, "기한", [{"gap": "기한"}], ["문자열"], [{"value": ""}], 7):
+            self.assertEqual(decision_checks.verify_fill_sources(broken, self.SOURCE), [])
+
+    def test_an_unknown_source_label_becomes_a_guess(self):
+        fills = [{"gap": "범위", "value": "세 장", "source": "추측"}]
+        self.assertEqual(decision_checks.verify_fill_sources(fills, self.SOURCE)[0]["source"], "AI추정")
+
+    # ---- 응답 파싱 ----
+
+    def test_parse_items_keeps_verified_fills_for_ambiguous_items(self):
+        raw = json.dumps([dict(self.AMBIGUOUS, fills=[
+            {"gap": "기한", "value": "12월 5일", "source": "원문", "quote": "12월 5일까지 하죠"},
+        ])], ensure_ascii=False)
+        item = decision_compiler.parse_items(raw, source_text=self.SOURCE)[0]
+        # 인용이 전사본에 없으므로 AI추정으로 내려간다.
+        self.assertEqual(item["fills"], [
+            {"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": "12월 5일까지 하죠"},
+        ])
+
+    def test_a_clear_item_carries_no_fills(self):
+        """바로 공개되는 항목은 원문 기준을 그대로 쓴다 — 채운 값이라는 개념이 없다."""
+        raw = json.dumps([{
+            "topic": "발표", "ambiguous": False, "final": "민수가 발표를 맡는다",
+            "evidence": "민수가 발표를 맡을게요",
+            "fills": [{"gap": "담당", "value": "민수", "source": "AI추정"}],
+        }], ensure_ascii=False)
+        self.assertEqual(decision_compiler.parse_items(raw, source_text=self.SOURCE)[0]["fills"], [])
+
+    def test_parse_items_without_a_transcript_keeps_the_shape_without_verifying(self):
+        """가짜 모드는 원문이 없어 대조할 수 없다 — 근거 검증을 건너뛰는 기존 규칙과 같다."""
+        raw = json.dumps([dict(self.AMBIGUOUS, fills=[
+            {"gap": "담당", "value": "민수", "source": "원문", "quote": "아무 말"},
+        ])], ensure_ascii=False)
+        self.assertEqual(decision_compiler.parse_items(raw)[0]["fills"][0]["source"], "원문")
+
+    # ---- 저장 ----
+
+    def test_compile_stores_fills_on_the_saved_candidate(self):
+        """진행자 화면은 다음 요청에서 그려진다 — 저장돼 있지 않으면 색을 칠할 수 없다."""
+        raw = json.dumps([dict(self.AMBIGUOUS, fills=[
+            {"gap": "기한", "value": "12월 5일", "source": "AI추정"},
+        ])], ensure_ascii=False)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", return_value=raw):
+            decision_compiler.compile_meeting(self.meeting)
+        interpretation = Interpretation.objects.get()
+        self.assertEqual(interpretation.fills, [
+            {"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": ""},
+        ])
+
+
 class DecisionParseTests(TestCase):
     """통합 응답 파서(parse_items)의 스키마 검증과 근거 검증."""
 

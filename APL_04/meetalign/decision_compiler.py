@@ -41,7 +41,7 @@ import re
 
 from django.db import IntegrityError, transaction
 
-from . import services
+from . import decision_checks, services
 from .models import Decision, Interpretation
 
 # 결정 하나에 보여줄 AI 확정 문장 수. 가장 추천하는 하나만 보여준다 — 후보 여러 개를 읽고 비교하는
@@ -413,7 +413,30 @@ def _legacy_candidate_evidence(raw_candidates, normalized_source):
     return ""
 
 
-def parse_items(raw, source_text=None):
+def _info_text(meeting_info):
+    """회의 정보를 한 덩어리 문자열로 — fills의 "회의정보" 출처를 대조할 때 쓴다.
+
+    collect_meeting_info()가 만든 dict를 받는다. 비어 있으면 빈 문자열이고, 그러면 "회의정보"라고
+    주장한 값은 전부 추정으로 내려간다(대조할 것이 없으니 증명되지 않았다).
+    """
+    if not meeting_info:
+        return ""
+    parts = []
+    for value in meeting_info.values():
+        parts.extend(value if isinstance(value, (list, tuple)) else [value])
+    return " / ".join(str(part) for part in parts if part)
+
+
+def parse_fills(row, source=None, meeting_info=None):
+    """응답 한 줄에서 AI가 채운 값(fills)을 읽어 출처까지 검증한다.
+
+    검증 규칙은 decision_checks.verify_fill_sources에 있다 — 모델도 네트워크도 모르는 순수 함수라
+    같은 입력이면 늘 같은 결과가 나온다. 여기서는 회의 정보를 문자열로 펴 주기만 한다.
+    """
+    return decision_checks.verify_fill_sources(row.get("fills"), source, _info_text(meeting_info))
+
+
+def parse_items(raw, source_text=None, meeting_info=None):
     """LLM 응답 → 안건별 모호 여부, 사유, 행동 영향, 문장과 원문 근거.
 
     한 번의 호출로 받은 응답을 전부 여기서 읽는다. 항목 하나의 형식이 틀렸다고 나머지를
@@ -462,6 +485,8 @@ def parse_items(raw, source_text=None):
             "ambiguous": ambiguous,
             "impact": " ".join(impact.split()) if ambiguous and isinstance(impact, str) else "",
             "why": str(row.get("why", "")).strip() if ambiguous else "",
+            # 바로 공개되는 명확 항목은 원문 기준을 그대로 쓴다 — 채운 값이라는 개념이 없다.
+            "fills": parse_fills(row, source_text, meeting_info) if ambiguous else [],
             "final": final,
             "evidence": evidence,
             "candidates": candidates,
@@ -559,6 +584,8 @@ def _save_items(meeting, items):
                     decision=decision, order=candidate_order,
                     text=candidate["text"], evidence=candidate["evidence"],
                     recommended=candidate["recommended"],
+                    # 채운 값은 추천 문장 하나에 딸린 것이다(MAX_INTERPRETATIONS = 1).
+                    fills=item["fills"] if candidate_order == 0 else [],
                 )
             if decision.has_warning:
                 ambiguous_count += 1
