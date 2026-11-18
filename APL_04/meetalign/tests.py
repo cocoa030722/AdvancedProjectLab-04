@@ -2608,6 +2608,15 @@ class DecisionCompileTests(TestCase):
         self.assertEqual(
             Interpretation.objects.filter(decision__meeting=self.meeting, recommended=True).count(), 2)
 
+    def test_fake_mode_does_not_verify_candidates(self):
+        """가짜 모드는 LLM이 없어 다시 쓸 수 없다 — 검증 단계를 아예 타지 않는다(시연용 경로)."""
+        with patch.dict(os.environ, {}, clear=True):
+            summary = decision_compiler.compile_meeting(self.meeting)
+        self.assertEqual(
+            (summary["checked"], summary["regenerated"], summary["discarded"], summary["regenerate_failed"]),
+            (0, 0, 0, 0),
+        )
+
     def test_fake_mode_decisions_carry_evidence(self):
         """가짜 모드도 '원문: …'이 보이도록 결정마다 원문 인용을 담는다 — 시연에서 가장 중요한 칸이다."""
         with patch.dict(os.environ, {}, clear=True):
