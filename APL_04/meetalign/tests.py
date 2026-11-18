@@ -2856,6 +2856,36 @@ class DecisionFillPromptTests(TestCase):
         self.assertNotIn("단톡방에서 정한다", prompt)
         self.assertIn("가장 그럴듯한 값", prompt)
 
+    def test_the_prompt_closes_the_decide_later_escape_and_asks_for_guesses(self):
+        """근거가 없을 때 '누가 언제까지 정한다'로 물러서지 말고 추측해서 채우게 한다."""
+        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        self.assertNotIn("채울 근거가 전혀 없을 때만", prompt)
+        self.assertIn("추측해서 값을 정한 문장", prompt)
+        self.assertIn("같은 문장 틀을 되풀이하지 마라", prompt)
+        for gap in ("수량", "장소", "완료기준"):
+            self.assertIn(gap, decision_compiler.FILL_GAPS)
+        self.assertIn(decision_compiler.FILL_GAPS, prompt)
+
+    def test_the_prompt_lets_deferred_items_pick_a_side_as_a_guess(self):
+        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        self.assertNotIn("둘 중 하나를 고른 것처럼 쓰지", prompt)
+        self.assertIn("고른 값은 fills에 \"AI추정\"으로 남겨라", prompt)
+
+    def test_the_prompt_keeps_guesses_out_of_clear_items(self):
+        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        self.assertIn("final에는 원문에 나온 값만 쓴다", prompt)
+
+    def test_the_refine_prompt_uses_the_same_gap_names(self):
+        items = [{"topic": "로그 보관", "evidence": "", "candidates": [{"text": "로그를 보관한다"}],
+                  "check": {"reasons": ["원문에 없던 담당자·기한·수치가 하나도 없어요"]}}]
+        prompt = decision_refine._refine_prompt(items, [0], self.SOURCE, None)
+        self.assertIn(decision_compiler.FILL_GAPS, prompt)
+
+    def test_guessed_values_are_colored_red(self):
+        """AI추정 값의 경고색은 빨간색(--danger)이다."""
+        page = self.client.get(reverse("login")).content.decode()
+        self.assertIn(".ai-fill { background:var(--danger-soft); color:var(--danger);", page)
+
     def test_the_prompt_asks_for_fills_with_a_source(self):
         prompt = decision_compiler._compile_prompt(self.SOURCE)
         for token in ('"fills"', '"gap"', '"source"', "원문|회의정보|AI추정"):
