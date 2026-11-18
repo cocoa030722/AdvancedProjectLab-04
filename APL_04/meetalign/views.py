@@ -155,6 +155,32 @@ def _recording_error(recording):
     return None
 
 
+# 녹음을 올릴 때 적는 말한 사람 수의 범위. 화자 분리 결과는 화자 A~Z로 적으므로 26명이 한계지만, 회의 녹음에
+# 그만큼 말하는 일은 없어서 20명에서 자른다.
+MAX_SPEAKER_COUNT = 20
+
+
+def _speaker_counts(request, recordings):
+    """녹음마다 적은 '말한 사람 수' → ([값 또는 None, ...] 녹음 순서대로, [오류 문구, ...]).
+
+    업로드 화면은 녹음 줄마다 speaker_counts 칸을 두고 파일과 같은 순서로 보낸다. 비워 둔 칸, 또는 칸이 오지
+    않은 녹음(스크립트가 돌지 않는 브라우저)은 None — 화자 분리가 스스로 추정한다.
+    """
+    raws = request.POST.getlist("speaker_counts")
+    counts, errors = [], []
+    for index, recording in enumerate(recordings):
+        raw = raws[index].strip() if index < len(raws) else ""
+        if not raw:
+            counts.append(None)
+        elif raw.isdigit() and 1 <= int(raw) <= MAX_SPEAKER_COUNT:
+            counts.append(int(raw))
+        else:
+            counts.append(None)
+            errors.append("%s: 말한 사람 수는 1~%d 사이 숫자로 적어 주세요(모르면 비워 두세요)."
+                          % (recording.name, MAX_SPEAKER_COUNT))
+    return counts, errors
+
+
 def _text_file_error(text_file):
     """텍스트 파일 칸에 올린 파일 하나를 검사한다. 읽을 수 없거나 빈 파일은 처리 단계까지 보내지 않는다."""
     extension = os.path.splitext(text_file.name)[1].lower()
@@ -268,6 +294,8 @@ def meeting_detail(request, meeting_id):
                       + [e for e in map(_text_file_error, text_files) if e])
             if not errors:
                 errors = _duplicate_text_errors(meeting, text_files)
+            speaker_counts, speaker_errors = _speaker_counts(request, recordings)
+            errors.extend(speaker_errors)
             error = "\n".join(errors) or None
         if error:
             return render(request, "meetalign/meeting_detail.html", {
@@ -276,8 +304,14 @@ def meeting_detail(request, meeting_id):
             })
         if uploads:
             # 녹음을 먼저 만들고 텍스트 파일을 나중에 만든다(처리 순서). 녹취 원문에서는 텍스트 파일이 앞에 온다(tasks).
-            added = [Recording.objects.create(meeting=meeting, file=upload, status=Recording.STATUS_PROCESSING)
-                     for upload in uploads]
+            # 말한 사람 수는 녹음마다 따로 붙는다(텍스트 파일은 화자 분리를 하지 않는다).
+            added = [
+                Recording.objects.create(
+                    meeting=meeting, file=upload, status=Recording.STATUS_PROCESSING,
+                    speaker_count=speaker_counts[index] if index < len(recordings) else None,
+                )
+                for index, upload in enumerate(uploads)
+            ]
             tasks.start_processing(*(r.id for r in added))
         if request.POST.get("action") == "end":
             Meeting.objects.filter(pk=meeting.pk).update(ended=True)
@@ -681,10 +715,13 @@ def decision_review(request, meeting_id):
     if request.method == "POST":
         action = request.POST.get("action")
         if action == "compile":
-            try:
-                decision_compiler.compile_meeting(meeting)
-            except decision_compiler.DecisionCompileError as exc:
-                error = str(exc)
+            # 백그라운드에서 돈다(tasks.start_decision_compile). 이미 추출한 회의는 시작하지 않고 바로 알린다.
+            if meeting.decisions.exists():
+                error = "이미 결정 사항을 추출한 회의입니다. 다시 하려면 기존 결정을 먼저 지워 주세요."
+            else:
+                tasks.start_decision_compile(meeting.id)
+                # 그 자리에서 끝난 경우(백그라운드를 끈 설정)에는 실패 사유를 바로 보여준다.
+                error = tasks.pop_decision_compile_error(meeting.id) or None
         elif action == "reset":
             error = _reset_decisions(meeting)
         elif action == "save":
@@ -702,6 +739,10 @@ def decision_review(request, meeting_id):
         if error is None:
             return redirect("decision_review", meeting_id=meeting.id)
 
+    compiling = tasks.decision_compile_state(meeting.id)["running"]
+    if error is None and not compiling:
+        # 백그라운드 추출이 실패하고 끝났으면 사유를 한 번 보여준다.
+        error = tasks.pop_decision_compile_error(meeting.id) or None
     decisions = list(meeting.decisions.prefetch_related("interpretations"))
     rows = []
     for decision in decisions:
@@ -767,6 +808,8 @@ def decision_review(request, meeting_id):
         "steps": steps,
         "error": error,
         "compiled": bool(decisions),
+        # 추출 중이면 화면이 스스로 새로 고친다. 결정이 저장되는 즉시 끝난 것으로 본다.
+        "compiling": compiling and not decisions,
         "ambiguous_rows": ambiguous_rows,
         "clear_rows": clear_rows,
         "carried_rows": carried_rows,

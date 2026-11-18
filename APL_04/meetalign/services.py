@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +31,11 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
 # 무료 등급은 응답 대기가 길어서 Ollama보다 넉넉하게 기다린다 (GEMINI_TIMEOUT으로 조정).
 GEMINI_DEFAULT_TIMEOUT_SECONDS = 60
+# 긴 프롬프트는 그만큼 더 기다린다. 1~2시간 회의의 결정 추출은 프롬프트가 5~10만 자이고 결정도 수십 개라,
+# 60초 안에 다 쓰지 못해 시간 초과 → 다른 모델로 넘어가 실패하곤 했다. 1만 자마다 이만큼 더하고(GEMINI_TIMEOUT_PER_10K),
+# 아무리 길어도 GEMINI_MAX_TIMEOUT을 넘기지 않는다 — 응답이 아예 없는 호출을 몇십 분씩 붙잡지 않기 위해서다.
+GEMINI_TIMEOUT_PER_10K_CHARS = 30
+GEMINI_MAX_TIMEOUT_SECONDS = 300
 # 일시적 오류(요청 과다, 서버 바쁨)와 타임아웃만 잠깐 쉬었다가 한 번 더 보낸다. 두 번째도 실패하면 다음 Gemini 모델(없으면
 # Ollama)로 넘어간다 — 무료 등급이 몰릴 때 몇 분씩 붙잡고 기다리는 것보다 빨리 넘어가는 편이 낫다.
 GEMINI_RETRY_STATUS = (429, 500, 503)
@@ -87,6 +93,15 @@ GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_DEFAULT_MODEL = "whisper-large-v3-turbo"
 # Groq 앞단의 Cloudflare가 urllib 기본 User-Agent(Python-urllib/x.y)를 403(error code: 1010)으로 막아서 직접 지정한다.
 GROQ_USER_AGENT = "MeetAlign/1.0"
+# Groq Whisper는 파일 하나에 25MB까지 받는다(무료 등급). 1~2시간 녹음은 그보다 커서 통째로 보내면 거절되고 로컬
+# Whisper로 넘어갔다(CPU면 녹음 길이만큼 걸린다). 이보다 큰 파일은 16kHz 모노 WAV 조각으로 잘라 차례로 보내고 이어
+# 붙인다(_transcribe_groq_long). multipart 머리말 몫을 남겨 24MB를 기준으로 둔다. GROQ_MAX_UPLOAD_MB로 조정.
+GROQ_MAX_UPLOAD_MB = 24
+# 조각 길이(초). 16kHz 16bit 모노 WAV는 초당 32KB라 10분이 약 19MB다. GROQ_CHUNK_SECONDS로 조정하되, 조각이
+# 업로드 한도를 넘지 않게 _chunk_seconds가 줄여 쓴다. 조각 경계에서 단어가 잘릴 수 있다 — 10분마다 한 번이다.
+GROQ_CHUNK_SECONDS = 600
+CHUNK_SAMPLE_RATE = 16000
+CHUNK_BYTES_PER_SECOND = CHUNK_SAMPLE_RATE * 2
 
 
 def _groq_enabled():
@@ -193,11 +208,15 @@ def _clova_text(data, segments, diarize):
     return (data.get("text") or " ".join((segment.get("text") or "").strip() for segment in segments)).strip()
 
 
-def _transcribe_clova(path):
+def _transcribe_clova(path, speaker_count=None):
     """CLOVA Speech 장문 인식(로컬 파일 업로드, 동기 방식) 호출. 전사 텍스트와, 응답의 마지막 구간 끝 시각으로 추정한 음성
     길이(초)를 돌려준다. 네트워크/HTTP 오류, 해석 불가 응답, COMPLETED가 아닌 결과는 모두 이유를 담은 RuntimeError로 올린다."""
     diarize = os.environ.get("CLOVA_SPEECH_DIARIZATION") == "1"
-    params = {"language": "ko-KR", "completion": "sync", "wordAlignment": False, "fullText": True, "diarization": {"enable": diarize}}
+    diarization = {"enable": diarize}
+    if diarize and speaker_count:
+        # 말한 사람 수를 알면 CLOVA에도 그 수로 묶게 한다(최소·최대를 같게).
+        diarization.update(speakerCountMin=speaker_count, speakerCountMax=speaker_count)
+    params = {"language": "ko-KR", "completion": "sync", "wordAlignment": False, "fullText": True, "diarization": diarization}
     body, length, content_type = _clova_multipart(path, params)
     request = urllib.request.Request(
         os.environ["CLOVA_SPEECH_INVOKE_URL"].rstrip("/") + "/recognizer/upload", data=body, method="POST",
@@ -295,6 +314,93 @@ def _transcribe_groq(path, with_segments=False):
         raise RuntimeError("Groq Whisper 응답 해석 실패: %s" % error) from error
 
 
+def _groq_upload_limit_bytes():
+    return int(float(os.environ.get("GROQ_MAX_UPLOAD_MB", GROQ_MAX_UPLOAD_MB)) * 1024 * 1024)
+
+
+def _chunk_seconds():
+    """조각 길이(초) — 설정값과, 업로드 한도 안에 들어가는 길이(5% 여유) 중 짧은 쪽."""
+    wanted = int(os.environ.get("GROQ_CHUNK_SECONDS", GROQ_CHUNK_SECONDS))
+    fits = int(_groq_upload_limit_bytes() * 0.95 // CHUNK_BYTES_PER_SECOND)
+    return max(1, min(wanted, fits))
+
+
+def _write_wav_chunk(path, pcm):
+    with wave.open(path, "wb") as chunk:
+        chunk.setnchannels(1)
+        chunk.setsampwidth(2)
+        chunk.setframerate(CHUNK_SAMPLE_RATE)
+        chunk.writeframes(bytes(pcm))
+
+
+def _split_audio(path, chunk_seconds, out_dir):
+    """녹음을 chunk_seconds초짜리 16kHz 모노 WAV 조각으로 자른다 → [(시작 초, 조각 경로), ...].
+
+    PyAV(faster-whisper와 함께 설치되는 FFmpeg 바인딩)로 어떤 형식이든 읽는다 — 서버에 ffmpeg 명령이 없어도 된다.
+    PyAV가 없거나 읽지 못하는 파일이면 RuntimeError(호출자가 로컬 Whisper로 넘어간다).
+    """
+    try:
+        import av
+    except ImportError as error:
+        raise RuntimeError("긴 녹음을 나누려면 PyAV가 필요합니다(pip install av)") from error
+    per_chunk = chunk_seconds * CHUNK_BYTES_PER_SECOND
+    chunks, buffer, written = [], bytearray(), 0
+
+    def flush(pcm):
+        nonlocal written
+        chunk_path = os.path.join(out_dir, "chunk_%03d.wav" % len(chunks))
+        _write_wav_chunk(chunk_path, pcm)
+        chunks.append((written / CHUNK_BYTES_PER_SECOND, chunk_path))
+        written += len(pcm)
+
+    try:
+        with av.open(path) as container:
+            if not container.streams.audio:
+                raise RuntimeError("녹음에 소리 트랙이 없습니다")
+            resampler = av.AudioResampler(format="s16", layout="mono", rate=CHUNK_SAMPLE_RATE)
+
+            def take(frames):
+                for frame in frames:
+                    # s16 모노는 평면이 하나다. 평면 버퍼는 정렬 때문에 뒤에 여분이 붙을 수 있어 표본 수만큼만 쓴다.
+                    buffer.extend(bytes(frame.planes[0])[:frame.samples * 2])
+                    while len(buffer) >= per_chunk:
+                        flush(buffer[:per_chunk])
+                        del buffer[:per_chunk]
+
+            for frame in container.decode(container.streams.audio[0]):
+                take(resampler.resample(frame))
+            take(resampler.resample(None))
+    except RuntimeError:
+        raise
+    except Exception as error:
+        raise RuntimeError("긴 녹음을 나누지 못했습니다: %s" % error) from error
+    if buffer:
+        flush(buffer)
+    return chunks
+
+
+def _transcribe_groq_long(path, with_segments=False):
+    """Groq 업로드 한도보다 큰 녹음은 조각으로 나눠 차례로 전사하고 이어 붙인다. 작은 녹음은 그대로 한 번에 보낸다.
+
+    with_segments=True(화자 분리용)면 조각마다 받은 구간의 시각에 조각 시작 시각을 더해 원래 녹음 기준으로 맞춘다 —
+    화자 분리는 원본 녹음 전체를 한 번에 돌리므로(_with_speakers) 시각이 맞아야 화자를 제대로 붙인다.
+    조각 하나라도 실패하면 RuntimeError — 일부만 전사된 회의록은 빠진 줄 모른 채 쓰이므로 통째로 실패시킨다.
+    """
+    if os.path.getsize(path) <= _groq_upload_limit_bytes():
+        return _transcribe_groq(path, with_segments=with_segments)
+    with tempfile.TemporaryDirectory(prefix="meetalign-chunks-") as out_dir:
+        chunks = _split_audio(path, _chunk_seconds(), out_dir)
+        logger.info("긴 녹음을 %d조각으로 나눠 Groq Whisper로 전사합니다", len(chunks))
+        if with_segments:
+            segments = []
+            for start, chunk_path in chunks:
+                for segment in _transcribe_groq(chunk_path, with_segments=True):
+                    segments.append({**segment, "start": segment["start"] + start, "end": segment["end"] + start})
+            return segments
+        texts = [_transcribe_groq(chunk_path) for _, chunk_path in chunks]
+        return " ".join(text.strip() for text in texts if text and text.strip())
+
+
 def _transcribe_local(recording_path, engine, with_segments=False):
     """로컬 Whisper(mlx-whisper 또는 faster-whisper)는 별도 프로세스(whisper_worker.py)로 띄워서 실행한다. Django 개발 서버는
     요청마다 새 스레드를 쓰는데, mlx의 GPU 스트림이 스레드에 묶여 있어서 같은 프로세스 안에서 다른 스레드가 연달아 호출하면
@@ -322,11 +428,16 @@ def _transcribe_local(recording_path, engine, with_segments=False):
     return output if with_segments else output.strip()
 
 
-def _diarize(recording_path):
-    """diarize_worker.py를 별도 프로세스로 돌려 [[시작초, 끝초, 화자번호], ...]를 받는다."""
+def _diarize(recording_path, speaker_count=None):
+    """diarize_worker.py를 별도 프로세스로 돌려 [[시작초, 끝초, 화자번호], ...]를 받는다.
+
+    speaker_count(녹음을 올릴 때 적은 말한 사람 수)가 있으면 그 수로 묶는다. 없으면 DIARIZATION_NUM_SPEAKERS,
+    그것도 없으면 화자 분리가 DIARIZATION_THRESHOLD로 스스로 추정한다.
+    """
     args = [
         recording_path, os.environ.get("DIARIZATION_MODEL_DIR") or DIARIZATION_DEFAULT_MODEL_DIR,
-        os.environ.get("DIARIZATION_NUM_SPEAKERS", ""), os.environ.get("DIARIZATION_THRESHOLD", ""),
+        str(speaker_count) if speaker_count else os.environ.get("DIARIZATION_NUM_SPEAKERS", ""),
+        os.environ.get("DIARIZATION_THRESHOLD", ""),
     ]
     result = subprocess.run(
         [sys.executable, _DIARIZE_WORKER] + args, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -371,10 +482,10 @@ def _label_speakers(segments, turns):
     return "\n".join("화자 %s: %s" % (letter, text) for letter, text in lines)
 
 
-def _with_speakers(recording_path, segments):
+def _with_speakers(recording_path, segments, speaker_count=None):
     """구간 목록에 로컬 화자 분리 결과를 붙인 전사 텍스트. 화자 분리가 실패해도 전사는 살린다(화자 표시 없이)."""
     try:
-        return _label_speakers(segments, _diarize(recording_path))
+        return _label_speakers(segments, _diarize(recording_path, speaker_count))
     except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as error:
         logger.warning("화자 분리 실패(%s) — 화자 표시 없이 저장합니다", error)
         return " ".join(segment["text"] for segment in segments)
@@ -401,10 +512,11 @@ def read_text_transcript(path):
         return decode_text_transcript(handle.read())
 
 
-def transcribe(recording_path, recording_id=None):
+def transcribe(recording_path, recording_id=None, speaker_count=None):
     """녹음 파일을 전사한다. 네이버 CLOVA Speech(이번 달 무료 사용량 이내) → Groq Whisper API → 로컬 Whisper 순서로
     시도하고, 앞 단계가 설정돼 있지 않거나 실패하면 다음 단계로 넘어간다. 아무 것도 설정돼 있지 않으면 None(가짜 동작
-    유지). recording_id는 CLOVA 사용량 기록에 어떤 녹음이었는지 남기는 용도."""
+    유지). recording_id는 CLOVA 사용량 기록에 어떤 녹음이었는지 남기는 용도.
+    speaker_count는 올릴 때 적은 말한 사람 수 — 화자 분리(CLOVA·로컬)가 그 수로 목소리를 묶는다."""
     local = _local_stt_engine()
     fallback_available = _groq_enabled() or local is not None
 
@@ -412,7 +524,7 @@ def transcribe(recording_path, recording_id=None):
         duration = _audio_duration_seconds(recording_path)
         if _clova_budget_allows(duration):
             try:
-                text, end_seconds = _transcribe_clova(recording_path)
+                text, end_seconds = _transcribe_clova(recording_path, speaker_count)
             except RuntimeError as error:
                 if not fallback_available:
                     raise
@@ -430,15 +542,15 @@ def transcribe(recording_path, recording_id=None):
     if _groq_enabled():
         try:
             if diarize:
-                return _with_speakers(recording_path, _transcribe_groq(recording_path, with_segments=True))
-            return _transcribe_groq(recording_path)
+                return _with_speakers(recording_path, _transcribe_groq_long(recording_path, with_segments=True), speaker_count)
+            return _transcribe_groq_long(recording_path)
         except RuntimeError as error:
             if local is None:
                 raise
             logger.warning("%s — %s로 전환합니다", error, LOCAL_STT_LABELS[local])
 
     if diarize and local is not None:
-        return _with_speakers(recording_path, _transcribe_local(recording_path, local, with_segments=True))
+        return _with_speakers(recording_path, _transcribe_local(recording_path, local, with_segments=True), speaker_count)
     return _transcribe_local(recording_path, local)
 
 
@@ -551,6 +663,19 @@ def _daily_quota_exhausted(error):
         return False
 
 
+def gemini_timeout(prompt):
+    """프롬프트 길이에 맞춘 Gemini 응답 대기(초).
+
+    기본값(GEMINI_TIMEOUT, 60초)에 1만 자마다 GEMINI_TIMEOUT_PER_10K(30초)를 더하고 GEMINI_MAX_TIMEOUT(300초)에서
+    자른다. 짧은 요청(요약·대화창)은 기본값 그대로다. 기본값이 상한보다 크면 기본값을 따른다 — 직접 늘려 둔 설정을
+    상한이 깎지 않게.
+    """
+    base = int(os.environ.get("GEMINI_TIMEOUT", GEMINI_DEFAULT_TIMEOUT_SECONDS))
+    per_10k = int(os.environ.get("GEMINI_TIMEOUT_PER_10K", GEMINI_TIMEOUT_PER_10K_CHARS))
+    ceiling = max(base, int(os.environ.get("GEMINI_MAX_TIMEOUT", GEMINI_MAX_TIMEOUT_SECONDS)))
+    return min(ceiling, base + (len(prompt or "") // 10000) * per_10k)
+
+
 def _generate_gemini(prompt, temperature=None, model=None, retry_timeout=True):
     """Gemini generateContent API 호출. HTTP/네트워크 오류(401 잘못된 키, 429 무료 한도 초과 등)는
     urllib이 OSError 하위 예외로 올리므로 호출자의 기존 대체 처리가 그대로 동작한다. 안전 필터 차단 등으로
@@ -567,7 +692,7 @@ def _generate_gemini(prompt, temperature=None, model=None, retry_timeout=True):
         GEMINI_URL % model, data=body,
         headers={"Content-Type": "application/json", "x-goog-api-key": os.environ["GEMINI_API_KEY"]},
     )
-    timeout = int(os.environ.get("GEMINI_TIMEOUT", GEMINI_DEFAULT_TIMEOUT_SECONDS))
+    timeout = gemini_timeout(prompt)
     for attempt in range(GEMINI_RETRIES + 1):
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:

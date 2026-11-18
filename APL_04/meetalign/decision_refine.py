@@ -53,10 +53,10 @@ def _other_sentences(items, index):
     return sentences
 
 
-def _check(item, items, index, participants):
+def _check(item, items, index, participants, source=None):
     return decision_checks.check_candidate(
         item["candidates"][0]["text"], item["evidence"],
-        _other_sentences(items, index), participants,
+        _other_sentences(items, index), participants, source,
     )
 
 
@@ -95,7 +95,9 @@ def _refine_prompt(items, flagged, source, meeting_info):
         "아래는 회의 녹취에서 뽑은 결정들에 대해 네가 쓴 '그대로 공개될 확정 문장'인데, 그대로 쓸 수 없는 "
         "문장들이다. 항목마다 적힌 '고쳐야 할 점'을 해결해서 다시 써라.\n"
         "- 원문 근거를 그대로 옮겨 쓰지 마라. 누가·무엇을·언제까지가 들어간 실행 문장으로 써야 한다.\n"
-        "- 빠진 담당·기한·범위는 회의 정보와 앞뒤 대화에서 가장 그럴듯한 값으로 채워라.\n"
+        "- 빠진 기한·범위는 회의 정보와 앞뒤 대화에서 가장 그럴듯한 값으로 채워라. 담당자는 녹취 안에서 추론한다 — "
+        "녹취에 나온 이름, 대화로 드러난 화자의 이름, 그것도 안 되면 하겠다고 나서거나 맡은 화자의 기호(\"화자 D\"). "
+        "참석자 명단에서 근거 없이 이름을 고르지 마라.\n"
         "- 같은 회의의 다른 결정 문장과 겹치지 않게 써라.\n"
         "- \"나중에\", \"각자\", \"적당히\", \"그쪽\"처럼 사람마다 다르게 읽는 표현을 쓰지 마라.\n"
         + decision_compiler._meeting_info_block(meeting_info) +
@@ -173,7 +175,7 @@ def refine_candidates(items, source, meeting_info=None):
     for index, item in enumerate(items):
         if not _checkable(item):
             continue
-        passed, reasons = _check(item, items, index, participants)
+        passed, reasons = _check(item, items, index, participants, source)
         item["check"] = {"reasons": reasons, "regenerated": False, "discarded": False, "kept": False}
         if not passed:
             flagged.append(index)
@@ -195,7 +197,7 @@ def refine_candidates(items, source, meeting_info=None):
             continue
         item["candidates"][0] = {"text": candidate["text"], "evidence": "", "recommended": True}
         item["fills"] = candidate["fills"]
-        passed, reasons = _check(item, items, index, participants)
+        passed, reasons = _check(item, items, index, participants, source)
         vague = _vague_reason(candidate["text"])
         if passed and not vague:
             check["regenerated"] = True

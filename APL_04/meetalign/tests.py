@@ -16,7 +16,7 @@ from django.test.utils import CaptureQueriesContext
 from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
 
-from . import decision_checks, decision_compiler, decision_refine, services, tasks, views, whisper_worker
+from . import decision_checks, decision_compiler, decision_recommend, decision_refine, services, tasks, views, whisper_worker
 from .models import (
     ChatMessage, Checkpoint, Decision, DecisionAgreement,
     Interpretation, Meeting, Notification, Question, Recording, SttUsage, Team,
@@ -983,7 +983,7 @@ class LocalDiarizationTests(TestCase):
                 patch.object(services, "_diarize", return_value=self.TURNS) as diarize:
             text = services.transcribe(self.audio)
         groq.assert_called_once_with(self.audio, with_segments=True)
-        diarize.assert_called_once_with(self.audio)
+        diarize.assert_called_once_with(self.audio, None)
         self.assertTrue(text.startswith("화자 A: 안녕하세요"))
 
     def test_diarization_failure_keeps_the_transcript_without_labels(self):
@@ -2447,10 +2447,19 @@ class DecisionCompileTests(TestCase):
             summary = decision_compiler.compile_meeting(self.meeting)
         return summary, {d.what: d for d in self.meeting.decisions.all()}, gen
 
-    # ---- 호출 한 번 ----
+    # ---- 호출 횟수: 추출 한 번 + (확인 필요 항목이 있으면) 추천 한 번 ----
 
-    def test_the_llm_is_called_exactly_once(self):
+    def test_extraction_and_recommendation_are_separate_calls(self):
         _, _, gen = self._compiled(self.CLEAR, self.AMBIGUOUS)
+        self.assertEqual(gen.call_count, 2)
+        extract_prompt, recommend_prompt = (c.args[0] for c in gen.call_args_list)
+        self.assertIn('"ambiguous"', extract_prompt)
+        self.assertNotIn('"candidate"', extract_prompt)
+        self.assertIn('"candidate"', recommend_prompt)
+        self.assertIn("로그 보관 기간", recommend_prompt)
+
+    def test_no_recommendation_call_when_everything_is_clear(self):
+        _, _, gen = self._compiled(self.CLEAR)
         self.assertEqual(gen.call_count, 1)
 
     def test_transcript_is_sent_in_the_compile_prompt(self):
@@ -2463,7 +2472,7 @@ class DecisionCompileTests(TestCase):
         _, by_topic, gen = self._compiled(dict(self.CLEAR, impact=impact), item)
         self.assertEqual(by_topic[item["topic"]].impact, impact)
         self.assertEqual(by_topic[self.CLEAR["topic"]].impact, "")
-        self.assertIn('"impact"', gen.call_args.args[0])
+        self.assertIn('"impact"', gen.call_args_list[0].args[0])
 
     def test_compile_uses_the_llm_response_when_a_model_is_configured(self):
         _, by_topic, _ = self._compiled(self.CLEAR, self.AMBIGUOUS)
@@ -2563,8 +2572,12 @@ class DecisionCompileTests(TestCase):
     def test_a_clear_item_without_usable_evidence_is_promoted(self):
         _, by_topic, _ = self._compiled(dict(self.CLEAR, evidence="회의에 없던 문장입니다."))
         decision = by_topic["배포 스크립트 정리"]
+        # 바로 공개하지 않고 진행자 확인으로 올리되, AI가 쓴 문장은 '그대로 공개' 선택지로 남긴다.
         self.assertEqual(decision.final_text, "")
-        self.assertEqual(decision.interpretations.count(), 0)
+        self.assertEqual(decision.divergence_reason, "근거를 원문에서 확인하지 못했어요")
+        choice = decision.interpretations.get()
+        self.assertEqual(choice.text, self.CLEAR["final"])
+        self.assertFalse(choice.recommended)
         self.assertTrue(decision.has_warning)
         self.assertTrue(decision.blocks_publish)
 
@@ -2850,15 +2863,21 @@ class DecisionFillPromptTests(TestCase):
         )
         self.meeting.participants.add(self.host, self.member)
 
+    def _recommend_prompt(self, info=None):
+        """추천 문장 프롬프트 — 빈칸 채우기 규칙은 추출이 아니라 이 호출에 있다."""
+        item = {"topic": self.AMBIGUOUS["topic"], "ambiguous": True, "why": "갈립니다", "impact": "",
+                "evidence": self.AMBIGUOUS["evidence"], "final": "", "candidates": [], "draft_hint": "", "fills": []}
+        return decision_recommend.recommend_prompt([item], [0], self.SOURCE, info)
+
     def test_the_prompt_no_longer_forbids_filling_in_missing_values(self):
-        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        prompt = self._recommend_prompt()
         self.assertNotIn("원문에 없는 날짜·이름을 지어내지 말고", prompt)
         self.assertNotIn("단톡방에서 정한다", prompt)
         self.assertIn("가장 그럴듯한 값", prompt)
 
     def test_the_prompt_closes_the_decide_later_escape_and_asks_for_guesses(self):
         """근거가 없을 때 '누가 언제까지 정한다'로 물러서지 말고 추측해서 채우게 한다."""
-        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        prompt = self._recommend_prompt()
         self.assertNotIn("채울 근거가 전혀 없을 때만", prompt)
         self.assertIn("추측해서 값을 정한 문장", prompt)
         self.assertIn("같은 문장 틀을 되풀이하지 마라", prompt)
@@ -2867,7 +2886,7 @@ class DecisionFillPromptTests(TestCase):
         self.assertIn(decision_compiler.FILL_GAPS, prompt)
 
     def test_the_prompt_lets_deferred_items_pick_a_side_as_a_guess(self):
-        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        prompt = self._recommend_prompt()
         self.assertNotIn("둘 중 하나를 고른 것처럼 쓰지", prompt)
         self.assertIn("고른 값은 fills에 \"AI추정\"으로 남겨라", prompt)
 
@@ -2887,7 +2906,7 @@ class DecisionFillPromptTests(TestCase):
         self.assertIn(".ai-fill { background:var(--danger-soft); color:var(--danger);", page)
 
     def test_the_prompt_asks_for_fills_with_a_source(self):
-        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        prompt = self._recommend_prompt()
         for token in ('"fills"', '"gap"', '"source"', "원문|회의정보|AI추정"):
             self.assertIn(token, prompt)
 
@@ -2937,7 +2956,9 @@ class DecisionRefineTests(TestCase):
     옮겨 쓰거나, 서로 다른 안건에 같은 문장을 붙인다. 진행자에게 내보내기 전에 서버가 되짚는다.
     """
 
-    SOURCE = ("로그 보관 얘기를 해 봅시다. "
+    # 참석자 이름이 녹취에 나와야 추천 문장의 담당자로 인정된다(decision_checks.check_candidate).
+    SOURCE = ("민수 씨, 지은 씨 시작할게요. "
+              "로그 보관 얘기를 해 봅시다. "
               "로그는 일단 한 달 정도면 충분할 것 같은데요. "
               "그럼 그렇게 하죠. "
               "발표 자료는 누가 할까요.")
@@ -3068,7 +3089,11 @@ class DecisionRefineTests(TestCase):
     # ---- 기록 ----
 
     def _three_item_meeting(self):
-        """통과 1건 + 재생성 성공 1건 + 폐기 1건이 나오는 회의와 응답 두 개."""
+        """통과 1건 + 재생성 성공 1건 + 폐기 1건이 나오는 회의와 응답 두 개.
+
+        추출 → 추천 → 재생성 세 번 부른다. 추천 호출에는 추출 응답을 그대로 다시 돌려준다 — 추천
+        응답은 번호가 없으면 안건 이름으로 짝을 맞추므로, 각 안건의 candidate가 추천 문장으로 읽힌다.
+        """
         host = User.objects.create_user("민수", password="pw12345!")
         team = Team.objects.create(name="t")
         team.members.add(host)
@@ -3093,7 +3118,7 @@ class DecisionRefineTests(TestCase):
     def test_compile_meeting_reports_the_verification_counts(self):
         """재생성 성공률을 보고 이 단계를 유지할지 정하려면 숫자가 남아야 한다."""
         meeting, extracted, refined = self._three_item_meeting()
-        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, refined]):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, extracted, refined]):
             summary = decision_compiler.compile_meeting(meeting)
         self.assertEqual(
             (summary["checked"], summary["regenerated"], summary["discarded"], summary["regenerate_failed"]),
@@ -3102,7 +3127,7 @@ class DecisionRefineTests(TestCase):
 
     def test_the_verification_result_is_logged(self):
         meeting, extracted, refined = self._three_item_meeting()
-        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, refined]),              self.assertLogs("meetalign.decision_refine", level="INFO") as logs:
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, extracted, refined]),              self.assertLogs("meetalign.decision_refine", level="INFO") as logs:
             decision_compiler.compile_meeting(meeting)
         recorded = chr(10).join(logs.output)
         self.assertIn("추천 문장 검증", recorded)
@@ -3122,7 +3147,7 @@ class DecisionRefineTests(TestCase):
             "topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
             "evidence": self.EVIDENCE, "candidate": self.EVIDENCE,
         })
-        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, OSError("down")]),              self.assertLogs("meetalign.decision_refine", level="INFO") as logs:
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, extracted, OSError("down")]),              self.assertLogs("meetalign.decision_refine", level="INFO") as logs:
             summary = decision_compiler.compile_meeting(meeting)
         self.assertEqual((summary["checked"], summary["regenerate_failed"], summary["discarded"]), (1, 1, 0))
         self.assertIn("재생성 실패로 원본 유지", chr(10).join(logs.output))
@@ -3134,7 +3159,7 @@ class DecisionRefineTests(TestCase):
         걸린 항목만 남기면 '깨끗하게 통과한 추출'과 '추출이 돌지 않은 것'을 로그에서 구분할 수 없다.
         """
         meeting, extracted, refined = self._three_item_meeting()
-        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, refined]),              self.assertLogs("meetalign.decision_compiler", level="INFO") as logs:
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, extracted, refined]),              self.assertLogs("meetalign.decision_compiler", level="INFO") as logs:
             decision_compiler.compile_meeting(meeting)
         self.assertIn(
             "결정 추출: 결정 3건 / 검증 3건 / 재생성 1건 / 폐기 1건 / 재생성 실패 0건",
@@ -3153,9 +3178,9 @@ class DecisionRefineTests(TestCase):
             "topic": "로그 보관 기간", "ambiguous": True, "why": "갈립니다",
             "evidence": self.EVIDENCE, "candidate": self.FILLED,
         })
-        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted]) as gen,              self.assertLogs("meetalign.decision_compiler", level="INFO") as logs:
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, extracted]) as gen,              self.assertLogs("meetalign.decision_compiler", level="INFO") as logs:
             decision_compiler.compile_meeting(meeting)
-        self.assertEqual(gen.call_count, 1)
+        self.assertEqual(gen.call_count, 2)  # 추출 + 추천 — 검증에 걸린 게 없으니 재생성은 부르지 않는다
         self.assertIn(
             "결정 추출: 결정 1건 / 검증 1건 / 재생성 0건 / 폐기 0건 / 재생성 실패 0건",
             chr(10).join(logs.output),
@@ -3164,7 +3189,7 @@ class DecisionRefineTests(TestCase):
     # ---- 추출 흐름에 붙어 있는지 ----
 
     def test_compile_saves_the_rewritten_sentence(self):
-        """compile_specs가 저장 전에 이 단계를 거친다 — AI를 두 번 부른다(추출 1 + 재생성 1)."""
+        """compile_specs가 저장 전에 이 단계를 거친다 — AI를 세 번 부른다(추출 1 + 추천 1 + 재생성 1)."""
         host = User.objects.create_user("민수", password="pw12345!")
         team = Team.objects.create(name="t")
         team.members.add(host)
@@ -3177,10 +3202,10 @@ class DecisionRefineTests(TestCase):
             "evidence": self.EVIDENCE, "candidate": self.EVIDENCE,
         })
         rewritten = "민수가 12월 5일까지 로그 보관 기간을 30일로 줄인다"
-        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, self._response(
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}),              patch.object(services, "_generate", side_effect=[extracted, extracted, self._response(
                  {"n": 1, "candidate": rewritten})]) as gen:
             decision_compiler.compile_meeting(meeting)
-        self.assertEqual(gen.call_count, 2)
+        self.assertEqual(gen.call_count, 3)
         self.assertEqual(Interpretation.objects.get().text, rewritten)
 
     def test_a_missing_row_in_the_regeneration_response_keeps_that_candidate(self):
@@ -5650,7 +5675,7 @@ class TextTranscriptUploadTests(TestCase):
         })
 
     def test_text_files_come_first_and_audio_transcripts_follow(self):
-        def fake_stt(path, recording_id=None):
+        def fake_stt(path, recording_id=None, speaker_count=None):
             return "전사:" + os.path.basename(path).split("_")[0].split(".")[0]
         with patch.object(services, "transcribe", side_effect=fake_stt) as stt, \
              patch.object(services, "summarize", return_value="요약") as summarize:
@@ -5968,3 +5993,559 @@ class InboxAnswerTests(TestCase):
         self.assertRedirects(r, "%s#q%d" % (self.inbox, self.question.id), fetch_redirect_response=False)
         self.question.refresh_from_db()
         self.assertEqual(self.question.answer, "옛 화면 답")
+
+
+class DecisionRecommendTests(TestCase):
+    """추천 문장은 결정 추출과 따로 LLM을 불러 쓴다(decision_recommend)."""
+
+    SOURCE = ("화자 E: 목요일에는 3시부터 4시 반까지 수업이 있어요. "
+              "화자 A: 다음 회의는 다음 주 목요일 오후 4시에 하죠. "
+              "화자 D: PPT는 자료 양을 봐야 알 것 같아요. "
+              "화자 A: 주제는 SNS와 소비로 해요.")
+    CLEAR = {"topic": "발표 주제", "ambiguous": False, "final": "발표 주제는 SNS와 소비로 정한다",
+             "evidence": "화자 A: 주제는 SNS와 소비로 해요."}
+    MEETING_TIME = {"topic": "다음 회의 일시", "ambiguous": True, "why": "수업 시간과 겹칩니다",
+                    "impact": "화자 E가 회의에 빠질 수 있다",
+                    "evidence": "화자 A: 다음 회의는 다음 주 목요일 오후 4시에 하죠."}
+    PPT = {"topic": "PPT 기한", "ambiguous": True, "why": "기한이 없어요", "impact": "",
+           "evidence": "화자 D: PPT는 자료 양을 봐야 알 것 같아요."}
+
+    def setUp(self):
+        self.host = User.objects.create_user("민수", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host)
+        self.meeting = Meeting.objects.create(
+            team=self.team, title="m", host=self.host,
+            processing_status=Meeting.STATUS_DONE, transcript=self.SOURCE,
+        )
+
+    def _json(self, *rows):
+        return json.dumps(list(rows), ensure_ascii=False)
+
+    def _compile(self, *responses):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "_generate", side_effect=list(responses)) as gen:
+            decision_compiler.compile_meeting(self.meeting)
+        return {d.what: d for d in self.meeting.decisions.all()}, gen
+
+    def test_extraction_prompt_no_longer_asks_for_recommendations(self):
+        prompt = decision_compiler._compile_prompt(self.SOURCE)
+        self.assertNotIn("candidate", prompt)
+        self.assertNotIn("fills", prompt)
+        self.assertNotIn("가장 그럴듯한 값을 추측", prompt)
+
+    def test_recommend_prompt_carries_context_settled_decisions_and_transcript(self):
+        items = decision_compiler.parse_items(self._json(self.CLEAR, self.MEETING_TIME, self.PPT), self.SOURCE)
+        prompt = decision_recommend.recommend_prompt(items, [1, 2], self.SOURCE)
+        self.assertIn("1) 안건: 다음 회의 일시", prompt)
+        self.assertIn("2) 안건: PPT 기한", prompt)
+        self.assertIn("확인이 필요한 이유: 수업 시간과 겹칩니다", prompt)
+        self.assertIn("그대로 두면 생길 일: 화자 E가 회의에 빠질 수 있다", prompt)
+        self.assertIn("근거 앞뒤 대화:", prompt)
+        # 이미 확정된 결정과 겹치거나 모순되지 않게 하고, 추천 문장끼리도 맞추게 한다.
+        self.assertIn("- 발표 주제는 SNS와 소비로 정한다", prompt)
+        self.assertIn("추천 문장끼리도 기한·담당·순서가 서로 맞아야 한다", prompt)
+        self.assertTrue(prompt.endswith(self.SOURCE))
+
+    def test_recommendations_are_matched_by_number_and_saved_with_fills(self):
+        extracted = self._json(self.CLEAR, self.MEETING_TIME, self.PPT)
+        recommended = self._json(
+            {"n": 2, "candidate": "화자 D가 11월 20일까지 PPT 초안을 단톡방에 올린다",
+             "fills": [{"gap": "기한", "value": "11월 20일", "source": "AI추정"}]},
+            {"n": 1, "candidate": "다음 회의는 다음 주 목요일 오후 5시에 한다",
+             "fills": [{"gap": "기한", "value": "오후 5시", "source": "AI추정"}]},
+        )
+        decisions, gen = self._compile(extracted, recommended)
+        # 추출 + 추천 — 두 문장 모두 검증을 통과해 재생성은 없다
+        self.assertEqual(gen.call_count, 2)
+        time_choice = decisions["다음 회의 일시"].interpretations.get()
+        self.assertEqual(time_choice.text, "다음 회의는 다음 주 목요일 오후 5시에 한다")
+        self.assertEqual(time_choice.fills[0]["value"], "오후 5시")
+        self.assertIn("PPT 초안", decisions["PPT 기한"].interpretations.get().text)
+        # 명확한 항목은 추천 호출의 영향을 받지 않는다.
+        self.assertEqual(decisions["발표 주제"].final_text, "발표 주제는 SNS와 소비로 정한다")
+
+    def test_a_missing_or_vague_recommendation_leaves_that_item_to_direct_writing(self):
+        extracted = self._json(self.MEETING_TIME, self.PPT)
+        recommended = self._json({"n": 1, "candidate": "다음 회의는 나중에 정한다"})
+        decisions, _ = self._compile(extracted, recommended)
+        time_item = decisions["다음 회의 일시"]
+        self.assertFalse(time_item.interpretations.exists())
+        self.assertIn("(구체적으로 적기)", time_item.draft_hint)
+        self.assertFalse(decisions["PPT 기한"].interpretations.exists())
+        self.assertTrue(decisions["PPT 기한"].has_warning)
+
+    def test_an_unreadable_recommendation_is_retried_once(self):
+        extracted = self._json(self.MEETING_TIME)
+        recommended = self._json({"n": 1, "candidate": "다음 회의는 다음 주 목요일 오후 5시에 한다"})
+        decisions, gen = self._compile(extracted, "형식이 깨진 응답", recommended)
+        self.assertEqual(gen.call_count, 3)
+        self.assertTrue(decisions["다음 회의 일시"].interpretations.exists())
+
+    def test_a_failed_recommendation_call_keeps_the_extraction(self):
+        extracted = self._json(self.CLEAR, self.MEETING_TIME)
+        decisions, _ = self._compile(extracted, OSError("down"))
+        self.assertEqual(sorted(decisions), ["다음 회의 일시", "발표 주제"])
+        self.assertTrue(decisions["다음 회의 일시"].has_warning)
+        self.assertFalse(decisions["다음 회의 일시"].interpretations.exists())
+
+    def test_fake_mode_still_shows_recommendations_without_any_call(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(services, "_generate") as gen:
+            decision_compiler.compile_meeting(self.meeting)
+        gen.assert_not_called()
+        self.assertTrue(Interpretation.objects.filter(decision__meeting=self.meeting).exists())
+
+
+class KoreanTimezoneTests(TestCase):
+    """날짜 계산은 한국 시간으로 한다 — UTC로 두면 오전 0~9시에 만든 회의의 날짜가 하루 당겨진다."""
+
+    def test_meeting_date_in_prompt_uses_korean_time(self):
+        host = User.objects.create_user("민수", password="pw12345!")
+        team = Team.objects.create(name="t")
+        meeting = Meeting.objects.create(team=team, title="m", host=host)
+        # 한국 시간 2026-11-18(수) 오전 1시 = UTC 2026-11-17 16시
+        from datetime import datetime, timezone as dt_timezone
+        utc_moment = datetime(2026, 11, 17, 16, 0, tzinfo=dt_timezone.utc)
+        Meeting.objects.filter(pk=meeting.pk).update(created_at=utc_moment)
+        meeting.refresh_from_db()
+        self.assertEqual(decision_compiler.collect_meeting_info(meeting)["date"], "2026년 11월 18일 (수)")
+
+class BackgroundDecisionCompileTests(TestCase):
+    """결정 사항 추출은 요청 안에서 기다리지 않고 백그라운드에서 돈다(tasks.start_decision_compile)."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host)
+        self.meeting = Meeting.objects.create(
+            team=self.team, title="m", host=self.host,
+            processing_status=Meeting.STATUS_DONE, transcript="배포 스크립트는 제가 금요일까지 정리하겠습니다.",
+        )
+        self.client.force_login(self.host)
+        self.url = reverse("decision_review", args=[self.meeting.id])
+        self.addCleanup(tasks._decision_jobs.pop, self.meeting.id, None)
+
+    def test_compile_starts_a_thread_and_the_page_shows_progress_and_refreshes(self):
+        with override_settings(BACKGROUND_DECISIONS=True), patch.object(tasks.threading, "Thread") as thread:
+            r = self.client.post(self.url, {"action": "compile"})
+            self.assertRedirects(r, self.url)
+            thread.return_value.start.assert_called_once()
+            page = self.client.get(self.url)
+        self.assertContains(page, "data-compiling")
+        self.assertContains(page, 'http-equiv="refresh"')
+        self.assertNotContains(page, 'value="compile"')
+
+    def test_a_second_click_while_running_does_not_start_another_job(self):
+        with override_settings(BACKGROUND_DECISIONS=True), patch.object(tasks.threading, "Thread") as thread:
+            self.client.post(self.url, {"action": "compile"})
+            self.client.post(self.url, {"action": "compile"})
+        self.assertEqual(thread.return_value.start.call_count, 1)
+
+    def test_the_job_saves_decisions_and_the_page_stops_refreshing(self):
+        with override_settings(BACKGROUND_DECISIONS=True), patch.object(tasks.threading, "Thread") as thread:
+            self.client.post(self.url, {"action": "compile"})
+        # 스레드가 할 일을 그 자리에서 돌린다(가짜 응답 모드 — LLM 없음).
+        with patch.dict(os.environ, {}, clear=True):
+            tasks._run_decision_compile(self.meeting.id)
+        page = self.client.get(self.url)
+        self.assertTrue(self.meeting.decisions.exists())
+        self.assertNotContains(page, 'http-equiv="refresh"')
+        self.assertNotContains(page, "data-compiling")
+
+    def test_a_failed_job_shows_its_reason_once(self):
+        tasks._decision_jobs[self.meeting.id] = {"running": True, "error": ""}
+        with patch.object(decision_compiler, "compile_meeting",
+                          side_effect=decision_compiler.DecisionCompileError("AI 응답을 결정로 읽지 못했습니다.")):
+            tasks._run_decision_compile(self.meeting.id)
+        self.assertContains(self.client.get(self.url), "AI 응답을 결정로 읽지 못했습니다.")
+        self.assertNotContains(self.client.get(self.url), "AI 응답을 결정로 읽지 못했습니다.")
+
+    def test_an_unexpected_error_does_not_leave_the_page_spinning(self):
+        tasks._decision_jobs[self.meeting.id] = {"running": True, "error": ""}
+        with patch.object(decision_compiler, "compile_meeting", side_effect=ValueError("boom")):
+            tasks._run_decision_compile(self.meeting.id)
+        self.assertFalse(tasks.decision_compile_state(self.meeting.id)["running"])
+        self.assertContains(self.client.get(self.url), "결정 사항 추출 중 오류가 났습니다")
+
+    def test_an_already_compiled_meeting_is_refused_without_starting_a_job(self):
+        Decision.objects.create(meeting=self.meeting, order=0, what="x", final_text="x")
+        with override_settings(BACKGROUND_DECISIONS=True), patch.object(tasks.threading, "Thread") as thread:
+            r = self.client.post(self.url, {"action": "compile"})
+        thread.assert_not_called()
+        self.assertContains(r, "이미 결정 사항을 추출한 회의입니다")
+
+
+class GeminiTimeoutTests(TestCase):
+    """긴 프롬프트는 그만큼 더 기다린다(services.gemini_timeout)."""
+
+    def test_short_prompts_keep_the_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(services.gemini_timeout("짧은 질문"), 60)
+
+    def test_long_prompts_wait_longer_up_to_the_ceiling(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(services.gemini_timeout("가" * 50000), 60 + 5 * 30)
+            self.assertEqual(services.gemini_timeout("가" * 500000), 300)
+
+    def test_settings_override_each_part(self):
+        env = {"GEMINI_TIMEOUT": "90", "GEMINI_TIMEOUT_PER_10K": "10", "GEMINI_MAX_TIMEOUT": "120"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(services.gemini_timeout("가" * 20000), 110)
+            self.assertEqual(services.gemini_timeout("가" * 90000), 120)
+        # 기본값을 상한보다 크게 잡아 두면 기본값을 따른다.
+        with patch.dict(os.environ, {"GEMINI_TIMEOUT": "400"}, clear=True):
+            self.assertEqual(services.gemini_timeout("가" * 90000), 400)
+
+    def test_the_request_uses_the_scaled_timeout(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {"candidates": [{"content": {"parts": [{"text": "답"}]}}]}).encode()
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "m"}, clear=True), \
+             patch.object(services.urllib.request, "urlopen", return_value=response) as urlopen:
+            services._generate_gemini("가" * 30000)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 60 + 3 * 30)
+
+
+class LongRecordingChunkTests(TestCase):
+    """Groq 업로드 한도보다 큰 녹음은 조각으로 나눠 전사하고 이어 붙인다(services._transcribe_groq_long)."""
+
+    def _wav(self, seconds, rate=8000):
+        import math, wave as wave_module
+        path = os.path.join(tempfile.mkdtemp(), "long.wav")
+        with wave_module.open(path, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(rate)
+            frames = bytearray()
+            for i in range(int(seconds * rate)):
+                value = int(8000 * math.sin(2 * math.pi * 440 * i / rate))
+                frames += value.to_bytes(2, "little", signed=True)
+            out.writeframes(bytes(frames))
+        return path
+
+    def test_split_audio_makes_16khz_mono_chunks_that_cover_the_whole_recording(self):
+        try:
+            import av  # noqa: F401
+        except ImportError:
+            self.skipTest("PyAV가 없는 환경")
+        import wave as wave_module
+        chunks = services._split_audio(self._wav(3.5), 1, tempfile.mkdtemp())
+        self.assertEqual([round(start, 2) for start, _ in chunks], [0.0, 1.0, 2.0, 3.0])
+        lengths = []
+        for _, chunk_path in chunks:
+            with wave_module.open(chunk_path) as chunk:
+                self.assertEqual((chunk.getnchannels(), chunk.getframerate(), chunk.getsampwidth()), (1, 16000, 2))
+                lengths.append(chunk.getnframes() / chunk.getframerate())
+        self.assertAlmostEqual(sum(lengths), 3.5, places=1)
+
+    def test_an_unreadable_file_raises_runtime_error(self):
+        path = os.path.join(tempfile.mkdtemp(), "broken.m4a")
+        with open(path, "wb") as broken:
+            broken.write(b"not audio at all")
+        with self.assertRaises(RuntimeError):
+            services._split_audio(path, 1, tempfile.mkdtemp())
+
+    def test_a_small_recording_is_sent_whole(self):
+        path = self._wav(0.5)
+        with patch.object(services, "_transcribe_groq", return_value="전사") as groq, \
+             patch.object(services, "_split_audio") as split:
+            self.assertEqual(services._transcribe_groq_long(path), "전사")
+        split.assert_not_called()
+        groq.assert_called_once_with(path, with_segments=False)
+
+    def test_a_large_recording_is_split_and_joined_in_order(self):
+        path = self._wav(0.5)
+        chunks = [(0.0, "/c0.wav"), (600.0, "/c1.wav"), (1200.0, "/c2.wav")]
+        with patch.dict(os.environ, {"GROQ_MAX_UPLOAD_MB": "0.001"}), \
+             patch.object(services, "_split_audio", return_value=chunks), \
+             patch.object(services, "_transcribe_groq", side_effect=["앞부분", " 가운데 ", "끝부분"]) as groq:
+            self.assertEqual(services._transcribe_groq_long(path), "앞부분 가운데 끝부분")
+        self.assertEqual([c.args[0] for c in groq.call_args_list], ["/c0.wav", "/c1.wav", "/c2.wav"])
+
+    def test_segments_are_shifted_to_the_original_timeline(self):
+        path = self._wav(0.5)
+        chunks = [(0.0, "/c0.wav"), (600.0, "/c1.wav")]
+        responses = [[{"start": 1.0, "end": 2.0, "text": "가"}], [{"start": 3.0, "end": 4.5, "text": "나"}]]
+        with patch.dict(os.environ, {"GROQ_MAX_UPLOAD_MB": "0.001"}), \
+             patch.object(services, "_split_audio", return_value=chunks), \
+             patch.object(services, "_transcribe_groq", side_effect=responses):
+            segments = services._transcribe_groq_long(path, with_segments=True)
+        self.assertEqual(segments, [{"start": 1.0, "end": 2.0, "text": "가"},
+                                    {"start": 603.0, "end": 604.5, "text": "나"}])
+
+    def test_chunk_length_never_exceeds_the_upload_limit(self):
+        with patch.dict(os.environ, {"GROQ_CHUNK_SECONDS": "3600", "GROQ_MAX_UPLOAD_MB": "24"}):
+            self.assertLessEqual(services._chunk_seconds() * services.CHUNK_BYTES_PER_SECOND,
+                                 24 * 1024 * 1024)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GROQ_CHUNK_SECONDS", None)
+            os.environ.pop("GROQ_MAX_UPLOAD_MB", None)
+            self.assertEqual(services._chunk_seconds(), 600)
+
+    def test_transcribe_uses_the_chunked_path_for_groq(self):
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}, clear=True), \
+             patch.object(services, "_transcribe_groq_long", return_value="긴 회의 전사") as long_path:
+            self.assertEqual(services.transcribe("/x.wav"), "긴 회의 전사")
+        long_path.assert_called_once_with("/x.wav")
+
+    def test_a_failed_split_falls_back_to_local_whisper(self):
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k", "FASTER_WHISPER_MODEL": "m"}, clear=True), \
+             patch.object(services, "_transcribe_groq_long", side_effect=RuntimeError("나누지 못했습니다")), \
+             patch.object(services, "_transcribe_local", return_value="로컬 전사") as local:
+            self.assertEqual(services.transcribe("/x.wav"), "로컬 전사")
+        local.assert_called_once()
+
+
+
+class EvidenceMatchingTests(TestCase):
+    """근거 대조는 화자 표시·띄어쓰기를 무시하고, " / "로 묶인 근거는 조각마다 본다.
+
+    화자 분리가 한 사람의 말을 끊어 다음 줄 다른 화자에게 붙이면("…그냥 그걸로 ⏎ 화자 D: 하겠습니다"),
+    AI는 끊긴 말을 이어 붙여 인용한다. 그 인용을 '원문에 없다'고 보면 명확한 결정이 확인 필요로 밀려났다.
+    """
+
+    SOURCE = ("화자 T: 이름은 뭐...\n"
+              "화자 U: 그걸로 하시죠? 네, 믿어 온라인 이름은 괜찮은 것 같은데 그냥 그걸로\n"
+              "화자 D: 하겠습니다 믿어\n"
+              "화자 F: 온라인 좋습니다\n"
+              "화자 D: 그냥 심플앱 사주 뭐")
+
+    def _squashed(self):
+        return decision_checks.squash_transcript(self.SOURCE)
+
+    def test_a_quote_split_across_speaker_lines_is_found(self):
+        quote = "화자 U: 믿어 온라인 이름은 괜찮은 것 같은데 그냥 그걸로 하겠습니다"
+        self.assertTrue(decision_checks.quote_in_source(quote, self._squashed()))
+
+    def test_every_part_of_a_slash_joined_quote_must_be_found(self):
+        joined = ("화자 U: 믿어 온라인 이름은 괜찮은 것 같은데 그냥 그걸로 하겠습니다 / "
+                  "화자 D: 그냥 심플앱 사주 뭐 / 화자 F: 믿어 온라인 좋습니다")
+        self.assertTrue(decision_checks.quote_in_source(joined, self._squashed()))
+        self.assertFalse(decision_checks.quote_in_source(
+            "화자 D: 그냥 심플앱 사주 뭐 / 화자 F: 이름은 내일 정해요", self._squashed()))
+
+    def test_made_up_words_are_still_rejected(self):
+        self.assertFalse(decision_checks.quote_in_source("믿어 온라인으로 확정합니다", self._squashed()))
+        self.assertFalse(decision_checks.quote_in_source("", self._squashed()))
+
+    def test_parse_items_keeps_a_clear_decision_whose_quote_crossed_speaker_lines(self):
+        raw = json.dumps([{"topic": "프로젝트 이름", "ambiguous": False,
+                           "final": "프로젝트 이름은 믿어 온라인으로 정한다",
+                           "evidence": "화자 U: 믿어 온라인 이름은 괜찮은 것 같은데 그냥 그걸로 하겠습니다 / 화자 F: 믿어 온라인 좋습니다"}],
+                         ensure_ascii=False)
+        item = decision_compiler.parse_items(raw, source_text=self.SOURCE)[0]
+        self.assertEqual(item["final"], "프로젝트 이름은 믿어 온라인으로 정한다")
+        self.assertEqual(item["unverified_final"], "")
+
+    def test_fill_quotes_get_the_same_tolerance(self):
+        fills = [{"gap": "선택지", "value": "믿어 온라인", "source": "원문",
+                  "quote": "믿어 온라인 이름은 괜찮은 것 같은데 그냥 그걸로 하겠습니다"}]
+        verified = decision_checks.verify_fill_sources(fills, self.SOURCE)
+        self.assertEqual(verified[0]["source"], "원문")
+
+    def test_a_source_quote_must_contain_the_filled_value(self):
+        """전사본에 있는 아무 구절이나 붙여 놓고 짐작한 값을 '원문'이라고 하면 추정으로 내린다."""
+        fills = [{"gap": "담당", "value": "demo_account1", "source": "원문", "quote": "그냥 심플앱 사주 뭐"}]
+        self.assertEqual(decision_checks.verify_fill_sources(fills, self.SOURCE)[0]["source"], "AI추정")
+
+    def test_a_vague_unverified_sentence_becomes_a_draft_hint_instead_of_a_choice(self):
+        item = {"topic": "x", "ambiguous": False, "final": "", "unverified_final": "자료는 나중에 공유한다",
+                "evidence": "", "candidates": [], "draft_hint": "", "impact": "", "why": "", "fills": []}
+        warnings, reason, final, candidates, hint = decision_compiler._resolve_item(item)
+        self.assertEqual((reason, candidates), ("근거를 원문에서 확인하지 못했어요", []))
+        self.assertIn("(구체적으로 적기)", hint)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
+class SpeakerCountUploadTests(TestCase):
+    """녹음마다 말한 사람 수를 적으면 화자 분리가 그 수로 목소리를 묶는다."""
+
+    def setUp(self):
+        self.user = User.objects.create_user("a", password="pw12345!")
+        self.client.force_login(self.user)
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.user)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.user)
+        self.url = reverse("meeting_detail", args=[self.meeting.id])
+
+    def _post(self, counts, names=("a.wav",), text_file=False):
+        data = {"action": "submit", "speaker_counts": list(counts),
+                "recording": [SimpleUploadedFile(n, b"RIFF", content_type="audio/wav") for n in names]}
+        if text_file:
+            data["text_file"] = [SimpleUploadedFile("메모.txt", "메모".encode(), content_type="text/plain")]
+        with patch.object(services, "transcribe", return_value="전사") as stt, \
+             patch.object(services, "summarize", side_effect=lambda t: t):
+            r = self.client.post(self.url, data)
+        return r, stt
+
+    def _count_of(self, prefix):
+        return self.meeting.recordings.get(file__startswith="recordings/" + prefix).speaker_count
+
+    def test_each_staged_recording_row_gets_its_own_field(self):
+        r = self.client.get(self.url)
+        self.assertContains(r, "data-speaker-count")
+        self.assertContains(r, 'count.name = "speaker_counts"')
+        self.assertNotContains(r, 'name="speaker_count"')
+
+    def test_counts_follow_the_recordings_in_order(self):
+        r, stt = self._post(["4", "", "2"], names=("one.wav", "two.wav", "three.wav"), text_file=True)
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual((self._count_of("one"), self._count_of("two"), self._count_of("three")), (4, None, 2))
+        self.assertIsNone(self.meeting.recordings.get(file__endswith=".txt").speaker_count)
+        self.assertEqual(sorted(c.kwargs["speaker_count"] or 0 for c in stt.call_args_list), [0, 2, 4])
+        self.assertContains(self.client.get(self.url), "말한 사람 4명")
+
+    def test_missing_fields_mean_automatic(self):
+        _, stt = self._post([])
+        self.assertIsNone(self.meeting.recordings.get().speaker_count)
+        self.assertIsNone(stt.call_args.kwargs["speaker_count"])
+
+    def test_invalid_counts_are_rejected_with_the_file_name_and_nothing_is_saved(self):
+        for bad in ("0", "21", "두 명", "-3", "2.5"):
+            r, stt = self._post(["3", bad], names=("ok.wav", "bad.wav"))
+            self.assertContains(r, "bad.wav: 말한 사람 수는 1~20 사이 숫자로", msg_prefix=bad)
+            stt.assert_not_called()
+        self.assertFalse(self.meeting.recordings.exists())
+
+    def test_retry_keeps_the_count(self):
+        rec = Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("f.wav", b"R"),
+                                       status=Recording.STATUS_FAILED, speaker_count=3)
+        with patch.object(services, "transcribe", return_value="전사") as stt, \
+             patch.object(services, "summarize", side_effect=lambda t: t):
+            self.client.post(reverse("recording_retry", args=[self.meeting.id, rec.id]))
+        self.assertEqual(stt.call_args.kwargs["speaker_count"], 3)
+
+    def test_local_diarization_uses_the_count_over_the_env_setting(self):
+        result = MagicMock(returncode=0, stdout="[[0, 1, 0]]", stderr="")
+        with patch.dict(os.environ, {"DIARIZATION_NUM_SPEAKERS": "7", "DIARIZATION_THRESHOLD": "0.9"}), \
+             patch.object(services.subprocess, "run", return_value=result) as run:
+            services._diarize("/a.wav", 3)
+            self.assertEqual(run.call_args.args[0][-2:], ["3", "0.9"])
+            services._diarize("/a.wav")
+            self.assertEqual(run.call_args.args[0][-2:], ["7", "0.9"])
+
+    def test_clova_is_told_the_count(self):
+        captured = {}
+
+        def fake_multipart(path, params):
+            captured.update(params)
+            return iter([b""]), 0, "multipart/form-data"
+
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {"result": "COMPLETED", "text": "전사", "segments": []}).encode()
+        env = {"CLOVA_SPEECH_INVOKE_URL": "https://x", "CLOVA_SPEECH_SECRET_KEY": "k", "CLOVA_SPEECH_DIARIZATION": "1"}
+        with patch.dict(os.environ, env), patch.object(services, "_clova_multipart", side_effect=fake_multipart), \
+             patch.object(services.urllib.request, "urlopen", return_value=response):
+            services._transcribe_clova("/a.wav", 4)
+        self.assertEqual(captured["diarization"], {"enable": True, "speakerCountMin": 4, "speakerCountMax": 4})
+
+
+class DiarizeWorkerCountTests(TestCase):
+    """화자 수를 정해 줘도 sherpa-onnx가 더 적게 나누면, 요청 수를 올려 다시 묶는다(diarize_worker.diarize)."""
+
+    def _fake_sherpa(self, counts_by_request):
+        """num_clusters → 나올 화자 수. 실제 모델 없이 묶음 결과만 흉내낸다."""
+        calls = []
+
+        class Turn:
+            def __init__(self, start, speaker):
+                self.start, self.end, self.speaker = start, start + 1, speaker
+
+        class Result(list):
+            def sort_by_start_time(self):
+                return self
+
+        class Engine:
+            def __init__(self, config):
+                self.config = config
+
+            def set_config(self, config):
+                self.config = config
+
+            def process(self, audio):
+                requested = self.config["num_clusters"]
+                calls.append(requested)
+                return Result(Turn(i, i) for i in range(counts_by_request.get(requested, max(requested, 1))))
+
+        fake = types.SimpleNamespace(
+            OfflineSpeakerDiarization=Engine,
+            OfflineSpeakerDiarizationConfig=lambda **kw: {"num_clusters": kw["clustering"]["num_clusters"]},
+            OfflineSpeakerSegmentationModelConfig=lambda **kw: kw,
+            OfflineSpeakerSegmentationPyannoteModelConfig=lambda **kw: kw,
+            SpeakerEmbeddingExtractorConfig=lambda **kw: kw,
+            FastClusteringConfig=lambda **kw: kw,
+        )
+        return fake, calls
+
+    def _run(self, num_speakers, counts_by_request):
+        from . import diarize_worker
+        fake, calls = self._fake_sherpa(counts_by_request)
+        with patch.dict(sys.modules, {"sherpa_onnx": fake}), \
+             patch.object(diarize_worker, "ensure_models", return_value=("seg", "emb")), \
+             patch.object(diarize_worker, "load_audio", return_value=[]):
+            turns = diarize_worker.diarize("/a.wav", "/models", num_speakers, 0.9)
+        return len({speaker for _, _, speaker in turns}), calls
+
+    def test_a_short_result_is_retried_with_a_higher_request(self):
+        self.assertEqual(self._run(4, {4: 3, 5: 4}), (4, [4, 5]))
+
+    def test_an_exact_result_is_not_retried(self):
+        self.assertEqual(self._run(3, {3: 3}), (3, [3]))
+
+    def test_retries_stop_after_two_and_keep_the_closest_without_going_over(self):
+        self.assertEqual(self._run(5, {5: 4, 6: 4, 7: 4}), (4, [5, 6, 7]))
+        # 다시 묶었더니 요청보다 많아지면 그 결과는 쓰지 않는다.
+        self.assertEqual(self._run(4, {4: 3, 5: 6, 6: 6}), (3, [4, 5, 6]))
+
+    def test_automatic_mode_runs_once(self):
+        self.assertEqual(self._run(0, {-1: 5}), (5, [-1]))
+
+
+
+class AssigneeGuessTests(TestCase):
+    """담당자는 녹취 안에서 추론한다 — 녹취에 나온 이름, 대화로 드러난 이름, 그것도 안 되면 맡은 화자의 기호.
+    참석자 명단에서 근거 없이 고른 이름은 걸러낸다."""
+
+    SOURCE = "화자 A: 발표 자료는 누가 할까요. 화자 B: 지은 씨가 맡아 주세요. 화자 D: 자료조사는 제가 할게요."
+    PEOPLE = ["demo_account1", "지은", "민수"]
+
+    def test_a_name_from_the_participant_list_that_never_appears_in_the_transcript_is_flagged(self):
+        ok, reasons = decision_checks.check_candidate(
+            "demo_account1이 11월 23일까지 발표 자료를 만든다", "화자 A: 발표 자료는 누가 할까요.",
+            participant_names=self.PEOPLE, source=self.SOURCE)
+        self.assertFalse(ok)
+        self.assertIn("원문에 나오지 않은 사람을 담당자로 적었어요: demo_account1", reasons)
+
+    def test_a_name_said_in_the_meeting_is_allowed_and_counts_as_new_information(self):
+        ok, reasons = decision_checks.check_candidate(
+            "지은이 발표 자료를 만든다", "화자 A: 발표 자료는 누가 할까요.",
+            participant_names=self.PEOPLE, source=self.SOURCE)
+        self.assertEqual((ok, reasons), (True, []))
+
+    def test_a_speaker_label_as_the_assignee_counts_as_filling_the_gap(self):
+        """이름을 알 수 없으면 하겠다고 나선 화자를 담당자로 적는다 — 근거 줄 머리의 같은 기호와는 비교하지 않는다."""
+        ok, reasons = decision_checks.check_candidate(
+            "화자 D가 자료조사를 맡는다", "화자 D: 자료조사는 제가 할게요.",
+            participant_names=self.PEOPLE, source=self.SOURCE)
+        self.assertEqual((ok, reasons), (True, []))
+
+    def test_a_speaker_label_fill_backed_by_the_speaker_line_is_from_the_transcript(self):
+        fills = [{"gap": "담당", "value": "화자 D", "source": "원문", "quote": "화자 D: 자료조사는 제가 할게요."}]
+        self.assertEqual(decision_checks.verify_fill_sources(fills, self.SOURCE)[0]["source"], "원문")
+
+    def test_prompts_ask_to_infer_assignees_from_the_transcript(self):
+        rules = decision_compiler.FILL_RULES
+        self.assertIn("담당자는 녹취 원문 안에서 최대한 추론", rules)
+        self.assertIn("다음 화자가 대답했거나", rules)
+        self.assertIn("화자 기호", rules)
+        self.assertIn("참석자 명단에서 녹취에 근거 없이 아무 이름이나 고르지 마라", rules)
+        self.assertNotIn("담당자 지정 필요", rules)
+        block = decision_compiler._meeting_info_block(
+            {"date": "2026년 11월 18일 (수)", "participants": self.PEOPLE, "deadline": "", "carryover": []})
+        self.assertIn("명단에서 골라 담당자를 정하지 마라", block)
+        items = [{"topic": "발표", "evidence": "", "candidates": [{"text": "발표 자료를 만든다"}],
+                  "check": {"reasons": ["원문에 없던 담당자·기한·수치가 하나도 없어요"]}, "final": ""}]
+        refine = decision_refine._refine_prompt(items, [0], self.SOURCE, None)
+        self.assertIn("담당자는 녹취 안에서 추론한다", refine)
+        self.assertNotIn("담당자 지정 필요", refine)

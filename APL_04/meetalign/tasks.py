@@ -64,7 +64,9 @@ def process_recording(recording_id, refresh=True):
             if recording.is_text:
                 recording.transcript = services.read_text_transcript(recording.file.path)
             else:
-                recording.transcript = services.transcribe(recording.file.path, recording_id=recording.id) or ""
+                recording.transcript = services.transcribe(
+                    recording.file.path, recording_id=recording.id, speaker_count=recording.speaker_count,
+                ) or ""
             recording.status = Recording.STATUS_DONE
             recording.error_message = ""
         except Exception as exc:
@@ -153,6 +155,78 @@ def start_refresh(meeting_id):
         finally:
             with _active_lock:
                 _refreshing.discard(meeting_id)
+            close_old_connections()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# 결정 사항 추출 — 버튼을 누른 요청 안에서 기다리지 않고 백그라운드에서 돈다.
+#
+# 추출은 AI를 1~3번 차례로 부른다(추출 → 추천 → 재생성). 긴 회의면 몇 분이 걸려서 요청
+# 안에서 기다리면 Cloudflare 터널의 100초 제한에 걸려 진행자 화면에 524 오류가 뜨고, 서버는 계속 돌아
+# 결과를 저장하는데 진행자는 실패한 줄 알고 버튼을 또 눌렀다. 그래서 녹음 처리와 같은 방식으로 스레드에서
+# 돌리고, 화면은 '추출 중'을 보여주며 스스로 새로 고친다(decision_review.html).
+#
+# 상태는 메모리에만 둔다(녹음 처리의 _active와 같다). 서버가 재시작되면 '추출 중' 표시가 사라지고
+# 결정이 없으니 추출 버튼이 다시 보인다 — 진행자가 다시 누르면 된다.
+# ---------------------------------------------------------------------------
+
+_decision_jobs = {}  # meeting_id → {"running": bool, "error": str}
+
+
+def decision_compile_state(meeting_id):
+    """{"running": 추출 중인가, "error": 마지막 추출의 실패 사유(없으면 "")}."""
+    with _active_lock:
+        job = _decision_jobs.get(meeting_id) or {}
+        return {"running": bool(job.get("running")), "error": job.get("error", "")}
+
+
+def pop_decision_compile_error(meeting_id):
+    """끝난 추출의 실패 사유를 한 번만 돌려준다 — 화면에 한 번 보여주면 지운다."""
+    with _active_lock:
+        job = _decision_jobs.get(meeting_id)
+        if not job or job.get("running"):
+            return ""
+        _decision_jobs.pop(meeting_id, None)
+        return job.get("error", "")
+
+
+def _run_decision_compile(meeting_id):
+    # 순환 import를 피하려고 여기서 부른다(decision_compiler가 services·models를 쓴다).
+    from . import decision_compiler
+    error = ""
+    try:
+        decision_compiler.compile_meeting(Meeting.objects.get(pk=meeting_id))
+    except decision_compiler.DecisionCompileError as exc:
+        error = str(exc)
+    except Meeting.DoesNotExist:
+        error = ""
+    except Exception:
+        logger.exception("decision compile failed for meeting %s", meeting_id)
+        error = "결정 사항 추출 중 오류가 났습니다. 잠시 뒤 다시 시도해 주세요."
+    with _active_lock:
+        _decision_jobs[meeting_id] = {"running": False, "error": error}
+
+
+def start_decision_compile(meeting_id):
+    """결정 사항 추출을 시작한다. 이미 추출 중이면 아무것도 하지 않는다(버튼을 두 번 눌러도 한 번만 돈다).
+
+    BACKGROUND_DECISIONS가 꺼져 있으면(테스트) 그 자리에서 끝까지 돈다. 어느 쪽이든 끝난 결과는
+    decision_compile_state / pop_decision_compile_error로 읽는다.
+    """
+    with _active_lock:
+        if (_decision_jobs.get(meeting_id) or {}).get("running"):
+            return
+        _decision_jobs[meeting_id] = {"running": True, "error": ""}
+    if not getattr(settings, "BACKGROUND_DECISIONS", True):
+        _run_decision_compile(meeting_id)
+        return
+
+    def run():
+        try:
+            _run_decision_compile(meeting_id)
+        finally:
             close_old_connections()
 
     threading.Thread(target=run, daemon=True).start()

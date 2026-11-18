@@ -59,22 +59,51 @@ def load_audio(path):
     return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
 
-def diarize(path, model_dir, num_speakers=0, threshold=DEFAULT_THRESHOLD):
-    import sherpa_onnx
+# 화자 수를 정해 줘도 sherpa-onnx가 그보다 적게 나누는 일이 있다. 5분 시험 녹음에서 2·3명은 그대로 나왔지만 4명을 주면
+# 3명, 5명을 주면 4명이 나왔다(묶음 하나가 겹침 정리 뒤 비어 버린다). 그래서 모자라면 요청 수를 하나씩 올려 다시 묶고,
+# 요청한 수에 가장 가까운 결과를 쓴다. 녹음·모델은 한 번만 읽고 묶는 설정만 바꾼다(set_config).
+COUNT_RETRIES = 2
 
-    segmentation, embedding = ensure_models(model_dir)
-    threads = max(1, min(4, os.cpu_count() or 1))
-    config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+
+def _config(segmentation, embedding, threads, num_clusters, threshold):
+    import sherpa_onnx
+    return sherpa_onnx.OfflineSpeakerDiarizationConfig(
         segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
             pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=segmentation), num_threads=threads,
         ),
         embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=embedding, num_threads=threads),
-        # 화자 수를 알면 그만큼으로 묶고, 모르면(0) threshold로 자동 판단한다. 값이 클수록 화자를 적게 나눈다.
-        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=num_speakers or -1, threshold=threshold),
+        # 화자 수를 알면 그만큼으로 묶고, 모르면(-1) threshold로 자동 판단한다. 값이 클수록 화자를 적게 나눈다.
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=num_clusters, threshold=threshold),
         min_duration_on=0.3, min_duration_off=0.5,
     )
-    result = sherpa_onnx.OfflineSpeakerDiarization(config).process(load_audio(path)).sort_by_start_time()
-    return [[round(turn.start, 2), round(turn.end, 2), turn.speaker] for turn in result]
+
+
+def _turns(result):
+    return [[round(turn.start, 2), round(turn.end, 2), turn.speaker] for turn in result.sort_by_start_time()]
+
+
+def diarize(path, model_dir, num_speakers=0, threshold=DEFAULT_THRESHOLD, retries=COUNT_RETRIES):
+    import sherpa_onnx
+
+    segmentation, embedding = ensure_models(model_dir)
+    threads = max(1, min(4, os.cpu_count() or 1))
+    audio = load_audio(path)
+    engine = sherpa_onnx.OfflineSpeakerDiarization(
+        _config(segmentation, embedding, threads, num_speakers or -1, threshold))
+    turns = _turns(engine.process(audio))
+    if num_speakers <= 0:
+        return turns
+    best = turns
+    for extra in range(1, retries + 1):
+        found = len({speaker for _, _, speaker in best})
+        if found >= num_speakers:
+            break
+        engine.set_config(_config(segmentation, embedding, threads, num_speakers + extra, threshold))
+        candidate = _turns(engine.process(audio))
+        # 요청보다 많이 나뉜 결과는 쓰지 않는다 — 사람이 적은 수를 알려 줬으니 그 이상은 쪼갠 것이다.
+        if found < len({speaker for _, _, speaker in candidate}) <= num_speakers:
+            best = candidate
+    return best
 
 
 def main(argv):
