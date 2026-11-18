@@ -16,7 +16,7 @@ from django.test.utils import CaptureQueriesContext
 from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
 
-from . import decision_compiler, services, tasks, views, whisper_worker
+from . import decision_checks, decision_compiler, services, tasks, views, whisper_worker
 from .models import (
     ChatMessage, Checkpoint, Decision, DecisionAgreement,
     Interpretation, Meeting, Notification, Question, Recording, SttUsage, Team,
@@ -2035,6 +2035,54 @@ class DecisionWarningTests(TestCase):
             decision_compiler.safety_warnings("민수가 금요일까지 배포한다", "그쪽에서 얘기한 대로 민수가 금요일까지 배포하기로 했어요"),
             [],
         )
+
+
+class DecisionCandidateCheckTests(TestCase):
+    """AI 추천 문장을 그대로 쓸 만한지 보는 세 가지 검사(decision_checks). DB·LLM 없이 도는 순수 함수다."""
+
+    COPIED = "로그는 일단 한 달 정도면 충분할 것 같은데요"
+    FILLED = "민수가 12월 5일까지 로그 보관 기간을 30일로 바꾼다"
+
+    def test_a_candidate_that_copies_the_evidence_is_flagged(self):
+        """근거를 그대로 옮긴 문장은 빈칸을 채운 것이 아니다."""
+        ok, reasons = decision_checks.check_candidate(self.COPIED, self.COPIED)
+        self.assertFalse(ok)
+        self.assertIn("추천 문장이 원문 근거와 거의 같아요", reasons)
+
+    def test_a_candidate_with_no_new_information_is_flagged(self):
+        ok, reasons = decision_checks.check_candidate("로그 보관 기간을 정한다", "로그 보관 기간을 정해야 해요")
+        self.assertFalse(ok)
+        self.assertIn("원문에 없던 담당자·기한·수치가 하나도 없어요", reasons)
+
+    def test_a_filled_candidate_passes(self):
+        ok, reasons = decision_checks.check_candidate(self.FILLED, self.COPIED, participant_names=["민수"])
+        self.assertEqual((ok, reasons), (True, []))
+
+    def test_a_participant_name_counts_as_new_information(self):
+        """숫자가 하나도 없어도 담당자를 정했으면 채운 것이다."""
+        ok, _ = decision_checks.check_candidate(
+            "민수가 발표 자료를 맡는다", "발표 자료는 누가 할까요", participant_names=["민수"])
+        self.assertTrue(ok)
+
+    def test_a_number_with_a_particle_counts_as_new_information(self):
+        """'한 달'을 '30일로'로 바꾼 것은 채운 값이다 — 날짜 정규식은 조사가 붙은 기간을 일부러 안 잡는다."""
+        ok, _ = decision_checks.check_candidate("민수가 30일로 바꾼다", "로그는 한 달 정도면 충분할 것 같은데요")
+        self.assertTrue(ok)
+
+    def test_a_candidate_almost_identical_to_another_decision_is_flagged(self):
+        ok, reasons = decision_checks.check_candidate(
+            self.FILLED + ".", "로그 얘기였어요", others=[self.FILLED], participant_names=["민수"])
+        self.assertFalse(ok)
+        self.assertIn("다른 결정의 문장과 거의 같아요: %s" % self.FILLED, reasons)
+
+    def test_an_empty_candidate_has_nothing_to_verify(self):
+        """후보가 없는 항목은 이미 '직접 쓰기'로 가 있다 — 검사할 문장이 없다."""
+        self.assertEqual(decision_checks.check_candidate("", "근거"), (True, []))
+
+    def test_the_module_stays_free_of_django_and_llm_imports(self):
+        """순수 모듈이어야 추출 흐름과 따로 검사만 떼어 쓸 수 있다 — import 줄만 본다."""
+        lines = io.open(decision_checks.__file__, encoding="utf-8").read().splitlines()
+        self.assertEqual([line for line in lines if line.startswith(("import ", "from "))], ["import re"])
 
 
 class DecisionParseTests(TestCase):
