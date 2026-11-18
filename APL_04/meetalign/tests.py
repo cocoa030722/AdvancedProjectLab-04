@@ -3417,6 +3417,109 @@ class DecisionReviewTests(TestCase):
         self.assertEqual(decision.due_text, "")
 
 
+class DecisionFillDisplayTests(TestCase):
+    """AI가 추정으로 채운 값을 진행자 화면에서 색으로 표시하기.
+
+    채우기를 허용한 대가로, 진행자는 어디가 회의에서 정해진 것이고 어디가 AI의 짐작인지
+    구분할 수 있어야 한다. 원문·회의정보에서 가져온 값은 표시하지 않는다 — 전부 칠하면
+    아무것도 칠하지 않은 것과 같다.
+    """
+
+    GUESS = {"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": ""}
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.member = User.objects.create_user("member", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host, self.member)
+        self.meeting = Meeting.objects.create(
+            team=self.team, title="m", host=self.host, processing_status=Meeting.STATUS_DONE,
+            transcript="로그는 한 달 정도면 충분할 것 같은데요.",
+        )
+        self.decision = Decision.objects.create(
+            meeting=self.meeting, order=0, what="로그 보관 기간",
+            divergence_reason="30일인지 90일인지 갈립니다",
+            evidence="로그는 한 달 정도면 충분할 것 같은데요.",
+        )
+        self.url = reverse("decision_review", args=[self.meeting.id])
+        self.client.force_login(self.host)
+
+    def _candidate(self, text="민수가 12월 5일까지 30일로 바꾼다", fills=None):
+        return Interpretation.objects.create(
+            decision=self.decision, order=0, text=text, recommended=True,
+            fills=[self.GUESS] if fills is None else fills,
+        )
+
+    # ---- 문장 쪼개기(순수 함수) ----
+
+    def test_fill_segments_marks_only_the_estimated_values(self):
+        self.assertEqual(
+            decision_checks.fill_segments("민수가 12월 5일까지 바꾼다", ["12월 5일"]),
+            [{"text": "민수가 ", "estimated": False},
+             {"text": "12월 5일", "estimated": True},
+             {"text": "까지 바꾼다", "estimated": False}],
+        )
+
+    def test_fill_segments_handles_regex_characters_in_a_value(self):
+        segments = decision_checks.fill_segments("범위는 A/B(주) 두 개", ["A/B(주)"])
+        self.assertEqual([seg["text"] for seg in segments if seg["estimated"]], ["A/B(주)"])
+
+    def test_fill_segments_leaves_the_sentence_whole_when_the_value_is_absent(self):
+        """AI가 문장과 다른 표기로 value를 보낼 수 있다 — 칠할 자리가 없으면 그냥 한 조각이다."""
+        self.assertEqual(
+            decision_checks.fill_segments("민수가 바꾼다", ["12월 5일"]),
+            [{"text": "민수가 바꾼다", "estimated": False}],
+        )
+
+    def test_fill_segments_without_any_value(self):
+        self.assertEqual(decision_checks.fill_segments("민수가 바꾼다", []),
+                         [{"text": "민수가 바꾼다", "estimated": False}])
+
+    # ---- 진행자 화면 ----
+
+    def test_the_host_screen_highlights_a_guessed_value_and_warns_once(self):
+        self._candidate()
+        response = self.client.get(self.url)
+        self.assertContains(response, 'class="ai-fill"')
+        self.assertContains(response, "12월 5일")
+        self.assertContains(response, "AI가 추정한 값이 있어요: 기한")
+
+    def test_proven_values_are_not_marked(self):
+        self._candidate(fills=[
+            {"gap": "담당", "value": "민수", "source": "원문", "quote": "민수가 할게요"},
+            {"gap": "기한", "value": "12월 5일", "source": "회의정보", "quote": ""},
+        ])
+        response = self.client.get(self.url)
+        self.assertNotContains(response, 'class="ai-fill"')
+        self.assertNotContains(response, "AI가 추정한 값이 있어요")
+
+    def test_a_candidate_without_fills_looks_the_same_as_before(self):
+        """이 기능 전에 추출한 결정(fills가 빈 목록)도 그대로 보여야 한다."""
+        self._candidate(fills=[])
+        response = self.client.get(self.url)
+        self.assertContains(response, "민수가 12월 5일까지 30일로 바꾼다")
+        self.assertNotContains(response, 'class="ai-fill"')
+
+    def test_a_value_with_html_is_escaped(self):
+        self._candidate(text="민수가 <b>x</b>까지 바꾼다",
+                        fills=[{"gap": "기한", "value": "<b>x</b>", "source": "AI추정", "quote": ""}])
+        response = self.client.get(self.url)
+        self.assertNotContains(response, "<b>x</b>")
+        self.assertContains(response, "&lt;b&gt;x&lt;/b&gt;")
+
+    def test_the_team_screen_never_shows_the_fill_markup(self):
+        """팀원은 확정 문장 하나만 본다 — AI가 어디를 짐작했는지는 진행자만 본다."""
+        self._candidate()
+        self.decision.final_text = "민수가 12월 5일까지 30일로 바꾼다"
+        self.decision.status = Decision.STATUS_PUBLISHED
+        self.decision.save()
+        client = Client()
+        client.force_login(self.member)
+        response = client.get(reverse("decision_ack", args=[self.meeting.id]))
+        self.assertNotContains(response, 'class="ai-fill"')
+        self.assertNotContains(response, "AI가 추정한 값이 있어요")
+
+
 class DecisionEntryLinkTests(TestCase):
     """회의록이 완성된 회의에서만 "결정 확인" 링크가 보인다. 진행자는 확정 화면, 팀원은 확인 화면."""
 

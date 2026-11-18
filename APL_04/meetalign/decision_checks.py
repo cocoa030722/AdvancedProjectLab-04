@@ -151,6 +151,35 @@ REASON_NO_NEW_INFO = "원문에 없던 담당자·기한·수치가 하나도 �
 REASON_DUPLICATE = "다른 결정의 문장과 거의 같아요: %s"
 
 
+def fill_segments(text, values):
+    """문장을 [{"text", "estimated"}, ...]로 쪼갠다 — values에 든 값이 나오는 자리만 estimated다.
+
+    진행자 화면이 그 자리만 다른 색으로 칠한다. 템플릿이 조각마다 {{ }}로 출력하므로 값에
+    HTML이 섞여 있어도 그대로 문자로 보인다(여기서 마크업을 만들지 않는 이유다).
+
+    긴 값을 먼저 찾는다 — "12월 5일"과 "5일"이 함께 오면 짧은 쪽이 먼저 걸려 긴 값이 쪼개진다.
+    문장에 없는 값은 조용히 지나간다(AI가 문장과 다른 표기로 보낼 수 있다).
+    """
+    wanted = sorted({value for value in values or () if value}, key=len, reverse=True)
+    if not wanted or not text:
+        return [{"text": text, "estimated": False}]
+    pattern = re.compile("|".join(re.escape(value) for value in wanted))
+    segments, at = [], 0
+    for match in pattern.finditer(text):
+        if match.start() > at:
+            segments.append({"text": text[at:match.start()], "estimated": False})
+        segments.append({"text": match.group(0), "estimated": True})
+        at = match.end()
+    if at < len(text):
+        segments.append({"text": text[at:], "estimated": False})
+    return segments or [{"text": text, "estimated": False}]
+
+
+def guessed_fills(fills):
+    """AI추정으로 판정된 것만 — 화면에서 칠할 값과 경고에 쓸 빈칸 이름을 고르는 기준이다."""
+    return [fill for fill in fills or () if fill.get("source") == SOURCE_GUESS and fill.get("value")]
+
+
 def new_information(candidate, evidence, participant_names=()):
     """추천 문장에는 있고 근거에는 없는 값 토큰 — AI가 실제로 채운 것들.
 

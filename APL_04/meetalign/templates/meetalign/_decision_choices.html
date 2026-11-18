@@ -16,7 +16,11 @@
     <input type="radio" name="choice_{{ row.decision.id }}" value="{{ interpretation.choice_value }}" style="width:auto;margin-top:3px" data-auto-advance
       {% if interpretation.chosen and not carried %}checked{% endif %}>
     <span>
-      <span>{{ interpretation.text }}</span>{% if not carried %}<span class="badge processing" style="margin-left:6px;vertical-align:1px;white-space:nowrap">{% if interpretation.recommended %}AI 추천{% else %}AI 문장{% endif %}</span>{% endif %}
+      {# AI가 짐작으로 채운 자리만 색을 입힌다(views.decision_review가 붙이는 segments). #}
+      <span>{% for segment in interpretation.segments %}{% if segment.estimated %}<span class="ai-fill">{{ segment.text }}</span>{% else %}{{ segment.text }}{% endif %}{% empty %}{{ interpretation.text }}{% endfor %}</span>{% if not carried %}<span class="badge processing" style="margin-left:6px;vertical-align:1px;white-space:nowrap">{% if interpretation.recommended %}AI 추천{% else %}AI 문장{% endif %}</span>{% endif %}
+      {% if interpretation.estimate_gaps and not carried %}
+      <span class="meta" style="display:block">AI가 추정한 값이 있어요: {{ interpretation.estimate_gaps|join:", " }} — 회의에서 정한 값인지 확인해 주세요</span>
+      {% endif %}
     </span>
   </label>
   {% endfor %}
