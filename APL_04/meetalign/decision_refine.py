@@ -101,7 +101,7 @@ def _refine_prompt(items, flagged, source, meeting_info):
         + decision_compiler._meeting_info_block(meeting_info) +
         "\n고칠 항목:\n" + "\n\n".join(blocks) + "\n\n"
         "반드시 아래 JSON 배열 형식으로만 답하라. n은 위 항목 번호다. 채운 자리는 fills에 남겨라"
-        "(gap은 기한|담당|범위|선택지, source는 원문|회의정보|AI추정, source가 \"원문\"이면 quote에 전사본 구절을 그대로):\n"
+        "(gap은 " + decision_compiler.FILL_GAPS + ", source는 원문|회의정보|AI추정, source가 \"원문\"이면 quote에 전사본 구절을 그대로):\n"
         '[{"n": 1, "candidate": "다시 쓴 확정 문장", '
         '"fills": [{"gap": "기한", "value": "12월 5일", "source": "AI추정", "quote": ""}]}]\n'
     )
