@@ -4,6 +4,10 @@
   쓰는 쪽 템플릿이 지켜야 할 약속:
   - 문항마다 <section class="decision-step" data-decision-id="결정 id">로 감싼다. 이 부품이 한 번에 하나만 보여준다.
     자바스크립트가 꺼져 있으면 모든 문항이 그대로 다 보인다(숨김은 스크립트가 켤 때만 건다).
+  - step-aside를 함께 붙인 문항은 넘겨 보기에서 뺀다 — 쓰는 쪽에서 접어 둔 묶음(예: 그대로 공개될 결정)에
+    모아 둔 카드다. 묶음을 감싼 바깥 문항이 한 문항으로 세어지고, 안쪽 카드는 따로 넘기지 않는다.
+    녹취 원문 창은 클래스가 그대로라 접힌 카드에서도 똑같이 열린다.
+  - 결정 하나에 대응하지 않는 문항(예: 묶음)은 data-decision-id를 비워 둔다. 원문 창을 따라 열지 않는다.
   - 컨텍스트에 unpaged=True를 주면 한 문항씩 넘겨 보기를 끄고 녹취 원문 창만 쓴다(카드 목록 화면).
     값을 주지 않으면 지금까지처럼 넘겨 보기가 켜진다.
   - 문항 안에서 녹취 원문 창을 여는 곳에 data-open-transcript를 붙인다. 특정 후보의 근거로 바로 가려면
@@ -105,7 +109,7 @@
 {{ evidence_data|json_script:"evidence-data" }}
 <script>
 (function () {
-  var steps = Array.prototype.slice.call(document.querySelectorAll(".decision-step"));
+  var steps = Array.prototype.slice.call(document.querySelectorAll(".decision-step:not(.step-aside)"));
   var nav = document.getElementById("step-nav");
   var prev = document.getElementById("step-prev");
   var next = document.getElementById("step-next");
@@ -135,8 +139,10 @@
     // 넘긴 문항의 첫머리가 화면 위로 지나가 있으면 첫머리로 올린다(버튼은 제자리에 있다).
     var top = steps[current].getBoundingClientRect().top;
     if (scrollOnShow && top < 72) window.scrollBy(0, top - 80);
-    // 원본 창이 열려 있으면 새 문항의 근거로 따라간다.
-    if (!panel.hidden) openFor(steps[current].getAttribute("data-decision-id"), null);
+    // 원본 창이 열려 있으면 새 문항의 근거로 따라간다. 결정 하나에 대응하지 않는 문항(묶음)은
+    // 보여줄 근거가 없으므로 창을 그대로 둔다 — 억지로 열면 "근거를 찾지 못했어요"가 뜬다.
+    var decisionId = steps[current].getAttribute("data-decision-id");
+    if (!panel.hidden && decisionId) openFor(decisionId, null);
   }
 
   // ---- 녹취 원문 창 ----

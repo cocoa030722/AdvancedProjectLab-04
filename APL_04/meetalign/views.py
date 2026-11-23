@@ -798,8 +798,12 @@ def decision_review(request, meeting_id):
     for group, group_rows in (("ambiguous", ambiguous_rows), ("clear", clear_rows), ("carried", carried_rows)):
         for row in group_rows:
             row["group"] = group
-    # 화면은 한 문항씩 넘겨 본다 — 확인이 필요한 것부터, 그다음 그대로 공개될 것, 넘길 것 순서.
-    steps = ambiguous_rows + clear_rows + carried_rows
+    # 한 문항씩 넘겨 보는 것은 진행자가 손대야 하는 항목뿐이다 — 확인이 필요한 것, 그다음 넘길 것.
+    # 그대로 공개될 항목은 고를 것이 없으므로 화면에서 접힌 묶음으로 내린다(펼치면 다 보인다).
+    # 번호는 접힌 묶음까지 이어 붙여 "결정 N개"와 맞춘다.
+    steps = ambiguous_rows + carried_rows
+    for number, row in enumerate(steps + clear_rows, start=1):
+        row["num"] = number
     drafts = [row for row in rows if row["decision"].status == Decision.STATUS_DRAFT]
     blockers = [row for row in drafts if row["blocking"]]
     return render(request, "meetalign/decision_review.html", {

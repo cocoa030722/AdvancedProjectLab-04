@@ -3365,6 +3365,41 @@ class DecisionReviewTests(TestCase):
         self.assertContains(r, "확인이 필요한 결정")
         self.assertContains(r, "그대로 공개될 결정")
 
+    def test_clear_items_are_folded_into_one_extra_step(self):
+        """그대로 공개될 결정은 마지막 한 문항에 접어서 모은다 — 확인 필요 2건이면 1~2가 그 둘, 3이 묶음이다."""
+        self._compile()
+        r = self.client.get(self.url)
+        clear_ids = {row["decision"].id for row in r.context["clear_rows"]}
+        self.assertTrue(clear_ids)
+        self.assertFalse(clear_ids & {row["decision"].id for row in r.context["steps"]})
+        html = r.content.decode()
+        start = html.index('id="clear-step"')
+        fold = html[start:html.index("</section>", start)]
+        # 묶음 자체가 한 문항이다 — 넘겨 보기 대상(.decision-step 중 step-aside가 아닌 것)에 들어간다.
+        self.assertIn('class="decision-step item" id="clear-step"', html)
+        self.assertIn("펼쳐서 확인", fold)
+        for decision_id in clear_ids:
+            # 안쪽 카드는 묶음 안에 있고, 따로 넘기지 않도록 step-aside가 붙는다.
+            self.assertIn('data-decision-id="%d"' % decision_id, fold)
+        self.assertEqual(fold.count("step-aside"), len(clear_ids))
+        # 묶음을 감싼 바깥 문항에는 결정 id가 없다 — 원문 창이 엉뚱하게 따라 열리지 않게.
+        self.assertNotIn("data-decision-id", fold[:fold.index("<details")])
+
+    def test_publishing_still_works_when_every_item_is_clear(self):
+        """전부 그대로 공개될 때 — 넘겨 볼 문항이 없어도 묶음을 펼쳐 두고 공개할 수 있어야 한다."""
+        self._compile()
+        self.meeting.decisions.update(warnings=[], divergence_reason="", final_text="금요일에 배포한다")
+        r = self.client.get(self.url)
+        self.assertEqual(r.context["steps"], [])
+        self.assertEqual(len(r.context["clear_rows"]), self.meeting.decisions.count())
+        html = r.content.decode()
+        tag = html[html.index("<details", html.index('id="clear-group"') - 80):]
+        self.assertIn(" open>", tag[:tag.index(">") + 1])
+        self.assertIn('value="publish" form="decision-form"', html)
+        self.client.post(self.url, {"action": "publish"})
+        self.assertEqual(
+            self.meeting.decisions.exclude(status=Decision.STATUS_PUBLISHED).count(), 0)
+
     def test_the_screen_has_no_spec_input_fields_left(self):
         """누가·무엇을·언제까지·완료기준 입력 칸과 후보 편집 UI가 화면에서 사라졌다."""
         self._compile()
