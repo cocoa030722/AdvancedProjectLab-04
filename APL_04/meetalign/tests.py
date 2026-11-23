@@ -16,10 +16,10 @@ from django.test.utils import CaptureQueriesContext
 from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
 
-from . import decision_checks, decision_compiler, decision_recommend, decision_refine, services, tasks, views, whisper_worker
+from . import decision_checks, decision_compiler, decision_recommend, decision_refine, live, services, tasks, views, whisper_worker
 from .models import (
     ChatMessage, Checkpoint, Decision, DecisionAgreement,
-    Interpretation, Meeting, Notification, Question, Recording, SttUsage, Team,
+    Interpretation, LiveChunk, LiveFlag, LiveSession, Meeting, Notification, Question, Recording, SttUsage, Team,
 )
 
 # 셸에 실행용 LLM/STT 환경변수가 설정돼 있어도 테스트가 실제 모델/API를 호출하지 않고 항상 같은 결과가
@@ -200,57 +200,21 @@ class PrototypeFlowTests(TestCase):
         self.assertContains(after, "회의록 보기")
         self.assertContains(after, "회의 종료")
 
-    def test_meeting_detail_offers_mic_recording_before_upload(self):
-        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
-        self.assertContains(r, "record-toggle")
-        self.assertContains(r, "getUserMedia")
-
-    def test_mic_button_is_the_primary_action_above_the_file_input(self):
+    def test_host_sees_live_recording_as_the_primary_action_above_the_file_input(self):
         """처음 쓰는 사람이 설명 없이 찾을 수 있게, 강조 색 큰 버튼으로 업로드 칸보다 위에 둔다."""
         r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
-        # class에 secondary가 없으면 기본(강조 색) 버튼이고, lg가 확대 크기다.
-        self.assertContains(r, 'id="record-toggle" class="btn lg"')
+        self.assertContains(r, 'id="live-start" class="btn lg"')
+        self.assertContains(r, 'formaction="%s"' % reverse("live_start", args=[self.meeting.id]))
         body = r.content.decode()
-        self.assertLess(body.index('id="record-toggle"'), body.index('id="recording" type="file"'))
-
-    def test_recording_state_shows_a_red_dot_elapsed_time_and_paused_label(self):
-        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
-        self.assertContains(r, 'id="record-dot"')
-        self.assertContains(r, "record-blink")  # 깜빡임 키프레임(base.html)
-        self.assertContains(r, 'id="record-time">00:00')  # mm:ss
-        self.assertContains(r, "일시정지됨")
-
-    def test_mic_recording_not_offered_once_meeting_ended(self):
-        self.meeting.ended = True
-        self.meeting.save()
-        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
+        self.assertLess(body.index('id="live-start"'), body.index('id="recording" type="file"'))
+        # 예전 화면 안 녹음기는 실시간 세션으로 옮겼다.
         self.assertNotContains(r, "record-toggle")
 
-    def test_mic_recording_offers_pause_and_separate_stop(self):
-        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
-        self.assertContains(r, "record-stop")
-        self.assertContains(r, "일시정지")
-        self.assertContains(r, "이어서 녹음")
-        self.assertContains(r, ".pause()")
-        self.assertContains(r, ".resume()")
-
-    def test_pause_controls_gone_once_meeting_ended(self):
+    def test_live_recording_not_offered_once_meeting_ended(self):
         self.meeting.ended = True
         self.meeting.save()
         r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
-        self.assertNotContains(r, "record-stop")
-        self.assertNotContains(r, "이어서 녹음")
-
-    def test_timer_accumulates_instead_of_wall_clock(self):
-        # 일시정지 중에도 시간이 올라가지 않도록 누적 방식으로 계산해야 한다.
-        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
-        self.assertContains(r, "elapsedMs")
-        self.assertContains(r, "segmentStart")
-
-    def test_submit_blocked_while_still_recording(self):
-        # 녹음을 중지하지 않고 제출하면 빈 파일이 올라가므로 먼저 막는다.
-        r = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
-        self.assertContains(r, "녹음을 먼저 중지해 주세요")
+        self.assertNotContains(r, "live-start")
 
     def test_summary_shows_saved_record(self):
         self.meeting.record = "결정: A안으로 진행"
@@ -6584,3 +6548,1290 @@ class AssigneeGuessTests(TestCase):
         refine = decision_refine._refine_prompt(items, [0], self.SOURCE, None)
         self.assertIn("담당자는 녹취 안에서 추론한다", refine)
         self.assertNotIn("담당자 지정 필요", refine)
+
+
+
+def _wav_bytes(seconds=0.5, rate=16000):
+    import math, wave as wave_module
+    buffer = io.BytesIO()
+    with wave_module.open(buffer, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(b"".join(int(6000 * math.sin(2 * math.pi * 440 * i / rate)).to_bytes(2, "little", signed=True)
+                                 for i in range(int(seconds * rate))))
+    return buffer.getvalue()
+
+
+def _transcript(state):
+    """실시간 상태에 쌓여 온 녹취 줄을 이어 붙인 글."""
+    return " ".join(line["text"] for line in state["lines"])
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
+class LiveSessionTests(TestCase):
+    """실시간 회의 세션 — 시작·조각 전사·애매함 분석·처리됨 체크·종료 뒤 통합 전사(meetalign.live)."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.member = User.objects.create_user("member", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host, self.member)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.host)
+        self.client.force_login(self.host)
+        self.member_client = Client()
+        self.member_client.force_login(self.member)
+        # 판단 미루기와 분석 간격은 따로 시험한다 — 나머지 시험에서는 조각마다 바로 본다.
+        env = patch.dict(os.environ, {"LIVE_ANALYZE_INTERVAL_SECONDS": "0", "LIVE_HOLDBACK_LINES": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+        live._last_analysis.clear()
+        live._last_failure.clear()
+        live._activity.clear()
+        self.addCleanup(live._activity.clear)
+        self.addCleanup(live._last_failure.clear)
+
+    def _start(self):
+        self.client.post(reverse("live_start", args=[self.meeting.id]))
+        return self.meeting.live_sessions.get()
+
+    def _url(self, name, session, *extra):
+        return reverse(name, args=[self.meeting.id, session.id, *extra])
+
+    def _chunk(self, session, seq, text="", client=None):
+        with patch.object(services, "transcribe_live", return_value=text):
+            return (client or self.client).post(self._url("live_chunk", session), {
+                "seq": str(seq), "chunk": SimpleUploadedFile("c%d.wav" % seq, _wav_bytes(), content_type="audio/wav"),
+            })
+
+    def _state(self, session, client=None):
+        return (client or self.client).get(self._url("live_state", session)).json()
+
+    # ---- 시작과 권한 ----
+
+    def test_host_starts_a_session_and_lands_on_the_live_page(self):
+        r = self.client.post(reverse("live_start", args=[self.meeting.id]))
+        session = self.meeting.live_sessions.get()
+        self.assertRedirects(r, self._url("live_session", session))
+        page = self.client.get(self._url("live_session", session))
+        self.assertContains(page, 'id="live-toggle"')
+        self.assertContains(page, 'id="live-end"')
+        self.assertContains(page, 'data-host="1"')
+
+    def test_starting_again_reuses_the_running_session(self):
+        first = self._start()
+        self.client.post(reverse("live_start", args=[self.meeting.id]))
+        self.assertEqual(self.meeting.live_sessions.count(), 1)
+        # 녹음 전이면 '시작', 녹음한 뒤에는 '이어가기'
+        self.assertContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "실시간 녹음 시작")
+        self._chunk(first, 0, "앞")
+        self.assertContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "실시간 녹음 이어가기")
+        self.assertEqual(self.meeting.live_sessions.get(), first)
+
+    def test_members_cannot_start_or_control_but_can_join_and_watch(self):
+        self.assertEqual(self.member_client.post(reverse("live_start", args=[self.meeting.id])).status_code, 403)
+        session = self._start()
+        self._chunk(session, 0, "앞")
+        detail = self.member_client.get(reverse("meeting_detail", args=[self.meeting.id]))
+        self.assertContains(detail, "실시간 회의 참여하기")
+        self.assertContains(detail, "data-live-banner")  # 팀원에게는 녹음 중일 때 배너를 띄운다
+        self.assertContains(detail, "실시간 회의 녹음 중")
+        page = self.member_client.get(self._url("live_session", session))
+        self.assertNotContains(page, 'id="live-toggle"')
+        self.assertContains(page, 'data-host=""')
+        self.assertEqual(self._chunk(session, 0, "x", client=self.member_client).status_code, 403)
+        self.assertEqual(self.member_client.post(self._url("live_control", session), {"action": "pause"}).status_code, 403)
+        self.assertEqual(self._state(session, client=self.member_client)["status"], "recording")
+
+    def test_the_host_sees_the_banner_only_while_paused_and_members_while_recording_too(self):
+        session = self._start()
+        self._chunk(session, 0, "앞")
+        detail = lambda client=None: (client or self.client).get(reverse("meeting_detail", args=[self.meeting.id]))
+        self.assertNotContains(detail(), "data-live-banner")  # 진행자: 녹음 중에는 실시간 화면에 있다
+        recording = detail(self.member_client)
+        self.assertContains(recording, "data-live-banner")  # 팀원: 녹음 중이면 들어와 보라고 띄운다
+        self.assertContains(recording, '<span class="record-dot" style')  # 깜빡이는 점
+        LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_PAUSED)
+        page = detail()
+        self.assertContains(page, "data-live-banner")
+        self.assertContains(page, '<span class="record-dot paused"')  # 깜빡이지 않는 일시정지 모양
+        self.assertContains(page, "실시간 회의 일시정지")
+        self.assertContains(detail(self.member_client), "진행자가 녹음을 잠시 멈췄어요.")
+
+    def test_a_recording_that_stopped_without_a_pause_signal_shows_as_paused(self):
+        """화면을 닫았는데 일시정지 신호가 못 가 '녹음 중'으로 남은 세션은 회의 화면에서도 일시정지로 본다."""
+        session = self._start()
+        chunk = LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("a.wav", b"x"),
+                                         status=LiveChunk.STATUS_DONE, transcript="앞")
+        self.assertNotContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "data-live-banner")
+        LiveChunk.objects.filter(pk=chunk.pk).update(created_at=timezone.now() - timedelta(minutes=5))
+        LiveSession.objects.filter(pk=session.pk).update(started_at=timezone.now() - timedelta(minutes=6))
+        live._activity.pop(session.id, None)  # 녹음을 시작한 것도 6분 전이다
+        self.assertContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "data-live-banner")
+        session.refresh_from_db()
+        self.assertEqual(session.status, LiveSession.STATUS_PAUSED)
+
+    def test_resuming_after_a_long_pause_is_not_flipped_back_to_paused(self):
+        """5분 쉬고 '이어서 녹음'을 누르면 첫 조각이 오기 전에 '조각이 끊겼다'며 다시 일시정지로 돌렸다 — 녹음은 계속되는데
+        서버는 일시정지로 알아, 판단 딜레이 시간을 무시하고 말마다 분석했다."""
+        session = self._start()
+        chunk = LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("a.wav", b"x"),
+                                         status=LiveChunk.STATUS_DONE, transcript="앞")
+        LiveChunk.objects.filter(pk=chunk.pk).update(created_at=timezone.now() - timedelta(minutes=5))
+        self.client.post(self._url("live_control", session), {"action": "pause"})
+        self.client.post(self._url("live_control", session), {"action": "resume"})
+        self.assertEqual(self._state(session)["status"], "recording")
+        self.assertNotContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "data-live-banner")
+        session.refresh_from_db()
+        self.assertEqual(session.status, LiveSession.STATUS_RECORDING)
+
+    def test_a_session_not_yet_recorded_shows_neither_recording_nor_paused(self):
+        """세션을 열기만 하고 녹음 전이면 '녹음 중'도 '일시정지'도 아니다 — 시작도 안 한 회의에 일시정지 표시가 떴다."""
+        session = self._start()
+        LiveSession.objects.filter(pk=session.pk).update(started_at=timezone.now() - timedelta(minutes=5))
+        for client in (self.client, self.member_client):
+            page = client.get(reverse("meeting_detail", args=[self.meeting.id]))
+            self.assertNotContains(page, "data-live-banner")
+        self.assertContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "실시간 녹음 시작")
+        self.assertContains(self.member_client.get(reverse("meeting_detail", args=[self.meeting.id])),
+                            "진행자가 실시간 회의를 열었어요.")
+        state = self._state(session, client=self.member_client)
+        self.assertEqual((state["status"], state["started"]), ("recording", False))  # 오래 열어 둬도 일시정지로 돌리지 않는다
+        self.assertContains(self.member_client.get(self._url("live_session", session)),
+                            '<span id="live-status-label">녹음 시작 전</span>')
+        self._chunk(session, 0, "앞")
+        self.assertTrue(self._state(session)["started"])
+        self.assertContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "실시간 녹음 이어가기")
+
+    def test_outsiders_cannot_see_a_session(self):
+        session = self._start()
+        outsider = Client()
+        outsider.force_login(User.objects.create_user("x", password="pw12345!"))
+        self.assertEqual(outsider.get(self._url("live_session", session)).status_code, 404)
+        self.assertEqual(outsider.get(self._url("live_state", session)).status_code, 404)
+
+    def test_an_ended_meeting_cannot_start_a_session(self):
+        Meeting.objects.filter(pk=self.meeting.pk).update(ended=True)
+        self.client.post(reverse("live_start", args=[self.meeting.id]))
+        self.assertFalse(self.meeting.live_sessions.exists())
+
+    # ---- 조각 전사 ----
+
+    def test_chunks_are_transcribed_and_joined_in_order_even_if_they_arrive_out_of_order(self):
+        session = self._start()
+        self._chunk(session, 1, "둘째 조각")
+        self._chunk(session, 0, "첫째 조각")
+        state = self._state(session)
+        self.assertEqual(_transcript(state), "첫째 조각 둘째 조각")
+        self.assertEqual((state["pending"], state["next_seq"]), (0, 2))
+
+    def test_transcript_lines_stack_and_are_sent_from_where_the_screen_left_off(self):
+        """대화처럼 한 줄씩 쌓인다. 다시 들어온 화면(after 없음)은 처음부터, 보고 있던 화면은 그 뒤 줄만 받는다."""
+        session = self._start()
+        self._chunk(session, 0, "첫 말")
+        self._chunk(session, 1, "")  # 조용한 조각은 줄을 만들지 않는다
+        self._chunk(session, 2, "셋째 말")
+        state = self._state(session)
+        self.assertEqual([(l["seq"], l["text"]) for l in state["lines"]], [(0, "첫 말"), (2, "셋째 말")])
+        self.assertRegex(state["lines"][0]["at"], r"^\d{2}:\d{2}$")
+        self.assertEqual(state["lines_until"], 2)
+        later = self.client.get(self._url("live_state", session) + "?after=2").json()
+        self.assertEqual((later["lines"], later["lines_until"]), ([], 2))
+        self.assertEqual([l["text"] for l in self.client.get(self._url("live_state", session) + "?after=0").json()["lines"]],
+                         ["셋째 말"])
+
+    def test_a_chunk_that_never_arrives_does_not_stop_the_record_or_the_analysis(self):
+        """브라우저가 조각 하나를 세 번 올려 보다 포기하면 그 순번이 비어, 회의 기록과 분석이 회의 끝까지 멈췄다."""
+        session = self._start()
+        LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("a.wav", b"x"),
+                                 status=LiveChunk.STATUS_DONE, transcript="첫 말")
+        later = LiveChunk.objects.create(session=session, seq=2, file=SimpleUploadedFile("c.wav", b"x"),
+                                         status=LiveChunk.STATUS_DONE, transcript="셋째 말")  # 1번은 오지 않았다
+        with patch.object(live, "recover"):
+            state = self._state(session)
+        self.assertEqual(state["lines_until"], 0)  # 막 빠진 순번은 잠시 기다린다(늦게 도착할 수 있다)
+        self.assertEqual(live._ready_seq(session), 0)
+        LiveChunk.objects.filter(pk=later.pk).update(created_at=timezone.now() - timedelta(seconds=live.GAP_GRACE_SECONDS + 1))
+        with patch.object(live, "recover"):
+            state = self._state(session)
+        self.assertEqual(state["lines_until"], 2)
+        self.assertEqual([l["text"] for l in state["lines"]], ["첫 말", "셋째 말"])
+        session.refresh_from_db()
+        self.assertEqual(live._ready_seq(session), 2)
+
+    def test_lines_wait_for_an_earlier_chunk_still_being_transcribed(self):
+        """뒤 조각이 먼저 끝나도 앞 조각을 기다린다 — 화면이 받은 데까지의 표시가 앞 조각을 건너뛰지 않게."""
+        session = self._start()
+        LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("a.wav", b"x"))
+        LiveChunk.objects.create(session=session, seq=1, file=SimpleUploadedFile("b.wav", b"x"),
+                                 status=LiveChunk.STATUS_DONE, transcript="뒤 조각")
+        with patch.object(live, "recover"):
+            state = self._state(session)
+        self.assertEqual((state["lines"], state["lines_until"]), ([], -1))
+
+    def test_a_resent_chunk_is_ignored(self):
+        session = self._start()
+        self._chunk(session, 0, "처음")
+        self._chunk(session, 0, "다시 보낸 것")
+        self.assertEqual(_transcript(self._state(session)), "처음")
+        self.assertEqual(session.chunks.count(), 1)
+
+    def test_bad_or_late_chunks_are_rejected(self):
+        session = self._start()
+        r = self.client.post(self._url("live_chunk", session), {"seq": "x"})
+        self.assertEqual(r.status_code, 400)
+        LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_ENDED)
+        self.assertEqual(self._chunk(session, 0, "늦은 조각").status_code, 409)
+
+    def test_a_chunk_left_pending_after_a_restart_is_transcribed_again_when_polled(self):
+        session = self._start()
+        chunk = LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("c.wav", _wav_bytes()))
+        with patch.object(services, "transcribe_live", return_value="다시 옮긴 내용"):
+            state = self._state(session)
+        chunk.refresh_from_db()
+        self.assertEqual((chunk.status, _transcript(state)), (LiveChunk.STATUS_DONE, "다시 옮긴 내용"))
+
+    def test_whisper_filler_on_silent_chunks_is_dropped(self):
+        for filler in ("시청해 주셔서 감사합니다.", "구독과 좋아요 부탁드립니다", "감사합니다", "  "):
+            self.assertTrue(services._looks_hallucinated(filler), filler)
+        self.assertFalse(services._looks_hallucinated("자료조사는 제가 금요일까지 할게요. 감사합니다"))
+
+    def test_a_chunk_the_browser_marked_silent_is_not_transcribed(self):
+        session = self._start()
+        with patch.object(services, "transcribe_live") as stt:
+            self.client.post(self._url("live_chunk", session), {
+                "seq": "0", "silent": "1", "chunk": SimpleUploadedFile("c0.wav", _wav_bytes(), content_type="audio/wav"),
+            })
+        stt.assert_not_called()
+        chunk = session.chunks.get()
+        self.assertEqual((chunk.status, chunk.transcript), (LiveChunk.STATUS_DONE, ""))
+        self.assertTrue(chunk.file)  # 녹음은 남겨 종료 뒤 합칠 때 쓴다
+
+    def test_live_transcription_removes_foreign_script_and_sends_no_prompt(self):
+        """프롬프트를 주면 Whisper가 소리가 불분명한 조각에서 프롬프트를 그대로 되풀이했다 — 주지 않는다."""
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}, clear=True), \
+             patch.object(services, "_transcribe_groq", return_value="자료는 ですね 제가 愛ずれ 찾을게요") as groq:
+            self.assertEqual(services.transcribe_live("/c.webm"), "자료는 제가 찾을게요")
+        self.assertEqual((groq.call_args.args, groq.call_args.kwargs), (("/c.webm",), {}))
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}, clear=True), \
+             patch.object(services, "_transcribe_groq", return_value="わかった わかった"):
+            self.assertEqual(services.transcribe_live("/c.webm"), "")
+
+    def test_the_ended_notice_stays_hidden_until_the_session_ends(self):
+        session = self._start()
+        page = self.client.get(self._url("live_session", session)).content.decode()
+        self.assertIn('id="live-ended" class="notice" hidden', page)
+        self.assertIn("#live-root [hidden] { display:none !important; }", page)
+
+    def test_ambiguity_feed_is_the_main_view_and_the_transcript_is_folded(self):
+        session = self._start()
+        page = self.client.get(self._url("live_session", session)).content.decode()
+        # 녹취는 접힌 칸 대신 위의 실시간 자막 칸에 대화처럼 쌓인다(높이 제한, 안에서 스크롤).
+        self.assertNotIn('id="live-transcript"', page)
+        self.assertLess(page.index('id="live-log"'), page.index('id="live-flags"'))
+        self.assertIn(".live-log-scroll { max-height:min(34vh, 300px);", page)
+        self.assertIn('id="live-level"', page)  # 마이크 입력 막대
+        state = self._state(session)
+        self.assertEqual(state["analysis"], {"state": "off", "seconds": 0, "model": "", "interval": 0})  # AI가 설정되지 않았다
+
+    def test_live_transcription_skips_clova_and_diarization(self):
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k", "CLOVA_SPEECH_INVOKE_URL": "u", "CLOVA_SPEECH_SECRET_KEY": "s",
+                                     "LOCAL_DIARIZATION": "1"}, clear=True), \
+             patch.object(services, "_transcribe_groq", return_value="회의 내용") as groq, \
+             patch.object(services, "_transcribe_clova") as clova, patch.object(services, "_diarize") as diarize:
+            self.assertEqual(services.transcribe_live("/c.webm"), "회의 내용")
+        self.assertEqual(groq.call_args.args, ("/c.webm",))
+        clova.assert_not_called()
+        diarize.assert_not_called()
+
+    # ---- 애매함 분석 ----
+
+    def _analysis(self, flags):
+        return json.dumps({"flags": flags}, ensure_ascii=False)
+
+    def test_the_latest_lines_are_held_back_as_context_and_judged_next_time(self):
+        """질문하자마자 짚으면 바로 뒤의 답을 모른 채 "기한을 정해 주세요"를 띄웠다 — 최근 말은 다음 분석이 판단한다."""
+        session = self._start()
+        response = self._analysis([
+            {"phrase": "다음 주쯤", "reason": "몇 요일까지인지 정해지지 않았어요"},
+            {"phrase": "녹취에 없는 말", "reason": "지어낸 인용"},
+            {"phrase": "자료는 제가 찾을게요", "reason": "판단을 미룬 말에서 고른 것"},
+        ])
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1", "LIVE_HOLDBACK_LINES": "1"}), \
+             patch.object(services, "generate_live", return_value=(response, "m1")) as gen:
+            self._chunk(session, 0, "PPT는 다음 주쯤 끝내 볼게요.")
+            self.assertEqual(gen.call_count, 0)  # 방금 한 말뿐 — 뒤에 이어질 말을 기다린다
+            self._chunk(session, 1, "자료는 제가 찾을게요.")
+        self.assertEqual(gen.call_count, 1)
+        prompt = gen.call_args.args[0]
+        self.assertIn("[새로 들어온 녹취]\nPPT는 다음 주쯤 끝내 볼게요.", prompt)
+        self.assertIn("[바로 뒤에 이어진 말 — 참고만 하고 여기서는 phrase를 고르지 마라]\n자료는 제가 찾을게요.", prompt)
+        session.refresh_from_db()
+        self.assertEqual(list(session.flags.values_list("phrase", flat=True)), ["다음 주쯤"])
+        self.assertEqual(session.analyzed_seq, 0)
+        flag = self._state(session)["flags"][0]
+        self.assertEqual((flag["phrase"], flag["reason"], flag["resolved"]), ("다음 주쯤", "몇 요일까지인지 정해지지 않았어요", False))
+        self.assertRegex(flag["at"], r"^\d{2}:\d{2}$")
+
+    def test_each_analysis_sends_the_whole_transcript_with_the_new_part_marked(self):
+        session = self._start()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}, clear=False), \
+             patch.object(services, "generate_live", side_effect=[
+                 (self._analysis([]), "m1"),
+                 (self._analysis([{"phrase": "다음 주쯤", "reason": "요일이 없어요"}]), "m1"),
+                 (self._analysis([{"phrase": "다음 주쯤", "reason": "같은 것"},
+                                  {"phrase": "수요일은 안 돼요", "reason": "앞에서 안 된다고 한 날과 겹쳐요"}]), "m1"),
+             ]) as gen:
+            self._chunk(session, 0, "저는 수요일은 안 돼요.")
+            self._chunk(session, 1, "PPT는 다음 주쯤 끝내요.")
+            self._chunk(session, 2, "그럼 수요일에 모여요.")
+        self.assertEqual(gen.call_count, 3)
+        third = gen.call_args_list[2].args[0]
+        self.assertIn("[지금까지의 녹취]\n저는 수요일은 안 돼요. PPT는 다음 주쯤 끝내요.", third)
+        self.assertIn("[새로 들어온 녹취]\n그럼 수요일에 모여요.", third)
+        self.assertRegex(third, r"- #\d+ 다음 주쯤: 요일이 없어요")  # 열린 것은 번호로 가리킬 수 있게 번호를 붙인다
+        self.assertNotIn("summary", third)
+        # 같은 표현은 다시 올리지 않고, 새 말 때문에 생긴 충돌은 앞 녹취의 표현으로도 올린다.
+        # 이 충돌은 일정 규칙도 짚는다 — AI가 같은 충돌을 짚은 것("수요일은 안 돼요")은 빼고 규칙의 것 하나만 남긴다.
+        self.assertEqual(list(session.flags.values_list("phrase", flat=True)), ["다음 주쯤", "수요일"])
+
+    def test_a_very_long_transcript_is_trimmed_from_the_front(self):
+        session = self._start()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1", "LIVE_MAX_CONTEXT_CHARS": "1000"}), \
+             patch.object(services, "generate_live", return_value=(self._analysis([]), "m1")) as gen:
+            self._chunk(session, 0, "앞" * 1500)
+            self._chunk(session, 1, "새로 한 말")
+        prompt = gen.call_args_list[1].args[0]
+        self.assertIn("[지금까지의 녹취 (앞부분 일부 생략)]", prompt)
+        self.assertIn("[새로 들어온 녹취]\n새로 한 말", prompt)
+        self.assertNotIn("앞" * 1000, prompt)
+        self.assertIn("앞" * 980, prompt)  # 뒤쪽(최근) 녹취는 남긴다
+
+    def test_chunks_that_arrive_during_an_analysis_are_picked_up_right_after(self):
+        session = self._start()
+        LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("a.wav", b"x"),
+                                 status=LiveChunk.STATUS_DONE, transcript="첫 말")
+        LiveChunk.objects.create(session=session, seq=1, file=SimpleUploadedFile("b.wav", b"x"),
+                                 status=LiveChunk.STATUS_DONE, transcript="둘째 말")
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", return_value=(self._analysis([]), "m1")) as gen:
+            live._analyze(session.id, 0)  # 0번까지 보는 사이 1번이 도착해 있었다
+        self.assertEqual(gen.call_count, 2)
+        session.refresh_from_db()
+        self.assertEqual(session.analyzed_seq, 1)
+
+    def test_pausing_analyzes_what_has_built_up(self):
+        """일시정지하면 간격도, 판단을 미룬 최근 말도 기다리지 않고 지금까지 쌓인 것을 모두 본다."""
+        session = self._start()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1", "LIVE_HOLDBACK_LINES": "2"}), \
+             patch.object(services, "generate_live", return_value=(self._analysis([]), "m1")) as gen:
+            self._chunk(session, 0, "각자 알아서 준비해요.")
+            self.assertEqual(gen.call_count, 0)
+            self.client.post(self._url("live_control", session), {"action": "pause"})
+        self.assertEqual(gen.call_count, 1)
+        self.assertNotIn("[바로 뒤에 이어진 말 —", gen.call_args.args[0])
+        session.refresh_from_db()
+        self.assertEqual((session.status, session.analyzed_seq), (LiveSession.STATUS_PAUSED, 0))
+
+    def test_a_failed_analysis_retries_that_stretch_next_time(self):
+        session = self._start()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", side_effect=OSError("down")):
+            self._chunk(session, 0, "각자 준비해요.")
+        session.refresh_from_db()
+        self.assertEqual(session.analyzed_seq, -1)
+
+    def test_analysis_waits_for_the_interval_between_runs(self):
+        """말 한마디마다 부르면 5분 회의에 40번 넘게 불러 무료 한도에 걸렸다 — 마지막 분석에서 간격이 지나야 다시 본다."""
+        session = self._start()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1", "LIVE_ANALYZE_INTERVAL_SECONDS": "60"}), \
+             patch.object(services, "generate_live", return_value=(self._analysis([]), "m1")) as gen:
+            self._chunk(session, 0, "첫 말")
+            self._chunk(session, 1, "둘째 말")
+            self.assertEqual(gen.call_count, 1)
+            with patch.object(live.time, "monotonic", return_value=live.time.monotonic() + 61):
+                self._chunk(session, 2, "셋째 말")
+        self.assertEqual(gen.call_count, 2)
+        self.assertIn("[새로 들어온 녹취]\n둘째 말 셋째 말", gen.call_args.args[0])
+
+    def test_a_held_back_line_is_judged_once_it_is_old_enough(self):
+        """말이 끊겨 뒤에 말이 더 오지 않아도 오래 미루지 않는다."""
+        session = self._start()
+        old = LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("a.wav", b"x"),
+                                       status=LiveChunk.STATUS_DONE, transcript="자료는 되는대로 올릴게요")
+        with patch.dict(os.environ, {"LIVE_HOLDBACK_LINES": "2", "LIVE_HOLDBACK_SECONDS": "20"}):
+            self.assertEqual(live._settled_seq(session, 0), -1)
+            LiveChunk.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(seconds=21))
+            self.assertEqual(live._settled_seq(session, 0), 0)
+
+    def test_the_same_problem_in_other_words_is_not_posted_twice(self):
+        transcript = "음 최대한 빨리 해볼게요 아 네 그럼 대충이라도 나오면 알려주세요 장소는 이따 단톡에서 정해요"
+        raw = self._analysis([
+            {"phrase": "대충이라도 나오면 알려주세요", "reason": "민혁 씨의 자료조사 제출 기한을 명확히 정해 주세요."},
+            {"phrase": "이따 단톡에서 정해요", "reason": "회의 장소를 정해 주세요"},
+            {"phrase": "장소는 이따", "reason": "회의 장소를 정해 주세요."},
+        ])
+        parsed = live.parse_analysis(raw, transcript, ["최대한 빨리 해볼게요"],
+                                     ["민혁 씨의 자료조사 제출 기한을 명확히 정해 주세요"])
+        self.assertEqual(parsed, [("이따 단톡에서 정해요", "회의 장소를 정해 주세요", "")])
+
+    def test_the_flags_are_read_even_when_a_small_model_breaks_the_json(self):
+        raw = ('```json\n{"constraints": [{"who": "뚱", "when": "목요일 7시", "what": "약속"}]}, '
+               '"flags": [{"topic": "다음 회의 시간", "phrase": "목요일 7시에", "reason": "약속과 겹쳐요"}]}\n```')
+        self.assertEqual(live.parse_analysis(raw, "그럼 목요일 7시에 다음 회의 잡을까요", []),
+                         [("목요일 7시에", "약속과 겹쳐요", "다음 회의 시간")])
+        self.assertIsNone(live.parse_analysis("답할 수 없어요", "x", []))
+
+    def test_a_flag_on_an_already_raised_topic_is_dropped(self):
+        """같은 안건의 같은 문제(topic)는 표현과 사유가 달라도 다시 올리지 않는다."""
+        transcript = "음 최대한 빨리 해볼게요 아 네 그럼 대충이라도 나오면 알려주세요 PPT는 다음 주쯤"
+        raw = self._analysis([
+            {"topic": "자료조사 기한", "phrase": "대충이라도 나오면 알려주세요", "reason": "날짜를 정해 주세요"},
+            {"topic": "PPT 기한", "phrase": "다음 주쯤", "reason": "몇 요일인지 정해 주세요"},
+        ])
+        parsed = live.parse_analysis(raw, transcript, ["최대한 빨리 해볼게요"], ["기한이 없어요"], ["자료조사 기한"])
+        self.assertEqual(parsed, [("다음 주쯤", "몇 요일인지 정해 주세요", "PPT 기한")])
+
+    def test_the_live_prompt_shares_the_decision_review_checklist_and_hints(self):
+        """회의 중에 짚는 기준과 회의 뒤 결정 확인이 묻는 기준이 같아야 한다."""
+        flag = LiveFlag(topic="자료조사 기한", phrase="최대한 빨리", reason="날짜를 정해 주세요")
+        hints = decision_compiler.review_hint_lines(["좋아요", "일단 알겠어요", "다음 주쯤 할게요"], live.LIVE_HINT_PHRASES)
+        self.assertEqual(hints, ["일단 알겠어요", "다음 주쯤 할게요"])
+        prompt = live.analyze_prompt("일단 알겠어요 다음 주쯤 할게요", "", [flag], [], hint_lines=hints)
+        self.assertIn(decision_compiler.AMBIGUITY_CHECKLIST, prompt)
+        self.assertIn(decision_compiler.AMBIGUITY_CHECKLIST, decision_compiler._compile_prompt("회의 내용"))
+        self.assertIn("어떻게 갈리는지 설명할 수 있을 때만 올린다", prompt)
+        self.assertIn("- [자료조사 기한] 최대한 빨리: 날짜를 정해 주세요", prompt)
+        self.assertIn("하나씩 반드시 검토하라. 검토해서 문제가 아니면 올리지 않아도 된다]\n- 일단 알겠어요\n- 다음 주쯤 할게요",
+                      prompt)
+
+    def test_the_topic_is_saved_and_sent_to_the_screen(self):
+        session = self._start()
+        response = self._analysis([{"topic": "PPT 기한", "phrase": "다음 주쯤", "reason": "몇 요일인지 정해 주세요"}])
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", return_value=(response, "m1")):
+            self._chunk(session, 0, "PPT는 다음 주쯤 끝내요.")
+        self.assertEqual(self._state(session)["flags"][0]["topic"], "PPT 기한")
+        page = self.client.get(self._url("live_session", session)).content.decode()
+        self.assertIn('topic.className = "topic";', page)
+
+    def test_the_prompt_tells_the_model_not_to_flag_bare_questions_or_repeat_a_problem(self):
+        prompt = live.analyze_prompt("자료조사는 언제까지 해주실 수 있어요?", "", [], [])
+        self.assertIn("질문·제안이나 안건을 막 꺼낸 말 자체", prompt)
+        self.assertIn("같은 안건에서 정해야 할 것이 같으면 표현이 달라도 같은 문제다", prompt)
+        self.assertNotIn("[바로 뒤에 이어진 말 —", prompt)
+
+    def test_analysis_waits_for_an_earlier_chunk_still_being_transcribed(self):
+        session = self._start()
+        LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("c.wav", b"x"))
+        LiveChunk.objects.create(session=session, seq=1, file=SimpleUploadedFile("d.wav", b"x"),
+                                 status=LiveChunk.STATUS_DONE, transcript="뒤 조각")
+        self.assertEqual(live._ready_seq(session), -1)
+
+    # ---- 처리됨 체크 ----
+
+    def test_host_ticks_a_flag_and_everyone_sees_it_resolved(self):
+        session = self._start()
+        flag = LiveFlag.objects.create(session=session, phrase="다음 주쯤", reason="요일이 없어요")
+        url = self._url("live_flag", session, flag.id)
+        self.assertEqual(self.member_client.post(url, {"resolved": "1"}).status_code, 403)
+        self.client.post(url, {"resolved": "1"})
+        flag.refresh_from_db()
+        self.assertEqual((flag.resolved, flag.resolved_by), (True, self.host))
+        self.assertTrue(self._state(session, client=self.member_client)["flags"][0]["resolved"])
+        self.client.post(url, {"resolved": "0"})
+        flag.refresh_from_db()
+        self.assertFalse(flag.resolved)
+
+    def test_a_schedule_conflict_is_flagged_even_when_the_model_misses_it(self):
+        """flash-lite가 "목요일 7시 약속"을 뽑아 놓고도 "목요일 7시에 회의 잡을까요?"를 넘겼다(12번 세션)."""
+        session = self._start()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", return_value=(self._analysis([]), "lite")):
+            for seq, text in enumerate(["저는 목요일 7시에", "약속이 있어서", "다른 활동은 못할 거 같아요",
+                                        "그럼 목요일 7시에", "다음 회의 잡을까요?", "네 잡도록 해요"]):
+                self._chunk(session, seq, text)
+        self.assertEqual(list(session.flags.values_list("phrase", "reason")),
+                         [("목요일 7시", "앞에서 안 된다고 한 시간(목요일 7시)과 겹쳐요. 다시 정해 주세요")])
+
+    def test_a_schedule_conflict_is_posted_once_even_if_the_model_fails_or_repeats_it(self):
+        session = self._start()
+        LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("a.wav", b"x"), status=LiveChunk.STATUS_DONE,
+                                 transcript="저 목요일에는 3시부터 4시 반까지 전공 수업이 있어서 그 시간은 안 돼요.")
+        LiveChunk.objects.create(session=session, seq=1, file=SimpleUploadedFile("b.wav", b"x"), status=LiveChunk.STATUS_DONE,
+                                 transcript="그럼 다음 주 목요일 오후 4시 어때요?")
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}):
+            with patch.object(services, "generate_live", side_effect=OSError("429")):
+                live._analyze(session.id, 1)
+            self.assertEqual(session.flags.count(), 1)  # AI가 실패해도 규칙이 찾은 충돌은 올린다
+            session.refresh_from_db()
+            self.assertEqual(session.analyzed_seq, -1)  # 구간은 다음에 다시 본다
+            repeat = self._analysis([{"phrase": "다음 주 목요일 오후 4시", "reason": "민혁 씨 수업과 겹쳐요"},
+                                     {"phrase": "어때요", "reason": "확답이 아니에요"}])
+            with patch.object(services, "generate_live", return_value=(repeat, "m1")):
+                live._analyze(session.id, 1)
+        self.assertEqual(list(session.flags.values_list("phrase", flat=True)), ["목요일 오후 4시", "어때요"])
+
+    def test_schedule_conflict_rules(self):
+        from meetalign import live_rules as sc
+        cases = [
+            (["저는 수요일은 안 돼요", "그럼 수요일에 모여요"], ["수요일"]),
+            (["저는 수요일은 안 돼요", "그럼 수요일 말고 목요일에 모여요"], []),  # 피하자는 말
+            (["목요일 3시부터 4시 반까지 수업이 있어서 안 돼요", "그럼 목요일 5시에 만나요"], []),  # 안 겹친다
+            (["목요일 3시부터 4시 반까지 수업이 있어서 안 돼요", "목요일 오후 4시 어때요?"], ["목요일 오후 4시"]),
+            (["금요일 오전 10시에 알바가 있어요", "금요일 저녁 10시에 모여요"], []),  # 오전과 저녁
+            (["목요일은 괜찮아요", "목요일 7시에 만나요"], []),  # 된다는 말은 사정이 아니다
+            (["목요일 7시에 만나요", "저는 목요일 7시에 약속 있어요"], []),  # 제안이 사정보다 앞
+        ]
+        for lines, phrases in cases:
+            self.assertEqual([p for p, _, _ in sc.find_conflicts(lines, 1)], phrases, lines)
+
+    def test_deferral_rules(self):
+        from meetalign import live_rules
+        found = live_rules.find_deferrals(["장소는 이따 단톡에서 정해요.", "나중에 봬요", "자료는 단톡에 올릴게요",
+                                           "그건 다음에 얘기해요"], 0)
+        self.assertEqual(found, [
+            ("이따 단톡에서 정해요", "장소 — 정하지 않고 미뤘어요. 누가 언제까지 정할지 정해 주세요", "장소 미룸"),
+            ("다음에 얘기해요", "그건 — 정하지 않고 미뤘어요. 누가 언제까지 정할지 정해 주세요", "미룬 안건"),
+        ])
+
+    def test_a_deferral_is_posted_once_even_when_repeated_in_the_wrap_up(self):
+        session = self._start()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", return_value=(self._analysis([]), "lite")):
+            self._chunk(session, 0, "장소는 이따 단톡에서 정해요.")
+            self._chunk(session, 1, "정리하면 다음 회의는 목요일이고 장소는 단톡에서 정해요.")
+        self.assertEqual(list(session.flags.values_list("phrase", flat=True)), ["이따 단톡에서 정해요"])
+
+    def test_host_dismisses_a_wrong_flag_and_it_is_not_raised_again(self):
+        session = self._start()
+        flag = LiveFlag.objects.create(session=session, phrase="역할을 나눠야 하는데", reason="담당자를 정해 주세요")
+        url = self._url("live_flag", session, flag.id)
+        self.assertEqual(self.member_client.post(url, {"dismissed": "1"}).status_code, 403)
+        self.assertEqual(self.client.post(url, {"dismissed": "1"}).json(), {"id": flag.id, "dismissed": True})
+        self.assertEqual(self._state(session, client=self.member_client)["flags"], [])  # 모두의 화면에서 사라진다
+        flag.refresh_from_db()
+        self.assertFalse(flag.resolved)
+        response = self._analysis([{"phrase": "역할을 나눠야 하는데", "reason": "다른 말로 다시"},
+                                   {"phrase": "되는대로", "reason": "담당자를 정해 주세요."}])
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", return_value=(response, "m1")) as gen:
+            self._chunk(session, 0, "이제 역할을 나눠야 하는데 자료는 되는대로 올릴게요")
+        prompt = gen.call_args.args[0]
+        self.assertIn("[진행자가 애매하지 않다고 지운 것 — 같은 문제나 같은 이유로는 다시 올리지 마라]\n"
+                      "- 역할을 나눠야 하는데: 담당자를 정해 주세요", prompt)
+        self.assertNotIn("[이미 올린 애매한 점 —", prompt)
+        self.assertEqual(session.flags.filter(dismissed=False).count(), 0)  # 같은 표현·같은 사유는 버린다
+        # 지운 것은 처리한 것이 아니다 — 결정 추출에 '처리한 애매한 점'으로 넘기지 않는다.
+        LiveFlag.objects.filter(pk=flag.pk).update(resolved=True)
+        self.assertEqual(live.resolved_flag_texts(self.meeting), [])
+        self.assertEqual(live.resolved_phrases(self.meeting), [])
+
+    def test_ticking_a_flag_repaints_it_at_once(self):
+        """누른 체크박스에 초점이 남아 목록을 다시 그리지 않아, 처리됨 표시가 다른 곳을 누를 때까지 안 보였다."""
+        session = self._start()
+        page = self.client.get(self._url("live_session", session)).content.decode()
+        self.assertIn("toggleFlag(flag.id, box, item, time, flag.at)", page)
+        self.assertIn("    paintResolved(item, time, at, resolved);\n    post(url, { resolved:", page)
+        self.assertIn('<b>회의 기록</b>', page)
+        self.assertNotIn("실시간 자막", page)
+
+    def _open_flag(self, session, **extra):
+        return LiveFlag.objects.create(session=session, topic="회의 장소", phrase="이따 단톡에서 정해요",
+                                       reason="장소를 정해 주세요", **extra)
+
+    def test_a_flag_settled_later_in_the_meeting_is_ticked_automatically(self):
+        session = self._start()
+        flag = self._open_flag(session)
+        response = json.dumps({"flags": [], "settled": [{"id": flag.id, "quote": "장소는 도서관 스터디룸으로 할게요"}]},
+                              ensure_ascii=False)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", return_value=(response, "m1")) as gen:
+            self._chunk(session, 0, "음 장소는 도서관 스터디룸으로 할게요.")
+        self.assertIn("- #%d [회의 장소] 이따 단톡에서 정해요: 장소를 정해 주세요" % flag.id, gen.call_args.args[0])
+        flag.refresh_from_db()
+        self.assertEqual((flag.resolved, flag.resolved_auto, flag.resolved_by, flag.settled_quote),
+                         (True, True, None, "장소는 도서관 스터디룸으로 할게요"))
+        shown = self._state(session, client=self.member_client)["flags"][0]
+        self.assertEqual((shown["resolved"], shown["auto"], shown["settled_quote"]),
+                         (True, True, "장소는 도서관 스터디룸으로 할게요"))
+        # 자동 확인은 가벼운 모델의 판단이라 결정 추출의 '처리한 애매한 점'으로 넘기지 않는다 — 결정 확인이 다시 본다.
+        self.assertEqual(live.resolved_flag_texts(self.meeting), [])
+        page = self.client.get(self._url("live_session", session)).content.decode()
+        self.assertIn('" · 회의에서 정해짐: “" + quote + "”"', page)
+
+    def test_a_settle_quote_that_is_not_in_the_new_speech_is_ignored(self):
+        session = self._start()
+        flag = self._open_flag(session)
+        response = json.dumps({"flags": [], "settled": [{"id": flag.id, "quote": "장소는 카페로 정했어요"},
+                                                        {"id": 999, "quote": "네 좋아요"}]}, ensure_ascii=False)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", return_value=(response, "m1")):
+            self._chunk(session, 0, "네 좋아요")
+        flag.refresh_from_db()
+        self.assertFalse(flag.resolved)
+
+    def test_a_reverted_auto_tick_is_not_applied_again_and_a_host_tick_counts(self):
+        session = self._start()
+        flag = self._open_flag(session, resolved=True, resolved_auto=True, settled_quote="스터디룸으로 해요")
+        url = self._url("live_flag", session, flag.id)
+        self.client.post(url, {"resolved": "0"})  # 진행자가 자동 확인을 되돌린다
+        flag.refresh_from_db()
+        self.assertEqual((flag.resolved, flag.resolved_auto), (False, False))
+        response = json.dumps({"flags": [], "settled": [{"id": flag.id, "quote": "스터디룸으로 해요"}]}, ensure_ascii=False)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", return_value=(response, "m1")):
+            self._chunk(session, 0, "그럼 스터디룸으로 해요")
+        flag.refresh_from_db()
+        self.assertFalse(flag.resolved)
+        self.client.post(url, {"resolved": "1"})  # 진행자가 직접 체크하면 결정 추출에 '처리함'으로 넘긴다
+        flag.refresh_from_db()
+        self.assertEqual((flag.resolved, flag.resolved_auto, flag.resolved_by), (True, False, self.host))
+        self.assertEqual(live.resolved_flag_texts(self.meeting), ["이따 단톡에서 정해요 — 장소를 정해 주세요"])
+
+    def test_settled_is_read_from_broken_json_too(self):
+        flag = LiveFlag(id=7, phrase="p", reason="r")
+        raw = '{"constraints": []}, "flags": [], "settled": [{"id": "#7", "quote": "금요일까지 올릴게요"}]}'
+        self.assertEqual(live.parse_settled(raw, "네 금요일까지 올릴게요", [flag]), [(flag, "금요일까지 올릴게요")])
+
+    def test_the_screen_shows_three_stages_judging_waiting_or_no_input(self):
+        """세부 단계와 남은 초는 알아보기 어려웠다 — '판단 중', '다음 판단까지 대기 중', '입력이 없음' 세 단계만 보인다."""
+        session = self._start()
+        status = lambda: self._state(session)["analysis"]["state"]
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1", "LIVE_HOLDBACK_LINES": "2", "LIVE_HOLDBACK_SECONDS": "20",
+                                     "LIVE_ANALYZE_INTERVAL_SECONDS": "15"}), \
+             patch.object(services, "generate_live", return_value=(self._analysis([]), "m1")) as gen:
+            self.assertEqual(status(), "idle")
+            chunk = LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("a.wav", b"x"),
+                                             status=LiveChunk.STATUS_DONE, transcript="자료는 제가 찾을게요")
+            self.assertEqual(status(), "waiting")  # 방금 한 말 — 판단을 기다린다
+            # 남은 초: 최근 말 미루기(판단 딜레이 15초를 넘지 않는다)가 끝날 때까지.
+            self.assertTrue(13 <= self._state(session)["analysis"]["seconds"] <= 15)
+            # 들어온 지 오래된 말은 화면이 상태를 묻는 그때 바로 판단한다(다음 조각을 기다리지 않는다).
+            LiveChunk.objects.filter(pk=chunk.pk).update(created_at=timezone.now() - timedelta(seconds=16))
+            self.assertEqual(status(), "idle")
+            self.assertEqual(gen.call_count, 1)
+            pending = LiveChunk.objects.create(session=session, seq=1, file=SimpleUploadedFile("b.wav", b"x"))
+            with patch.object(live, "recover"):
+                waiting = self._state(session)["analysis"]
+            self.assertEqual((waiting["state"], waiting["seconds"]), ("waiting", 0))  # 글로 옮기는 중 — 남은 초는 모른다
+            LiveChunk.objects.filter(pk=pending.pk).update(status=LiveChunk.STATUS_DONE, transcript="첫 말",
+                                                           created_at=timezone.now() - timedelta(seconds=30))
+            waiting = self._state(session)["analysis"]
+            self.assertEqual(waiting["state"], "waiting")  # 판단할 말은 있지만 판단 딜레이 시간이 아직 안 찼다
+            self.assertTrue(1 <= waiting["seconds"] <= 15)
+        with patch.object(live, "_analyzing", {session.id}), patch.object(live, "maybe_analyze"), \
+             patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}):
+            self.assertEqual(status(), "busy")
+        page = self.client.get(self._url("live_session", session)).content.decode()
+        self.assertIn('var PROGRESS = { busy: "판단 중", waiting: "다음 판단까지 대기 중", idle: "입력이 없음" };', page)
+        self.assertIn('if (state === "waiting" && a.seconds) label += " · " + a.seconds + "초 남음";', page)
+
+    def test_the_host_sets_the_judging_delay_with_a_slider(self):
+        session = self._start()
+        url = self._url("live_control", session)
+        self.assertEqual(self.member_client.post(url, {"action": "interval", "seconds": "30"}).status_code, 403)
+        self.assertEqual(self.client.post(url, {"action": "interval", "seconds": "32"}).json()["interval"], 30)  # 5초 단위
+        self.assertEqual(self.client.post(url, {"action": "interval", "seconds": "999"}).json()["interval"], 60)
+        self.assertEqual(self.client.post(url, {"action": "interval", "seconds": "1"}).json()["interval"], 5)
+        self.assertEqual(self.client.post(url, {"action": "interval", "seconds": "abc"}).status_code, 400)
+        self.client.post(url, {"action": "interval", "seconds": "45"})
+        self.assertEqual(self._state(session, client=self.member_client)["analysis"]["interval"], 45)
+        host_page = self.client.get(self._url("live_session", session)).content.decode()
+        self.assertIn("<label for=\"live-delay\">판단 딜레이 시간</label>", host_page)
+        self.assertIn('type="range" id="live-delay" min="5" max="60" step="5"\n        value="45">', host_page)
+        self.assertLess(host_page.index('id="live-delay"'), host_page.index('id="live-flags"'))
+        self.assertIn('<small class="live-delay-note">(딜레이 시간이 너무 짧으면 LLM 한도가 빨리 소모될 수 있습니다)</small>',
+                      host_page)
+        member_page = self.member_client.get(self._url("live_session", session)).content.decode()
+        self.assertIn('value="45" disabled title="진행자가 정해요">', member_page)
+
+    def test_a_chunk_transcribed_after_pausing_is_judged_without_waiting(self):
+        """일시정지를 누를 때 마지막 조각은 아직 전사 중이라, 이어서 녹음할 때까지 '곧 판단해요'에 멈춰 있었다."""
+        session = self._start()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1", "LIVE_HOLDBACK_LINES": "2", "LIVE_ANALYZE_INTERVAL_SECONDS": "60"}), \
+             patch.object(services, "generate_live", return_value=(self._analysis([]), "m1")) as gen:
+            self._chunk(session, 0, "첫 말")  # 첫 분석
+            self.assertEqual(gen.call_count, 0)  # 최근 말이라 미룬다
+            LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_PAUSED)
+            self._chunk(session, 1, "일시정지 직전에 한 말")  # 일시정지 뒤에 전사가 끝났다
+            self.assertEqual(gen.call_count, 1)  # 간격(60초)·최근 말 미루기 없이 바로 본다
+            session.refresh_from_db()
+            self.assertEqual(session.analyzed_seq, 1)
+            self.assertEqual(self._state(session)["analysis"]["state"], "idle")  # 입력이 없음
+
+    def test_a_failed_analysis_while_paused_waits_the_delay_before_retrying(self):
+        session = self._start()
+        LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_PAUSED, analyze_interval=10)
+        self.addCleanup(live._last_failure.pop, session.id, None)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", side_effect=OSError("429")) as gen:
+            self._chunk(session, 0, "각자 준비해요")
+            self.assertEqual(gen.call_count, 1)
+            retry = self._state(session)["analysis"]  # 1초마다 묻는 동안 다시 부르지 않는다
+            self.assertEqual(gen.call_count, 1)
+            self.assertEqual(retry["state"], "waiting")  # 다시 시도할 때까지 대기
+            self.assertTrue(9 <= retry["seconds"] <= 10)
+            with patch.object(live.time, "monotonic", return_value=live.time.monotonic() + 11):
+                self._state(session)
+            self.assertEqual(gen.call_count, 2)
+
+    def test_the_holdback_never_exceeds_the_judging_delay(self):
+        """딜레이를 짧게 정해도 최근 말을 20초씩 붙잡아 정한 시간보다 늦게 판단했다."""
+        session = self._start()
+        LiveSession.objects.filter(pk=session.pk).update(analyze_interval=5)
+        session.refresh_from_db()
+        chunk = LiveChunk.objects.create(session=session, seq=0, file=SimpleUploadedFile("a.wav", b"x"),
+                                         status=LiveChunk.STATUS_DONE, transcript="자료는 제가 찾을게요")
+        with patch.dict(os.environ, {"LIVE_HOLDBACK_LINES": "2", "LIVE_HOLDBACK_SECONDS": "20"}):
+            self.assertEqual(live.holdback_seconds(session), 5)
+            self.assertEqual(live._settled_seq(session, 0), -1)
+            LiveChunk.objects.filter(pk=chunk.pk).update(created_at=timezone.now() - timedelta(seconds=6))
+            self.assertEqual(live._settled_seq(session, 0), 0)
+
+    def test_busy_names_the_model_for_the_tooltip(self):
+        session = self._start()
+        self.addCleanup(live._current_try.pop, session.id, None)
+        live._current_try[session.id] = (live.time.monotonic(), "로컬 Ollama(m1)")
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(live, "_analyzing", {session.id}), patch.object(live, "maybe_analyze"):
+            self.assertEqual(self._state(session)["analysis"]["state"], "busy")
+            self.assertEqual(self._state(session)["analysis"]["model"], "로컬 Ollama(m1)")
+        page = self.client.get(self._url("live_session", session)).content.decode()
+        self.assertIn('a.model + "이(가) 판단하고 있어요."', page)
+
+    def test_each_model_call_is_reported_and_cleared_after_the_analysis(self):
+        session = self._start()
+        seen = []
+
+        def fake(prompt, on_try=None):
+            on_try("Gemini(lite)")
+            seen.append(live._current_try.get(session.id)[1])
+            on_try("로컬 Ollama(m1)")
+            seen.append(live._current_try.get(session.id)[1])
+            return self._analysis([]), "로컬 Ollama(m1)"
+
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "generate_live", side_effect=fake):
+            self._chunk(session, 0, "각자 준비해요")
+        self.assertEqual(seen, ["Gemini(lite)", "로컬 Ollama(m1)"])
+        self.assertNotIn(session.id, live._current_try)
+
+    def test_an_unexpected_error_counts_as_a_failure_and_is_not_retried_every_second(self):
+        """응답을 못 읽는 등 예상하지 못한 오류로 분석 스레드가 죽으면 실패로 남지 않아, 일시정지 중 1초마다 다시 불렀다."""
+        session = self._start()
+        LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_PAUSED, analyze_interval=10)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", side_effect=ValueError("bad json")) as gen:
+            self._chunk(session, 0, "각자 준비해요")
+            self._state(session)
+            self._state(session)
+        self.assertEqual(gen.call_count, 1)
+        self.assertIn(session.id, live._last_failure)
+        self.assertNotIn(session.id, live._analyzing)
+
+    def test_a_slow_local_answer_is_not_asked_again(self):
+        """로컬 모델은 한 번에 수십 초라, 읽을 수 없는 답이 와도 같은 분석 안에서 다시 묻지 않는다."""
+        session = self._start()
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", return_value=("모르겠어요", "로컬 Ollama(m1)")) as gen:
+            self._chunk(session, 0, "각자 준비해요")
+        self.assertEqual(gen.call_count, 1)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), \
+             patch.object(services, "generate_live", return_value=("모르겠어요", "Gemini(lite)")) as gen:
+            self._chunk(session, 1, "자료는 되는대로 올릴게요")
+        self.assertEqual(gen.call_count, decision_compiler.PARSE_RETRIES + 1)  # 빠른 클라우드 모델은 한 번 더 묻는다
+
+    def test_the_judging_delay_spaces_the_analyses(self):
+        session = self._start()
+        LiveSession.objects.filter(pk=session.pk).update(analyze_interval=60)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1", "LIVE_ANALYZE_INTERVAL_SECONDS": "0"}), \
+             patch.object(services, "generate_live", return_value=(self._analysis([]), "m1")) as gen:
+            self._chunk(session, 0, "첫 말")
+            self._chunk(session, 1, "둘째 말")
+            self.assertEqual(gen.call_count, 1)  # 세션에 정한 60초가 기본값(0초)보다 먼저다
+            LiveSession.objects.filter(pk=session.pk).update(analyze_interval=5)
+            with patch.object(live.time, "monotonic", return_value=live.time.monotonic() + 6):
+                self._chunk(session, 2, "셋째 말")
+        self.assertEqual(gen.call_count, 2)
+
+    def test_the_meeting_record_reads_like_minutes(self):
+        session = self._start()
+        page = self.client.get(self._url("live_session", session)).content.decode()
+        self.assertIn('block.className = "live-log-block";', page)
+        self.assertIn('if (last && last.dataset.at === (at || "")) {', page)  # 같은 분의 말은 한 칸에
+        # 말이 끊긴 조각과 그 안의 문장마다 줄을 바꾼다.
+        self.assertIn('line.className = "line";', page)
+        self.assertIn('text.replace(/([.?!…])\\s+/g, "$1\\n").split("\\n")', page)
+        self.assertNotIn("live-log-line", page)
+
+    def test_only_the_host_page_draws_the_dismiss_button(self):
+        session = self._start()
+        host_page = self.client.get(self._url("live_session", session)).content.decode()
+        self.assertIn('dismiss.className = "live-dismiss";', host_page)
+        self.assertIn("if (isHost) {\n        var dismiss", host_page)
+
+    def test_resolved_flags_are_passed_to_decision_extraction(self):
+        session = self._start()
+        LiveFlag.objects.create(session=session, phrase="다음 주쯤", reason="요일이 없어요", resolved=True)
+        LiveFlag.objects.create(session=session, phrase="각자", reason="담당이 없어요")
+        info = decision_compiler.collect_meeting_info(self.meeting)
+        self.assertEqual(info["resolved"], ["다음 주쯤 — 요일이 없어요"])
+        block = decision_compiler._meeting_info_block(info)
+        self.assertIn("회의 중 진행자가 이미 확인하고 처리한 애매한 점", block)
+        self.assertIn("· 다음 주쯤 — 요일이 없어요", block)
+        self.assertNotIn("각자", block)
+        # 처리한 표현은 '회의정보' 출처로 인정하지 않는다.
+        self.assertNotIn("다음 주쯤", decision_compiler._info_text(info))
+
+    def test_rule_warnings_about_a_resolved_phrase_are_dropped(self):
+        warnings = ["확정 문장에 모호한 표현이 있어요: '쯤'", "확정 문장에 다른 날짜가 섞여 있어요: 5일, 7일"]
+        self.assertEqual(decision_compiler._drop_resolved(warnings, ["다음 주쯤"]),
+                         ["확정 문장에 다른 날짜가 섞여 있어요: 5일, 7일"])
+        self.assertEqual(decision_compiler._drop_resolved(warnings, []), warnings)
+
+    # ---- 종료 ----
+
+    def test_ending_registers_one_merged_recording_without_transcribing_it(self):
+        session = self._start()
+        self._chunk(session, 0, "앞")
+        self._chunk(session, 1, "뒤")
+        chunk_paths = [c.file.path for c in session.chunks.all()]
+        with patch.object(services, "transcribe") as full:
+            r = self.client.post(self._url("live_control", session), {"action": "end", "speaker_count": "3"})
+        self.assertEqual(r.json()["status"], "ended")
+        full.assert_not_called()
+        session.refresh_from_db()
+        recording = session.recording
+        self.assertTrue(recording.filename.startswith("실시간녹음_"))
+        self.assertEqual((recording.status, recording.speaker_count, recording.transcript), (Recording.STATUS_READY, 3, ""))
+        self.meeting.refresh_from_db()
+        self.assertEqual((self.meeting.transcript, self.meeting.processing_status), ("", ""))
+        import wave as wave_module
+        with wave_module.open(recording.file.path) as merged:
+            self.assertAlmostEqual(merged.getnframes() / merged.getframerate(), 1.0, places=1)
+        self.assertFalse(any(os.path.exists(p) for p in chunk_paths))  # 조각 파일은 지운다
+        self.assertEqual(_transcript(self._state(session)), "앞 뒤")  # 회의 중 녹취 글은 남는다
+        self.assertContains(self.client.get(self._url("live_session", session)), "실시간 녹음이 끝났습니다")
+        self.assertContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "등록됨 · 제출하면 전사")
+
+    def test_submitting_processes_the_registered_recording_with_new_uploads(self):
+        session = self._start()
+        self._chunk(session, 0, "앞")
+        self.client.post(self._url("live_control", session), {"action": "end", "speaker_count": "2"})
+        registered = LiveSession.objects.get(pk=session.pk).recording
+        with patch.object(services, "transcribe", return_value="통합 전사본") as full, \
+             patch.object(services, "summarize", side_effect=lambda t: t):
+            r = self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {
+                "action": "submit",
+                "text_file": [SimpleUploadedFile("메모.txt", "회의 메모".encode(), content_type="text/plain")],
+            })
+        self.assertRedirects(r, reverse("meeting_result", args=[self.meeting.id]), fetch_redirect_response=False)
+        registered.refresh_from_db()
+        self.assertEqual(registered.status, Recording.STATUS_DONE)
+        self.assertEqual(full.call_args.kwargs["speaker_count"], 2)
+        self.meeting.refresh_from_db()
+        self.assertIn("통합 전사본", self.meeting.transcript)
+        self.assertIn("회의 메모", self.meeting.transcript)
+        self.assertEqual(self.meeting.processing_status, Meeting.STATUS_DONE)
+
+    def test_the_host_can_change_the_speaker_count_of_a_registered_recording(self):
+        """실시간 녹음을 끝낼 때 적은 말한 사람 수를, 제출하기 전에 회의 화면에서 고칠 수 있다."""
+        session = self._start()
+        self._chunk(session, 0, "앞")
+        self.client.post(self._url("live_control", session), {"action": "end", "speaker_count": "3"})
+        recording = LiveSession.objects.get(pk=session.pk).recording
+        url = reverse("recording_speakers", args=[self.meeting.id, recording.id])
+        detail = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
+        self.assertContains(detail, url)
+        self.assertContains(detail, 'value="3" placeholder="자동"')
+        self.assertNotContains(self.member_client.get(reverse("meeting_detail", args=[self.meeting.id])), url)
+        self.assertEqual(self.member_client.post(url, {"speaker_count": "4"}).status_code, 403)
+        self.assertRedirects(self.client.post(url, {"speaker_count": "5"}),
+                             reverse("meeting_detail", args=[self.meeting.id]), fetch_redirect_response=False)
+        recording.refresh_from_db()
+        self.assertEqual(recording.speaker_count, 5)
+        self.assertContains(self.client.post(url, {"speaker_count": "99"}), "1~20 사이 숫자로")
+        self.client.post(url, {"speaker_count": ""})  # 비우면 자동
+        recording.refresh_from_db()
+        self.assertIsNone(recording.speaker_count)
+        # 고친 수로 전사한다.
+        self.client.post(url, {"speaker_count": "2"})
+        with patch.object(services, "transcribe", return_value="통합 전사본") as full, \
+             patch.object(services, "summarize", side_effect=lambda t: t):
+            self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit"})
+        self.assertEqual(full.call_args.kwargs["speaker_count"], 2)
+        # 전사가 끝난 녹음은 바꿔도 소용없어 고치는 칸이 없다.
+        self.assertEqual(self.client.post(url, {"speaker_count": "4"}).status_code, 404)
+        self.assertNotContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), url)
+
+    def test_the_meeting_files_list_labels_each_kind(self):
+        """'업로드된 파일'에는 실시간 녹음만 있는 게 아니라 직접 올린 녹음·텍스트 파일도 함께 들어간다 — 줄마다 종류를 붙인다."""
+        session = self._start()
+        self._chunk(session, 0, "앞")
+        self.client.post(self._url("live_control", session), {"action": "end"})
+        Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("회의녹음.wav", _wav_bytes()),
+                                 status=Recording.STATUS_DONE)
+        Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("메모.txt", "메모".encode()),
+                                 status=Recording.STATUS_DONE)
+        page = self.client.get(reverse("meeting_detail", args=[self.meeting.id])).content.decode()
+        self.assertIn("회의 파일 (3)", page)
+        self.assertNotIn("업로드된 파일", page)
+        for kind in ("실시간 녹음", "녹음 파일", "텍스트 파일"):
+            self.assertIn('<span class="badge kind">%s</span>' % kind, page)
+        # 아래에서 고른 파일 목록도 위 목록과 같은 모양(아이콘·이름·종류·상태)이다.
+        self.assertIn('data-kind="녹음 파일"', page)
+        self.assertIn('item.className = "item";', page)
+        self.assertIn('state.textContent = "올리기 전 · 제출하면 "', page)
+
+    def test_submitting_with_only_the_registered_recording_processes_it(self):
+        session = self._start()
+        self._chunk(session, 0, "앞")
+        self.client.post(self._url("live_control", session), {"action": "end"})
+        with patch.object(services, "transcribe", return_value="통합 전사본"), \
+             patch.object(services, "summarize", side_effect=lambda t: t):
+            self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "submit"})
+        self.meeting.refresh_from_db()
+        self.assertEqual((self.meeting.transcript, self.meeting.processing_status), ("통합 전사본", Meeting.STATUS_DONE))
+
+    def test_a_registered_recording_does_not_count_as_a_failed_meeting(self):
+        Recording.objects.create(meeting=self.meeting, file=SimpleUploadedFile("r.wav", _wav_bytes()),
+                                 status=Recording.STATUS_READY)
+        tasks.refresh_meeting(self.meeting)
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.processing_status, "")
+
+    def test_ending_with_a_bad_speaker_count_is_refused(self):
+        session = self._start()
+        r = self.client.post(self._url("live_control", session), {"action": "end", "speaker_count": "99"})
+        self.assertEqual(r.status_code, 400)
+        session.refresh_from_db()
+        self.assertTrue(session.is_active)
+
+    def test_ending_without_any_audio_records_why(self):
+        session = self._start()
+        self.client.post(self._url("live_control", session), {"action": "end"})
+        session.refresh_from_db()
+        self.assertEqual((session.status, session.recording, session.error),
+                         (LiveSession.STATUS_ENDED, None, "녹음된 내용이 없습니다"))
+        self.assertNotContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "data-live-banner")
+
+    def test_ending_the_meeting_ends_a_paused_session_and_processes_its_recording(self):
+        """녹음 종료를 누르지 않고 회의를 종료하면 세션이 '일시정지'로 남아 배너가 계속 떴고, 녹음도 처리되지 않았다."""
+        session = self._start()
+        self._chunk(session, 0, "앞")
+        self.client.post(self._url("live_control", session), {"action": "pause"})
+        with patch.object(services, "transcribe", return_value="통합 전사본") as full, \
+             patch.object(services, "summarize", side_effect=lambda t: t):
+            self.client.post(reverse("meeting_detail", args=[self.meeting.id]), {"action": "end"})
+        session.refresh_from_db()
+        self.assertEqual(session.status, LiveSession.STATUS_ENDED)
+        self.assertIsNotNone(session.ended_at)
+        self.assertEqual(session.recording.status, Recording.STATUS_DONE)
+        full.assert_called_once()
+        self.meeting.refresh_from_db()
+        self.assertEqual((self.meeting.ended, self.meeting.transcript), (True, "통합 전사본"))
+        detail = self.client.get(reverse("meeting_detail", args=[self.meeting.id]))
+        self.assertNotContains(detail, "data-live-banner")
+        state = self._state(session)
+        self.assertEqual((state["status"], state["meeting_ended"]), ("ended", True))
+
+    def test_an_ended_meeting_hides_a_leftover_session_banner(self):
+        self._start()
+        Meeting.objects.filter(pk=self.meeting.pk).update(ended=True)
+        self.assertNotContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "data-live-banner")
+
+    def test_the_host_page_of_an_ended_session_is_not_drawn_as_paused(self):
+        """녹음 종료 뒤 새로 고친 진행자 화면이 녹음한 적이 있다는 이유로 '일시정지'로 그려졌다."""
+        session = self._start()
+        self._chunk(session, 0, "앞")
+        self.client.post(self._url("live_control", session), {"action": "end"})
+        page = self.client.get(self._url("live_session", session)).content.decode()
+        self.assertIn('data-status="ended"', page)
+        self.assertIn('<span id="live-status-label">종료</span>', page)
+        self.assertIn('if (status === "ended") {\n      onEnded();\n    } else if (nextSeq > 0) {', page)
+        self.assertIn("if (isHost) onEnded();", page)
+
+    def test_merge_skips_a_broken_chunk_instead_of_losing_the_meeting(self):
+        folder = tempfile.mkdtemp()
+        good, broken = os.path.join(folder, "a.wav"), os.path.join(folder, "b.webm")
+        with open(good, "wb") as handle:
+            handle.write(_wav_bytes(0.5))
+        with open(broken, "wb") as handle:
+            handle.write(b"not audio")
+        seconds = services.merge_audio_to_wav([good, broken, good], os.path.join(folder, "out.wav"))
+        self.assertAlmostEqual(seconds, 1.0, places=1)
+        with self.assertRaises(RuntimeError):
+            services.merge_audio_to_wav([broken], os.path.join(folder, "none.wav"))
+
+
+class LiveLlmTests(TestCase):
+    """실시간 애매함 분석의 AI 호출(services.generate_live) — 짧게 기다리고, 다시 보내지 않고, 누가 답했는지 남긴다."""
+
+    def setUp(self):
+        services._live_skip_until.clear()
+        self.addCleanup(services._live_skip_until.clear)
+
+    def test_a_live_only_groq_model_is_enough(self):
+        """LIVE_GROQ_LLM_MODEL만 두면 GROQ_LLM_MODEL이 없다는 이유로 Groq를 건너뛰었다."""
+        with patch.dict(os.environ, {"GROQ_API_KEY": "q", "LIVE_GROQ_LLM_MODEL": "small"}, clear=True), \
+             patch.object(services, "_generate_groq_llm", return_value="응답") as groq:
+            self.assertTrue(services.live_enabled())
+            self.assertEqual(services.generate_live("p"), ("응답", "Groq(small)"))
+        self.assertEqual(groq.call_args.kwargs["model"], "small")
+
+    def test_reports_each_model_it_is_about_to_call(self):
+        env = {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "g-lite", "OLLAMA_MODEL": "small"}
+        tried = []
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(services, "_generate_gemini", side_effect=OSError("429")), \
+             patch.object(services, "_generate_ollama", return_value="로컬"):
+            services.generate_live("p", on_try=tried.append)
+        self.assertEqual(tried, ["Gemini(g-lite)", "로컬 Ollama(small)"])
+
+    def test_uses_the_live_model_with_a_short_timeout_and_no_retry(self):
+        env = {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "slow", "LIVE_GEMINI_MODEL": "fast-a,fast-b", "LIVE_LLM_TIMEOUT": "9"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(services, "_generate_gemini", side_effect=[OSError("503"), "응답"]) as gemini:
+            self.assertEqual(services.generate_live("p"), ("응답", "Gemini(fast-b)"))
+        self.assertEqual([c.kwargs["model"] for c in gemini.call_args_list], ["fast-a", "fast-b"])
+        self.assertEqual({(c.kwargs["timeout"], c.kwargs["retries"]) for c in gemini.call_args_list}, {(9, 0)})
+        self.assertIn("fast-a", services._live_skip_until)  # 실패한 모델은 잠시 실시간 분석에서 건너뛴다
+        self.assertNotIn("fast-a", services._gemini_skip_until)  # 결정 추출 등 다른 호출에는 영향 없음
+
+    def test_falls_back_to_gemini_model_when_no_live_model_is_set(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "g1"}, clear=True), \
+             patch.object(services, "_generate_gemini", return_value="응답") as gemini:
+            services.generate_live("p")
+        self.assertEqual(gemini.call_args.kwargs["model"], "g1")
+
+    def test_uses_only_the_light_models_from_gemini_model_and_leaves_the_big_ones_alone(self):
+        """실시간은 일차 판단이라 가벼운 모델만 쓴다 — 큰 모델의 한도는 회의 뒤 결정 추출 몫이다."""
+        env = {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(services, "_generate_gemini", side_effect=OSError("429")) as gemini:
+            with self.assertRaises(OSError):
+                services.generate_live("p")
+        self.assertEqual([c.kwargs["model"] for c in gemini.call_args_list], ["gemini-3.5-flash-lite"])
+        self.assertEqual([m for m in ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gpt-5-mini", "x-nano-2", "gemini-pro")
+                          if services._is_light(m)], ["gemini-3.5-flash-lite", "gpt-5-mini", "x-nano-2"])
+
+    def test_the_live_groq_model_can_be_set_separately(self):
+        env = {"GROQ_API_KEY": "q", "GROQ_LLM_MODEL": "big", "LIVE_GROQ_LLM_MODEL": "small"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(services, "_generate_groq_llm", return_value="응답") as groq:
+            self.assertEqual(services.generate_live("p"), ("응답", "Groq(small)"))
+        self.assertEqual(groq.call_args.kwargs["model"], "small")
+
+    def test_falls_back_to_local_ollama_when_every_cloud_model_fails(self):
+        """클라우드가 모두 막혀도(무료 한도 소진) 회의 중 알림이 끊기지 않게 내 컴퓨터의 모델로 본다."""
+        env = {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "g-lite", "GROQ_API_KEY": "q", "GROQ_LLM_MODEL": "llama",
+               "OLLAMA_MODEL": "small", "LIVE_OLLAMA_TIMEOUT": "90"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(services, "_generate_gemini", side_effect=OSError("429")), \
+             patch.object(services, "_generate_groq_llm", side_effect=OSError("down")), \
+             patch.object(services, "_generate_ollama", return_value="로컬") as ollama:
+            self.assertEqual(services.generate_live("p"), ("로컬", "로컬 Ollama(small)"))
+            self.assertEqual(ollama.call_args.kwargs["timeout"], 90)
+            # 쉬는 중인 Gemini는 다시 부르지 않고 바로 로컬로 간다.
+            with patch.object(services, "_generate_gemini") as gemini:
+                services.generate_live("p")
+            gemini.assert_not_called()
+
+    def test_raises_when_everything_including_ollama_fails(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "g1", "OLLAMA_MODEL": "small"}, clear=True), \
+             patch.object(services, "_generate_gemini", side_effect=OSError("down")), \
+             patch.object(services, "_generate_ollama", side_effect=OSError("refused")):
+            with self.assertRaises(OSError):
+                services.generate_live("p")
+
+    def test_goes_to_groq_and_uses_ollama_alone_when_it_is_the_only_llm(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "g1", "GROQ_API_KEY": "q",
+                                     "GROQ_LLM_MODEL": "llama", "LIVE_LLM_TIMEOUT": "7"}, clear=True), \
+             patch.object(services, "_generate_gemini", side_effect=OSError("down")), \
+             patch.object(services, "_generate_groq_llm", return_value="그록") as groq:
+            self.assertEqual(services.generate_live("p"), ("그록", "Groq(llama)"))
+        self.assertEqual(groq.call_args.kwargs["timeout"], 7)
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "small"}, clear=True), \
+             patch.object(services, "_generate_ollama", return_value="로컬") as ollama:
+            self.assertEqual(services.generate_live("p"), ("로컬", "로컬 Ollama(small)"))
+        ollama.assert_called_once()
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
+class LiveSessionReturnTests(TestCase):
+    """녹음 중에 화면을 떠났다 돌아왔을 때 — 순번을 이어 붙이고, 녹음이 끊긴 것을 팀원에게 알린다."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.host)
+        self.client.force_login(self.host)
+        self.session = LiveSession.objects.create(meeting=self.meeting, started_by=self.host)
+
+    def _url(self, name):
+        return reverse(name, args=[self.meeting.id, self.session.id])
+
+    def _chunks(self, durations):
+        for seq, ms in enumerate(durations):
+            LiveChunk.objects.create(session=self.session, seq=seq, file=SimpleUploadedFile("c.wav", b"x"),
+                                     status=LiveChunk.STATUS_DONE, duration_ms=ms)
+
+    def test_returning_mid_recording_opens_paused_with_numbering_and_time_carried_on(self):
+        self._chunks([15000, 15000, 7500])
+        # 마지막 조각이 한참 전이다 — 진행자가 녹음 중에 화면을 떠났다.
+        LiveChunk.objects.filter(session=self.session).update(created_at=timezone.now() - timedelta(minutes=2))
+        page = self.client.get(self._url("live_session")).content.decode()
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, LiveSession.STATUS_PAUSED)  # 녹음 중에 떠났으면 일시정지로
+        self.assertIn('data-next-seq="3"', page)
+        self.assertIn('data-recorded-ms="37500"', page)
+        self.assertIn("parseInt(root.dataset.recordedMs, 10)", page)
+        self.assertIn('mode = "paused";', page)
+        # 자동으로 다시 녹음하지 않는다 — 진행자가 '이어서 녹음'을 누른다.
+        self.assertNotIn("navigator.permissions.query", page)
+        self.assertEqual(self.client.get(self._url("live_state")).json()["recorded_ms"], 37500)
+
+    def test_a_fresh_session_opens_waiting_not_paused(self):
+        self.client.get(self._url("live_session"))
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, LiveSession.STATUS_RECORDING)
+
+    def test_leaving_the_page_sends_a_pause_beacon(self):
+        page = self.client.get(self._url("live_session")).content.decode()
+        self.assertIn('addEventListener("pagehide"', page)
+        self.assertIn("navigator.sendBeacon(root.dataset.controlUrl, form)", page)
+        # sendBeacon은 머리말을 못 붙인다 — 폼 값으로 보낸 CSRF 토큰으로 일시정지가 통과해야 한다.
+        csrf_client = Client(enforce_csrf_checks=True)
+        csrf_client.force_login(self.host)
+        page = csrf_client.get(self._url("live_session"))
+        token = page.context["csrf_token"]
+        r = csrf_client.post(self._url("live_control"), {"action": "pause", "csrfmiddlewaretoken": str(token)})
+        self.assertEqual(r.status_code, 200)
+
+    def test_chunk_uploads_record_their_length(self):
+        with patch.object(services, "transcribe_live", return_value="x"):
+            self.client.post(self._url("live_chunk"), {
+                "seq": "0", "duration_ms": "14980",
+                "chunk": SimpleUploadedFile("c0.wav", _wav_bytes(), content_type="audio/wav"),
+            })
+        self.assertEqual(self.session.chunks.get().duration_ms, 14980)
+
+    def test_a_recording_session_whose_chunks_stopped_is_paused_when_polled(self):
+        self._chunks([15000])
+        LiveSession.objects.filter(pk=self.session.pk).update(status=LiveSession.STATUS_RECORDING)
+        self.assertEqual(self.client.get(self._url("live_state")).json()["status"], "recording")
+        old = timezone.now() - timedelta(minutes=5)
+        LiveChunk.objects.filter(session=self.session).update(created_at=old)
+        LiveSession.objects.filter(pk=self.session.pk).update(started_at=old - timedelta(minutes=1))
+        live._activity.pop(self.session.id, None)
+        self.assertEqual(self.client.get(self._url("live_state")).json()["status"], "paused")
+
+    def test_silence_is_only_judged_while_the_level_meter_is_running(self):
+        page = self.client.get(self._url("live_session")).content.decode()
+        self.assertIn('meterContext.state === "running"', page)
+        self.assertIn("meterWorking() ? chunkPeak < SILENT_RMS : false", page)
+
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(), BACKGROUND_RECORDING=False)
+class LiveSingleRecorderTests(TestCase):
+    """한 세션은 한 화면(탭)만 녹음한다 — 탭 두 개가 동시에 녹음해 같은 소리가 두 번 올라가던 문제."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.host)
+        self.client.force_login(self.host)
+        self.session = LiveSession.objects.create(meeting=self.meeting, started_by=self.host)
+        self.addCleanup(live._recorders.pop, self.session.id, None)
+
+    def _url(self, name):
+        return reverse(name, args=[self.meeting.id, self.session.id])
+
+    def _chunk(self, seq, recorder):
+        with patch.object(services, "transcribe_live", return_value="말"):
+            return self.client.post(self._url("live_chunk"), {
+                "seq": str(seq), "recorder": recorder, "duration_ms": "15000",
+                "chunk": SimpleUploadedFile("c.wav", _wav_bytes(), content_type="audio/wav"),
+            })
+
+    def test_only_the_tab_that_resumed_last_can_upload(self):
+        self.client.post(self._url("live_control"), {"action": "resume", "recorder": "tab-a"})
+        self.assertEqual(self._chunk(0, "tab-a").status_code, 200)
+        self.client.post(self._url("live_control"), {"action": "resume", "recorder": "tab-b"})
+        r = self._chunk(1, "tab-a")
+        self.assertEqual((r.status_code, r.json()["error"]), (409, "other_recorder"))
+        self.assertEqual(self._chunk(1, "tab-b").status_code, 200)
+        self.assertEqual(list(self.session.chunks.values_list("seq", flat=True)), [0, 1])
+
+    def test_an_old_tab_leaving_does_not_pause_the_new_tab(self):
+        self.client.post(self._url("live_control"), {"action": "resume", "recorder": "tab-a"})
+        self.client.post(self._url("live_control"), {"action": "resume", "recorder": "tab-b"})
+        self.client.post(self._url("live_control"), {"action": "pause", "recorder": "tab-a"})
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, LiveSession.STATUS_RECORDING)
+        self.client.post(self._url("live_control"), {"action": "pause", "recorder": "tab-b"})
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, LiveSession.STATUS_PAUSED)
+
+    def test_after_a_restart_the_first_tab_to_upload_takes_over(self):
+        self.assertEqual(self._chunk(0, "tab-a").status_code, 200)
+        self.assertEqual(self._chunk(1, "tab-b").status_code, 409)
+
+    def test_opening_a_second_tab_while_another_is_recording_does_not_pause_it(self):
+        self.client.post(self._url("live_control"), {"action": "resume", "recorder": "tab-a"})
+        self._chunk(0, "tab-a")
+        page = self.client.get(self._url("live_session")).content.decode()
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, LiveSession.STATUS_RECORDING)
+        self.assertIn('data-recording-elsewhere="1"', page)
+
+    def test_links_are_not_opened_in_a_new_tab_anymore(self):
+        page = self.client.get(self._url("live_session")).content.decode()
+        self.assertNotIn('link.target = "_blank"', page)
+        self.assertIn('form.append("recorder", recorderId)', page)
+
+    def test_trying_to_leave_pauses_right_away(self):
+        """나가려는 순간(확인 창이 뜰 때) 일시정지한다 — 나가기를 취소해도 일시정지된 채로 남는다."""
+        page = self.client.get(self._url("live_session")).content.decode()
+        handler = page[page.index('window.addEventListener("beforeunload"'):]
+        handler = handler[:handler.index("});")]
+        self.assertIn('if (mode === "recording") pauseForLeaving();', handler)
+        self.assertIn("화면을 나가려고 해서 녹음을 일시정지했어요", page)
+        # 닫히는 중에도 일시정지 요청과 작은 마지막 조각이 끝까지 가도록 keepalive로 보낸다.
+        self.assertIn('post(root.dataset.controlUrl, { action: "pause", recorder: recorderId }, leaving)', page)
+        self.assertIn("keepalive: !!keepalive", page)
+
+
+class LiveCaptionAndPauseChunkTests(TestCase):
+    """말이 끊기는 지점에서 조각 자르기."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("host", password="pw12345!")
+        self.member = User.objects.create_user("member", password="pw12345!")
+        self.team = Team.objects.create(name="t")
+        self.team.members.add(self.host, self.member)
+        self.meeting = Meeting.objects.create(team=self.team, title="m", host=self.host)
+        self.client.force_login(self.host)
+        self.member_client = Client()
+        self.member_client.force_login(self.member)
+        self.session = LiveSession.objects.create(meeting=self.meeting, started_by=self.host)
+        self.addCleanup(live._recorders.pop, self.session.id, None)
+
+    def _url(self, name):
+        return reverse(name, args=[self.meeting.id, self.session.id])
+
+    def test_page_cuts_chunks_at_pauses_without_browser_speech_recognition(self):
+        """'말하는 중' 임시 자막(브라우저 음성 인식)은 뺐다 — 문장이 계속 붙어 커지는 칸이 됐다. 자막 칸에는 녹취 줄만 쌓인다."""
+        page = self.client.get(self._url("live_session")).content.decode()
+        self.assertNotIn("SpeechRecognition", page)
+        self.assertNotIn('id="live-caption"', page)
+        self.assertNotIn("음성이 구글로 전송", page)
+        self.assertIn("var PAUSE_MS = 700, MIN_CHUNK_MS = 1500;", page)
+        self.assertIn("now - lastLoudAt >= PAUSE_MS", page)
+        self.assertIn('setTimeout(poll, status === "ended" ? 5000 : 1000)', page)
+        # 자막 칸은 애매한 점 대화창보다 위에 있다.
+        self.assertLess(page.index('id="live-log"'), page.index('id="live-flags"'))
+        self.assertNotIn("caption", self.client.get(self._url("live_state")).json())

@@ -15,9 +15,9 @@ from django.utils.dateparse import parse_date
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
-from . import decision_checks, decision_compiler, notifications, services, tasks
+from . import decision_checks, decision_compiler, live, notifications, services, tasks
 from .models import (
-    ChatMessage, Decision, DecisionAgreement, Interpretation, Meeting,
+    ChatMessage, Decision, DecisionAgreement, Interpretation, LiveChunk, LiveFlag, LiveSession, Meeting,
     Notification, Question, Recording, Team, TEXT_TRANSCRIPT_EXTENSIONS,
 )
 
@@ -239,13 +239,30 @@ def _participant_ids(meeting):
 
 
 def _participant_context(meeting, user):
-    """회의 화면의 참석자 칸(진행자에게만 보인다) — 결정 알림을 받을 범위."""
+    """회의 화면의 참석자 칸(진행자에게만 보인다) — 결정 알림을 받을 범위. 진행 중인 실시간 세션도 함께 넘긴다."""
+    # 종료된 회의는 실시간 세션도 끝난 것으로 본다(회의 종료가 세션을 함께 끝낸다 — _end_live_sessions).
+    live_active = None if meeting.ended else meeting.live_sessions.exclude(status=LiveSession.STATUS_ENDED).first()
+    if live_active is not None:
+        _pause_if_stalled(live_active)
+    # 녹음한 조각이 하나라도 있어야 시작한 회의다. 세션을 열어 두기만 하고 녹음 전이면 '녹음 중'도 '일시정지'도 아니다.
+    live_started = live_active is not None and live_active.chunks.exists()
+    # 회의 화면 위의 실시간 회의 배너. 녹음을 시작한 세션만 띄운다. 진행자에게는 일시정지일 때만 — 녹음 중이면 진행자는
+    # 실시간 화면에 있다. 팀원에게는 녹음 중일 때(들어와서 함께 보라고)와 일시정지일 때. 녹음 중인데 조각이 끊겼으면
+    # (화면을 닫았는데 일시정지 신호가 못 갔다) 위에서 일시정지로 돌려 둔다.
+    live_paused = live_started and live_active.status == LiveSession.STATUS_PAUSED
+    is_host = meeting.host_id == user.id
+    live_banner = live_started and (live_paused or not is_host)
+    context = {"live_active": live_active, "live_started": live_started, "live_paused": live_paused,
+               "live_banner": live_banner, "host_id": meeting.host_id,
+               # 회의 파일 목록에서 '실시간 녹음'으로 표시할 녹음(실시간 세션을 끝내며 조각을 합친 것).
+               "live_recording_ids": set(meeting.live_sessions.exclude(recording=None)
+                                         .values_list("recording_id", flat=True))}
     if meeting.host_id != user.id:
-        return {"team_members": [], "participant_ids": set(), "host_id": meeting.host_id}
+        return {"team_members": [], "participant_ids": set(), **context}
     return {
         "team_members": _team_members(meeting.team),
         "participant_ids": _participant_ids(meeting),
-        "host_id": meeting.host_id,
+        **context,
     }
 
 
@@ -302,6 +319,17 @@ def meeting_detail(request, meeting_id):
                 "meeting": meeting, "error": error, "stt_status": services.stt_status_text(),
                 **_participant_context(meeting, request.user),
             })
+        if request.POST.get("action") == "end":
+            # 일시정지된 채 남은 실시간 세션도 끝내고 녹음을 합쳐 둔다 — 아래에서 함께 처리된다.
+            _end_live_sessions(meeting)
+        # 실시간 세션에서 등록만 해 둔 녹음은 '제출하고 회의록 만들기'나 '회의 종료'를 누를 때 함께 처리한다. 종료한
+        # 회의에는 더 제출할 수 없어서, 종료할 때 처리하지 않으면 등록된 녹음이 그대로 남는다.
+        registered = []
+        if request.POST.get("action") in ("submit", "end"):
+            registered = list(meeting.recordings.filter(status=Recording.STATUS_READY).values_list("id", flat=True))
+            Recording.objects.filter(pk__in=registered).update(status=Recording.STATUS_PROCESSING)
+        if registered and not uploads:
+            tasks.start_processing(*registered)
         if uploads:
             # 녹음을 먼저 만들고 텍스트 파일을 나중에 만든다(처리 순서). 녹취 원문에서는 텍스트 파일이 앞에 온다(tasks).
             # 말한 사람 수는 녹음마다 따로 붙는다(텍스트 파일은 화자 분리를 하지 않는다).
@@ -312,7 +340,7 @@ def meeting_detail(request, meeting_id):
                 )
                 for index, upload in enumerate(uploads)
             ]
-            tasks.start_processing(*(r.id for r in added))
+            tasks.start_processing(*registered, *(r.id for r in added))
         if request.POST.get("action") == "end":
             Meeting.objects.filter(pk=meeting.pk).update(ended=True)
             return redirect("meeting_detail", meeting_id=meeting.id)
@@ -327,6 +355,14 @@ def meeting_detail(request, meeting_id):
         "notice_revised": Notification.KIND_REVISED,
         **_participant_context(meeting, request.user),
     })
+
+
+def _end_live_sessions(meeting):
+    """회의를 끝낼 때 아직 끝나지 않은(녹음 중·일시정지) 실시간 세션을 끝내고 조각을 하나의 녹음으로 합친다. 합치기는
+    이 요청 안에서 끝낸다 — 합친 녹음을 같은 제출 묶음에 넣어야 회의록이 한 번에 만들어진다."""
+    for session in meeting.live_sessions.exclude(status=LiveSession.STATUS_ENDED):
+        LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_ENDED, ended_at=timezone.now())
+        live.finish(session, wait=True)
 
 
 @login_required
@@ -355,6 +391,30 @@ def recording_retry(request, meeting_id, recording_id):
 
 @login_required
 @require_POST
+def recording_speakers(request, meeting_id, recording_id):
+    """등록한 녹음의 말한 사람 수를 고친다. 아직 전사하지 않은 녹음(등록됨)과 다시 시도할 녹음(실패)만 — 화자 분리는 전사할
+    때 이 수를 쓰므로, 이미 전사가 끝난 녹음은 바꿔도 소용없다. 비우면 화자 분리가 사람 수를 스스로 짐작한다.
+    실시간 녹음에서 합친 녹음은 녹음을 끝낼 때 적은 수가 미리 들어 있다."""
+    meeting = _meeting(request, meeting_id)
+    if meeting.host_id != request.user.id:
+        raise PermissionDenied
+    recording = get_object_or_404(
+        Recording, pk=recording_id, meeting=meeting, status__in=[Recording.STATUS_READY, Recording.STATUS_FAILED],
+    )
+    count, errors = _speaker_counts_from(request.POST.get("speaker_count", ""))
+    if meeting.ended or recording.is_text:
+        errors = ["이 파일의 말한 사람 수는 바꿀 수 없습니다."]
+    if errors:
+        return render(request, "meetalign/meeting_detail.html", {
+            "meeting": meeting, "error": errors[0], "stt_status": services.stt_status_text(),
+            **_participant_context(meeting, request.user),
+        })
+    Recording.objects.filter(pk=recording.pk).update(speaker_count=count)
+    return redirect("meeting_detail", meeting_id=meeting.id)
+
+
+@login_required
+@require_POST
 def recording_delete(request, meeting_id, recording_id):
     """업로드된 녹음·텍스트 파일 하나를 지우고, 남은 파일로 녹취 원문과 회의록을 다시 만든다.
 
@@ -371,6 +431,259 @@ def recording_delete(request, meeting_id, recording_id):
     recording.delete()
     tasks.start_refresh(meeting.id)
     return redirect("meeting_detail", meeting_id=meeting.id)
+
+
+# ---------------------------------------------------------------------------
+# 실시간 회의 세션(meetalign.live). 녹음·일시정지·종료·애매한 점 처리는 진행자만, 보기는 팀원 누구나.
+# ---------------------------------------------------------------------------
+
+# 실시간 조각 하나의 크기 상한. 15초 브라우저 녹음(webm/opus)은 수백 KB라 넉넉하다.
+MAX_LIVE_CHUNK_BYTES = 25 * 1024 * 1024
+
+
+def _live_session(request, meeting_id, session_id):
+    meeting = _meeting(request, meeting_id)
+    session = get_object_or_404(LiveSession, pk=session_id, meeting=meeting)
+    return meeting, session
+
+
+def _live_host_only(meeting, user):
+    if meeting.host_id != user.id:
+        raise PermissionDenied
+
+
+@login_required
+@require_POST
+def live_start(request, meeting_id):
+    """진행자가 '실시간 녹음'을 누르면 세션을 연다. 이미 진행 중인 세션이 있으면 그쪽으로 보낸다."""
+    meeting = _meeting(request, meeting_id)
+    _live_host_only(meeting, request.user)
+    if meeting.ended:
+        return redirect("meeting_detail", meeting_id=meeting.id)
+    session = meeting.live_sessions.exclude(status=LiveSession.STATUS_ENDED).first()
+    if session is None:
+        session = LiveSession.objects.create(meeting=meeting, started_by=request.user)
+    return redirect("live_session", meeting_id=meeting.id, session_id=session.id)
+
+
+@login_required
+def live_session(request, meeting_id, session_id):
+    meeting, session = _live_session(request, meeting_id, session_id)
+    last_chunk = session.chunks.order_by("-seq").first()
+    last = last_chunk.seq if last_chunk else None
+    recording_elsewhere = False
+    if session.status == LiveSession.STATUS_RECORDING and last_chunk is not None:
+        recent = (timezone.now() - last_chunk.created_at).total_seconds() <= live.chunk_seconds() * 2 + 5
+        if recent:
+            # 다른 화면(탭)이 지금도 조각을 올리고 있다 — 그 녹음을 멈추지 않는다.
+            recording_elsewhere = True
+        else:
+            # 진행자가 녹음 중에 화면을 떠났다. 녹음은 화면이 열려 있을 때만 되므로 일시정지로 돌려 둔다.
+            LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_PAUSED)
+            session.status = LiveSession.STATUS_PAUSED
+    return render(request, "meetalign/live.html", {
+        "meeting": meeting, "session": session, "is_host": meeting.host_id == request.user.id,
+        "started": last_chunk is not None,
+        "chunk_seconds": live.chunk_seconds(), "max_speakers": MAX_SPEAKER_COUNT,
+        "interval": live.analyze_interval(session), "interval_min": live.INTERVAL_MIN_SECONDS,
+        "interval_max": live.INTERVAL_MAX_SECONDS, "interval_step": live.INTERVAL_STEP_SECONDS,
+        # 다시 들어왔을 때 이어 붙일 순번. 0부터 다시 매기면 이미 있는 순번과 겹쳐 새 녹음이 버려진다.
+        "next_seq": 0 if last is None else last + 1,
+        "recorded_ms": _recorded_ms(session),
+        "recording_elsewhere": recording_elsewhere,
+    })
+
+
+def _recorded_ms(session):
+    return sum(session.chunks.values_list("duration_ms", flat=True))
+
+
+# 녹음 중인데 이 시간(조각 길이의 배수 + 여유) 동안 새 조각이 없으면 진행자 화면이 닫혔거나 녹음이 끊긴 것이다.
+LIVE_STALL_FACTOR = 3
+LIVE_STALL_GRACE_SECONDS = 15
+
+
+def _lines_until(chunks):
+    """0번부터 빈틈없이 전사가 끝난(또는 실패한) 마지막 조각 순번. 화면은 여기까지만 받아 쌓는다 — 뒤 조각이 먼저 끝나도
+    앞 조각이 아직 전사 중이면 기다려야, 화면이 받은 데까지의 표시(after)가 앞 조각을 건너뛰지 않는다. 끝내 오지 않은
+    순번(올리기를 포기한 조각)은 잠시 뒤 건너뛴다(live.contiguous_until)."""
+    return live.contiguous_until(sorted(chunks, key=lambda c: c.seq), -1)
+
+
+def _pause_if_stalled(session, chunks=None):
+    """녹음 중인데 조각이 한동안 끊겼으면 일시정지로 돌린다 — 진행자 화면이 닫혔는데 일시정지 신호가 오지 못한 경우다.
+    마지막 조각과 마지막으로 이어서 녹음한 때(live.touch) 가운데 늦은 것부터 센다 — 오래 쉬고 이어서 녹음하면 첫 조각이 오기
+    전에 다시 일시정지로 돌렸다. 녹음한 조각이 없으면(녹음 시작 전) 건드리지 않는다 — 시작도 안 한 회의를 일시정지로 보였다."""
+    if session.status != LiveSession.STATUS_RECORDING:
+        return
+    if chunks is None:
+        last_chunk = session.chunks.order_by("-created_at").values_list("created_at", flat=True).first()
+    else:
+        last_chunk = max((c.created_at for c in chunks), default=None)
+    if last_chunk is None:
+        return
+    last_activity = max(t for t in (last_chunk, live.last_touch(session.id)) if t is not None)
+    stall_after = live.chunk_seconds() * LIVE_STALL_FACTOR + LIVE_STALL_GRACE_SECONDS
+    if (timezone.now() - last_activity).total_seconds() > stall_after:
+        LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_PAUSED)
+        session.status = LiveSession.STATUS_PAUSED
+
+
+def _live_state(session, after=-1):
+    """after는 화면이 이미 받아 쌓은 마지막 조각 순번이다 — 녹취 줄은 그 뒤 것만 보낸다(긴 회의에서 1초마다 녹취 전체를
+    다시 보내지 않게). 처음 열거나 다시 들어온 화면은 -1을 보내 처음부터 받는다."""
+    chunks = list(session.chunks.all())
+    flags = list(session.flags.filter(dismissed=False))
+    _pause_if_stalled(session, chunks)
+    lines_until = _lines_until(chunks)
+    return {
+        "status": session.status,
+        # 녹음한 조각이 있는가 — 없으면 화면은 '녹음 중'·'일시정지' 대신 '녹음 시작 전'을 보인다.
+        "started": bool(chunks),
+        "recorded_ms": sum(c.duration_ms for c in chunks),
+        # 회의 기록 칸에 대화처럼 쌓이는 녹취 줄(조각 하나 = 한 줄). DB에 남아 있어 화면을 떠났다 돌아와도 다시 보인다.
+        "lines": [
+            {"seq": c.seq, "text": c.transcript, "at": timezone.localtime(c.created_at).strftime("%H:%M")}
+            for c in sorted(chunks, key=lambda c: c.seq)
+            if after < c.seq <= lines_until and c.status == LiveChunk.STATUS_DONE and c.transcript
+        ],
+        "lines_until": lines_until,
+        "pending": sum(1 for c in chunks if c.status == LiveChunk.STATUS_PENDING),
+        "failed": sum(1 for c in chunks if c.status == LiveChunk.STATUS_FAILED),
+        "next_seq": max((c.seq for c in chunks), default=-1) + 1,
+        "flags": [
+            {"id": f.id, "topic": f.topic, "phrase": f.phrase, "reason": f.reason, "resolved": f.resolved,
+             "auto": f.resolved and f.resolved_auto, "settled_quote": f.settled_quote,
+             "at": timezone.localtime(f.created_at).strftime("%H:%M")}
+            for f in flags
+        ],
+        # 애매함 분석 진행 — 화면이 "판단 중", "대기 중 · n초 남음" 같은 표시를 보여 준다(live.analysis_status).
+        "analysis": {**live.analysis_status(session), "interval": live.analyze_interval(session)},
+        "recording_ready": bool(session.recording_id),
+        # 회의 종료로 세션이 끝났으면 합친 녹음은 이미 처리 중이다 — 화면이 '제출하라'고 안내하지 않게.
+        "meeting_ended": Meeting.objects.filter(pk=session.meeting_id, ended=True).exists(),
+        "error": session.error,
+    }
+
+
+@login_required
+def live_state(request, meeting_id, session_id):
+    """실시간 화면이 몇 초마다 묻는 현재 상태(JSON). 멈춘 조각이 있으면 다시 전사를 건다."""
+    _, session = _live_session(request, meeting_id, session_id)
+    if session.is_active:
+        live.recover(session)
+        # 분석은 조각 전사가 끝날 때 시작되는데, 조용하면 다음 조각이 올 때까지 남은 시간이 0인 채로 멈춰 보였다. 화면이
+        # 1초마다 묻는 이때도 확인해서, 기다리는 시간이 다 되면 바로 시작한다(간격·잠금은 maybe_analyze가 지킨다).
+        # 일시정지 중에도 본다 — 일시정지를 누른 뒤에 전사가 끝난 마지막 조각을 바로 판단하게(예전에는 이어서 녹음할
+        # 때까지 '곧 판단해요'에 멈춰 있었다).
+        live.maybe_analyze(session)
+    raw_after = request.GET.get("after", "")
+    after = int(raw_after) if raw_after.lstrip("-").isdigit() else -1
+    return JsonResponse(_live_state(session, after=after))
+
+
+@login_required
+@require_POST
+def live_chunk(request, meeting_id, session_id):
+    """브라우저가 올리는 녹음 조각 하나. 같은 순번이 두 번 오면(재전송) 처음 것만 쓴다."""
+    meeting, session = _live_session(request, meeting_id, session_id)
+    _live_host_only(meeting, request.user)
+    if not session.is_active:
+        return JsonResponse({"error": "이미 끝난 세션입니다."}, status=409)
+    upload = request.FILES.get("chunk")
+    raw_seq = request.POST.get("seq", "")
+    if upload is None or not raw_seq.isdigit():
+        return HttpResponseBadRequest("chunk와 seq가 필요합니다.")
+    if upload.size > MAX_LIVE_CHUNK_BYTES:
+        return JsonResponse({"error": "녹음 조각이 너무 큽니다."}, status=413)
+    if not live.is_recorder(session.id, request.POST.get("recorder", "")):
+        # 다른 화면(탭)이 녹음을 맡았다. 이 화면은 녹음을 멈춘다(live.html).
+        return JsonResponse({"error": "other_recorder"}, status=409)
+    raw_duration = request.POST.get("duration_ms", "")
+    duration_ms = min(int(raw_duration), 10 * 60 * 1000) if raw_duration.isdigit() else 0
+    chunk, created = LiveChunk.objects.get_or_create(
+        session=session, seq=int(raw_seq), defaults={"file": upload, "duration_ms": duration_ms},
+    )
+    if created:
+        # 브라우저가 조각 동안 소리 크기를 재서 거의 조용했으면 silent=1을 붙인다 — 전사하지 않는다.
+        live.transcribe_chunk(chunk, silent=request.POST.get("silent") == "1")
+    return JsonResponse({"ok": True, "seq": chunk.seq})
+
+
+@login_required
+@require_POST
+def live_control(request, meeting_id, session_id):
+    """일시정지·이어서·종료. 종료하면 조각을 합쳐 녹음으로 등록하고(전사는 회의 화면에서 제출할 때) 끝낸다."""
+    meeting, session = _live_session(request, meeting_id, session_id)
+    _live_host_only(meeting, request.user)
+    action = request.POST.get("action")
+    if not session.is_active:
+        return JsonResponse({"status": session.status})
+    recorder = request.POST.get("recorder", "")
+    if action == "pause":
+        if not live.is_recorder(session.id, recorder):
+            # 이미 다른 화면이 녹음을 맡았다 — 떠나는 옛 화면의 일시정지 신호가 지금 녹음을 멈추지 않게 한다.
+            return JsonResponse({"status": session.status})
+        LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_PAUSED)
+        # 멈춘 김에 그때까지 쌓인 녹취를 바로 본다 — 쉬는 동안 애매한 점을 정리할 수 있게.
+        live.maybe_analyze(session, force=True)
+    elif action == "resume":
+        live.claim_recorder(session.id, recorder)
+        live.touch(session.id)  # 첫 조각이 오기 전에 '끊겼다'고 보지 않게
+        LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_RECORDING)
+    elif action == "interval":
+        # 판단 딜레이 시간(분석 간격) — '애매한 점' 아래 슬라이더. 바로 다음 분석부터 적용된다.
+        raw = request.POST.get("seconds", "")
+        if not raw.isdigit():
+            return HttpResponseBadRequest("seconds가 필요합니다.")
+        LiveSession.objects.filter(pk=session.pk).update(analyze_interval=live.clamp_interval(int(raw)))
+        session.refresh_from_db()
+        return JsonResponse({"status": session.status, "interval": live.analyze_interval(session)})
+    elif action == "end":
+        counts, errors = _speaker_counts_from(request.POST.get("speaker_count", ""))
+        if errors:
+            return JsonResponse({"error": errors[0]}, status=400)
+        LiveSession.objects.filter(pk=session.pk).update(
+            status=LiveSession.STATUS_ENDED, ended_at=timezone.now(), speaker_count=counts,
+        )
+        session.refresh_from_db()
+        live.finish(session)
+    else:
+        return HttpResponseBadRequest("알 수 없는 동작입니다.")
+    session.refresh_from_db()
+    return JsonResponse({"status": session.status})
+
+
+def _speaker_counts_from(raw):
+    """종료할 때 적은 말한 사람 수 하나 → (값 또는 None, [오류])."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None, []
+    if raw.isdigit() and 1 <= int(raw) <= MAX_SPEAKER_COUNT:
+        return int(raw), []
+    return None, ["말한 사람 수는 1~%d 사이 숫자로 적어 주세요(모르면 비워 두세요)." % MAX_SPEAKER_COUNT]
+
+
+@login_required
+@require_POST
+def live_flag(request, meeting_id, session_id, flag_id):
+    """진행자가 애매한 점을 '처리됨'으로 체크하거나 되돌린다. 처리한 것은 결정 추출이 다시 문제 삼지 않는다.
+    dismissed=1이면 잘못 짚은 것으로 지운다(화면의 ×) — 모두의 화면에서 사라지고, 다음 분석은 같은 것을 다시 올리지 않는다."""
+    meeting, session = _live_session(request, meeting_id, session_id)
+    _live_host_only(meeting, request.user)
+    flag = get_object_or_404(LiveFlag, pk=flag_id, session=session)
+    if "dismissed" in request.POST:
+        flag.dismissed = request.POST.get("dismissed") == "1"
+        flag.save(update_fields=["dismissed"])
+        return JsonResponse({"id": flag.id, "dismissed": flag.dismissed})
+    resolved = request.POST.get("resolved") == "1"
+    flag.resolved = resolved
+    flag.resolved_by = request.user if resolved else None
+    flag.resolved_at = timezone.now() if resolved else None
+    # 진행자가 직접 고르면 자동 확인이 아니다. 자동 확인을 되돌린 것은 settled_quote가 남아 다시 자동 확인하지 않는다.
+    flag.resolved_auto = False
+    flag.save(update_fields=["resolved", "resolved_by", "resolved_at", "resolved_auto"])
+    return JsonResponse({"id": flag.id, "resolved": flag.resolved})
 
 
 CHAT_HISTORY_TURNS = 3

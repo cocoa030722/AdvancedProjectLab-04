@@ -554,6 +554,93 @@ def transcribe(recording_path, recording_id=None, speaker_count=None):
     return _transcribe_local(recording_path, local)
 
 
+# Whisper가 조용한 구간에서 지어내곤 하는 말. 실시간 조각은 15초짜리라 아무도 말하지 않는 조각이 흔하고, 그때
+# 이런 문장이 녹취에 끼어든다. 조각 전체가 이런 말뿐이면 버린다(말 중간에 섞인 경우는 건드리지 않는다).
+LIVE_HALLUCINATIONS = (
+    "시청해주셔서감사합니다", "시청해주셔서고맙습니다", "구독과좋아요", "구독좋아요알림설정", "MBC뉴스",
+    "다음영상에서만나요", "감사합니다", "자막제공", "한국어자막", "부탁드립니다", "눌러주세요",
+)
+
+
+def _looks_hallucinated(text):
+    squashed = re.sub(r"[\s.,!?~·…]+", "", text or "")
+    if not squashed:
+        return True
+    for phrase in LIVE_HALLUCINATIONS:
+        squashed = squashed.replace(phrase, "")
+    # 위 문구와 '이 기자입니다' 같은 꼬리만 남았으면 지어낸 말로 본다.
+    return len(squashed) <= 2
+
+
+# 한국어·영어 외 문자(가나, 한자). Whisper는 언어를 한국어로 정해 줘도 잡음이 많은 짧은 조각에서 일본어·중국어로
+# 지어내곤 해서, 실시간 녹취에서는 그런 낱말을 지운다(한국어 회의에서 한자·가나로 받아 적을 말은 거의 없다).
+# 프롬프트(앞 조각 녹취·"한국어 회의 녹음입니다")는 주지 않는다 — 소리가 불분명한 조각에서 Whisper가 프롬프트를 그대로
+# 되풀이해서("안녕하세요."만 열 조각, "한국어 회의 녹음") 오히려 녹취를 망쳤다.
+_FOREIGN_WORD = re.compile(r"\S*[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]\S*")
+
+
+def _strip_foreign(text):
+    return " ".join(_FOREIGN_WORD.sub(" ", text or "").split())
+
+
+def transcribe_live(path):
+    """실시간 세션의 짧은 조각 하나를 전사한다. 화자 분리는 하지 않는다 — 조각마다 화자 번호가 따로 매겨져 이어
+    붙일 수 없고, 종료 뒤 합친 녹음으로 화자 분리를 포함해 다시 전사하기 때문이다(meetalign.live).
+
+    CLOVA는 쓰지 않는다 — 무료 사용량이 월 20분이라, 실시간 조각에 쓰면 종료 뒤 통합 전사 몫이 남지 않는다.
+    Groq → 로컬 Whisper 순서이고, 둘 다 없으면 None(가짜 동작). 조용한 조각에서 Whisper가 지어낸 말은 버린다.
+    """
+    local = _local_stt_engine()
+    text = None
+    if _groq_enabled():
+        try:
+            text = _transcribe_groq(path)
+        except RuntimeError as error:
+            if local is None:
+                raise
+            logger.warning("%s — %s로 전환합니다", error, LOCAL_STT_LABELS[local])
+    if text is None and local is not None:
+        text = _transcribe_local(path, local)
+    if text is None:
+        return None
+    text = _strip_foreign(text)
+    return "" if _looks_hallucinated(text) else text
+
+
+def merge_audio_to_wav(paths, out_path):
+    """여러 녹음 조각을 순서대로 이어 16kHz 모노 WAV 하나로 만든다(실시간 세션 종료 뒤 통합 전사용).
+
+    PyAV로 어떤 형식이든 읽는다. 읽지 못하는 조각은 건너뛰고 기록만 남긴다 — 조각 하나가 깨졌다고 회의 전체
+    녹음을 잃지 않게. 합친 길이(초)를 돌려준다. PyAV가 없거나 하나도 읽지 못하면 RuntimeError.
+    """
+    try:
+        import av
+    except ImportError as error:
+        raise RuntimeError("녹음 조각을 합치려면 PyAV가 필요합니다(pip install av)") from error
+    written = 0
+    with wave.open(out_path, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(CHUNK_SAMPLE_RATE)
+        for path in paths:
+            try:
+                with av.open(path) as container:
+                    if not container.streams.audio:
+                        continue
+                    resampler = av.AudioResampler(format="s16", layout="mono", rate=CHUNK_SAMPLE_RATE)
+                    frames = list(container.decode(container.streams.audio[0]))
+                    for frame in frames + [None]:
+                        for converted in resampler.resample(frame):
+                            pcm = bytes(converted.planes[0])[:converted.samples * 2]
+                            out.writeframes(pcm)
+                            written += len(pcm)
+            except Exception as error:  # 깨진 조각 하나 때문에 전체를 잃지 않는다
+                logger.warning("녹음 조각을 읽지 못해 건너뜁니다(%s): %s", os.path.basename(path), error)
+    if not written:
+        raise RuntimeError("합칠 수 있는 녹음 조각이 없습니다")
+    return written / CHUNK_BYTES_PER_SECOND
+
+
 def _format_minutes(seconds):
     return ("%.1f" % (seconds / 60)).rstrip("0").rstrip(".")
 
@@ -636,6 +723,12 @@ def _generate(prompt, temperature=None):
             logger.info("LLM 응답: Groq(%s) %.1f초", os.environ["GROQ_LLM_MODEL"], time.monotonic() - started)
             return text
     started = time.monotonic()
+    text = _generate_ollama(prompt, temperature=temperature)
+    logger.info("LLM 응답: 로컬 Ollama(%s) %.1f초", ollama, time.monotonic() - started)
+    return text
+
+
+def _generate_ollama(prompt, temperature=None, timeout=None):
     num_ctx = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
     options = {"num_ctx": num_ctx}
     if temperature is not None:
@@ -647,10 +740,111 @@ def _generate(prompt, temperature=None):
         "options": options,
     }).encode("utf-8")
     request = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=int(os.environ.get("OLLAMA_TIMEOUT", TIMEOUT_SECONDS))) as response:
-        text = json.loads(response.read().decode("utf-8"))["response"].strip()
-    logger.info("LLM 응답: 로컬 Ollama(%s) %.1f초", ollama, time.monotonic() - started)
-    return text
+    timeout = timeout or int(os.environ.get("OLLAMA_TIMEOUT", TIMEOUT_SECONDS))
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))["response"].strip()
+
+
+# 실시간 애매함 분석(meetalign.live)용 호출. 실시간 분석은 회의 중에 빠르게 하는 일차 판단이고, 놓친 것은 회의 뒤 결정
+# 확인(decision_compiler)이 큰 모델로 다시 본다. 그래서 실시간은 가벼운 모델을 쓴다 — 빠르고, 무료 한도도 결정 추출이 쓰는
+# 큰 모델과 따로라서 회의 중에 30초마다 불러도 결정 추출의 한도를 깎지 않는다. 회의 중에 짚어야 쓸모가 있어서, 결정
+# 추출처럼 한 모델을 60초씩 기다리고 다시 보내지 않는다. 짧게 기다리고(LIVE_LLM_TIMEOUT) 재시도 없이 다음 모델로 넘어가며, 그래도 안 되면 이번 분석을 건너뛴다
+# (다음 조각 때 같은 구간을 다시 본다). 실패한 모델은 LIVE_LLM_COOLDOWN초 동안 실시간 분석에서만 건너뛴다 — 짧은 대기로
+# 실패한 것이라 결정 추출(긴 대기)에서까지 빼지는 않는다.
+LIVE_LLM_DEFAULT_TIMEOUT_SECONDS = 25
+LIVE_LLM_DEFAULT_COOLDOWN_SECONDS = 300
+# 클라우드가 모두 실패했을 때 마지막으로 쓰는 로컬 Ollama의 응답 대기(초). 내 컴퓨터 모델은 느려서 클라우드보다 길게 둔다.
+LIVE_OLLAMA_DEFAULT_TIMEOUT_SECONDS = 120
+_live_skip_until = {}
+
+
+# 가벼운 모델을 알아보는 이름 조각(gemini-3.5-flash-lite 등). 하이픈 등으로 나뉜 한 마디로만 본다 — 그냥 글자로 찾으면
+# "ge-mini"처럼 'gemini' 안의 mini에 걸려 모든 Gemini 모델이 가벼운 모델이 된다.
+LIGHT_MODEL = re.compile(r"(?:^|[-_./])(?:lite|nano|mini)(?=$|[-_./\d])", re.IGNORECASE)
+
+
+def _is_light(model):
+    return bool(LIGHT_MODEL.search(model))
+
+
+def _live_gemini_models():
+    """실시간 분석에 쓸 Gemini 모델. LIVE_GEMINI_MODEL(쉼표로 구분)이 있으면 그것을 쓴다. 없으면 GEMINI_MODEL 가운데
+    가벼운 모델(이름에 lite 등)만 쓰고 큰 모델로는 넘어가지 않는다 — 큰 모델의 한도는 결정 추출 몫이다. 가벼운 모델이
+    하나도 없을 때만 GEMINI_MODEL을 그대로 쓴다."""
+    models = [model.strip() for model in os.environ.get("LIVE_GEMINI_MODEL", "").split(",") if model.strip()]
+    if models:
+        return models
+    configured = _gemini_models()
+    return [model for model in configured if _is_light(model)] or configured
+
+
+def _live_groq_model():
+    return os.environ.get("LIVE_GROQ_LLM_MODEL") or os.environ.get("GROQ_LLM_MODEL", "")
+
+
+def _live_groq_enabled():
+    return bool(os.environ.get("GROQ_API_KEY") and _live_groq_model())
+
+
+def live_enabled():
+    """실시간 분석에 쓸 LLM이 하나라도 있는가 — LIVE_GROQ_LLM_MODEL만 둔 경우도 친다."""
+    return _enabled() or _live_groq_enabled()
+
+
+def generate_live(prompt, on_try=None):
+    """실시간 애매함 분석 한 번. (응답 글, 답한 모델 이름)을 돌려주고, 모두 실패하면 OSError를 올린다.
+
+    순서는 가벼운 Gemini(_live_gemini_models) → Groq(LIVE_GROQ_LLM_MODEL 또는 GROQ_LLM_MODEL) → 로컬 Ollama(OLLAMA_MODEL)다.
+    클라우드가 모두 막혀도(무료 한도 소진 등) 회의 중 알림이 끊기지 않게 마지막에 내 컴퓨터의 모델로 본다. 로컬 모델은
+    응답이 느려(수십 초) 알림이 늦게 뜰 수 있고, 그동안 쌓인 말은 다음 분석이 한꺼번에 본다. 기다리는 시간은
+    LIVE_OLLAMA_TIMEOUT으로 따로 둔다. 다 실패하면 이번 분석을 건너뛰고, 놓친 것은 회의 뒤 결정 확인이 본다.
+
+    on_try(이름)는 모델을 하나 부르기 직전마다 불린다 — 화면이 "판단 중" 시간을 모델마다 새로 세고 어느 모델인지 보이게.
+    """
+    on_try = on_try or (lambda name: None)
+    timeout = int(os.environ.get("LIVE_LLM_TIMEOUT", LIVE_LLM_DEFAULT_TIMEOUT_SECONDS))
+    cooldown = int(os.environ.get("LIVE_LLM_COOLDOWN", LIVE_LLM_DEFAULT_COOLDOWN_SECONDS))
+    error = None
+    models = _live_gemini_models() if os.environ.get("GEMINI_API_KEY") else []
+    now = time.monotonic()
+    ready = [model for model in models if _live_skip_until.get(model, 0) <= now]
+    if models and not ready and not _live_groq_enabled() and not os.environ.get("OLLAMA_MODEL"):
+        ready = models  # 모두 쉬는 중인데 넘어갈 곳이 없으면 쉬는 것을 무시하고 다시 본다
+    for model in ready:
+        started = time.monotonic()
+        on_try("Gemini(%s)" % model)
+        try:
+            text = _generate_gemini(prompt, model=model, timeout=timeout, retries=0)
+        except OSError as failure:
+            error = failure
+            if cooldown:
+                _live_skip_until[model] = time.monotonic() + cooldown
+            logger.warning("실시간 분석: Gemini(%s) 실패(%s, %.1f초) — %d초 동안 실시간 분석에서 건너뜁니다",
+                           model, failure, time.monotonic() - started, cooldown)
+            continue
+        name = "Gemini(%s)" % model
+        logger.info("실시간 분석 응답: %s %.1f초", name, time.monotonic() - started)
+        return text, name
+    stages = []
+    if _live_groq_enabled():
+        stages.append(("Groq(%s)" % _live_groq_model(),
+                       lambda: _generate_groq_llm(prompt, timeout=timeout, model=_live_groq_model())))
+    if os.environ.get("OLLAMA_MODEL"):
+        ollama_timeout = int(os.environ.get("LIVE_OLLAMA_TIMEOUT", LIVE_OLLAMA_DEFAULT_TIMEOUT_SECONDS))
+        stages.append(("로컬 Ollama(%s)" % os.environ["OLLAMA_MODEL"],
+                       lambda: _generate_ollama(prompt, timeout=ollama_timeout)))
+    for name, call in stages:
+        started = time.monotonic()
+        on_try(name)
+        try:
+            text = call()
+        except OSError as failure:
+            error = failure
+            logger.warning("실시간 분석: %s 실패(%s, %.1f초)", name, failure, time.monotonic() - started)
+            continue
+        logger.info("실시간 분석 응답: %s %.1f초", name, time.monotonic() - started)
+        return text, name
+    raise error or OSError("실시간 분석에 쓸 LLM이 설정되지 않았습니다")
 
 
 def _daily_quota_exhausted(error):
@@ -676,13 +870,14 @@ def gemini_timeout(prompt):
     return min(ceiling, base + (len(prompt or "") // 10000) * per_10k)
 
 
-def _generate_gemini(prompt, temperature=None, model=None, retry_timeout=True):
+def _generate_gemini(prompt, temperature=None, model=None, retry_timeout=True, timeout=None, retries=GEMINI_RETRIES):
     """Gemini generateContent API 호출. HTTP/네트워크 오류(401 잘못된 키, 429 무료 한도 초과 등)는
     urllib이 OSError 하위 예외로 올리므로 호출자의 기존 대체 처리가 그대로 동작한다. 안전 필터 차단 등으로
     응답에 텍스트가 없을 때도 같은 경로로 처리되도록 OSError로 바꿔서 올린다.
     429/500/503과 타임아웃은 GEMINI_RETRIES번 잠깐 쉬었다가 다시 보낸다(총 두 번 시도). 키 오류 같은 다른 HTTP
     오류와 하루 한도 초과는 다시 보내도 소용없으므로 바로 올린다. retry_timeout=False면 시간 초과는 다시 보내지
-    않는다(다음 Gemini 모델이 남아 있을 때). model을 주지 않으면 GEMINI_MODEL의 첫 모델을 쓴다."""
+    않는다(다음 Gemini 모델이 남아 있을 때). model을 주지 않으면 GEMINI_MODEL의 첫 모델을 쓴다. timeout·retries를 주면
+    프롬프트 길이에 맞춘 대기와 기본 재시도 횟수 대신 그 값을 쓴다(실시간 분석 — generate_live)."""
     model = model or _gemini_models()[0]
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     if temperature is not None:
@@ -692,23 +887,23 @@ def _generate_gemini(prompt, temperature=None, model=None, retry_timeout=True):
         GEMINI_URL % model, data=body,
         headers={"Content-Type": "application/json", "x-goog-api-key": os.environ["GEMINI_API_KEY"]},
     )
-    timeout = gemini_timeout(prompt)
-    for attempt in range(GEMINI_RETRIES + 1):
+    timeout = timeout or gemini_timeout(prompt)
+    for attempt in range(retries + 1):
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as error:
-            if error.code not in GEMINI_RETRY_STATUS or attempt == GEMINI_RETRIES or _daily_quota_exhausted(error):
+            if error.code not in GEMINI_RETRY_STATUS or attempt == retries or _daily_quota_exhausted(error):
                 raise
-            logger.warning("Gemini(%s) 호출 실패 (%d/%d): HTTP %d — 다시 시도합니다", model, attempt + 1, GEMINI_RETRIES + 1, error.code)
+            logger.warning("Gemini(%s) 호출 실패 (%d/%d): HTTP %d — 다시 시도합니다", model, attempt + 1, retries + 1, error.code)
             time.sleep(GEMINI_RETRY_DELAY_SECONDS)
         except (TimeoutError, urllib.error.URLError) as error:
             # 응답을 읽다가 시간이 다 되면 TimeoutError, 연결하다가 시간이 다 되면 URLError(reason=TimeoutError)로 온다.
             timed_out = isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError)
-            if not timed_out or not retry_timeout or attempt == GEMINI_RETRIES:
+            if not timed_out or not retry_timeout or attempt == retries:
                 raise
-            logger.warning("Gemini(%s) 호출 실패 (%d/%d): %d초 안에 응답 없음 — 다시 시도합니다", model, attempt + 1, GEMINI_RETRIES + 1, timeout)
+            logger.warning("Gemini(%s) 호출 실패 (%d/%d): %d초 안에 응답 없음 — 다시 시도합니다", model, attempt + 1, retries + 1, timeout)
             time.sleep(GEMINI_RETRY_DELAY_SECONDS)
     try:
         parts = data["candidates"][0]["content"]["parts"]
@@ -720,10 +915,10 @@ def _generate_gemini(prompt, temperature=None, model=None, retry_timeout=True):
     return text.strip()
 
 
-def _generate_groq_llm(prompt, temperature=None):
+def _generate_groq_llm(prompt, temperature=None, timeout=TIMEOUT_SECONDS, model=None):
     """Groq의 OpenAI 호환 채팅 API 호출. HTTPError/URLError는 모두 OSError의 하위 클래스라 별도
     처리 없이도 그대로 올라가 호출자의 기존 대체 처리(다음 단계로 넘어가기)가 동작한다."""
-    payload = {"model": os.environ["GROQ_LLM_MODEL"], "messages": [{"role": "user", "content": prompt}]}
+    payload = {"model": model or os.environ["GROQ_LLM_MODEL"], "messages": [{"role": "user", "content": prompt}]}
     if temperature is not None:
         payload["temperature"] = temperature
     body = json.dumps(payload).encode("utf-8")
@@ -735,7 +930,7 @@ def _generate_groq_llm(prompt, temperature=None):
             "User-Agent": GROQ_USER_AGENT,
         },
     )
-    with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         data = json.loads(response.read().decode("utf-8"))
     try:
         text = data["choices"][0]["message"]["content"]
