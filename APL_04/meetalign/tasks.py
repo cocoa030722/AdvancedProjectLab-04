@@ -44,6 +44,8 @@ def refresh_meeting(meeting):
     full_transcript = "\n\n".join(_transcript_sections(recordings))
     meeting.transcript = full_transcript
     meeting.record = services.summarize(full_transcript) if full_transcript else ""
+    # 등록만 되고 아직 제출하지 않은 녹음(실시간 세션 종료)은 처리 상태를 정할 때 세지 않는다.
+    recordings = [r for r in recordings if r.status != Recording.STATUS_READY]
     if any(r.status == Recording.STATUS_PROCESSING for r in recordings):
         status = Meeting.STATUS_PROCESSING
     elif any(r.status == Recording.STATUS_DONE for r in recordings):

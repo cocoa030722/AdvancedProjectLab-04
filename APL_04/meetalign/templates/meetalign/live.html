@@ -1,0 +1,689 @@
+{% extends "meetalign/base.html" %}
+{% block content %}
+{% comment %}
+  실시간 회의 세션(meetalign.live). 회의를 멈추지 않고 애매한 점만 빠르게 짚는 화면이라, AI가 올린 애매한 점을 대화창처럼
+  가운데 크게 보여 주고 녹취는 아래에 접어 둔다. 세세한 애매함은 회의가 끝난 뒤 결정 확인이 다시 본다.
+  진행자 화면은 녹음을 짧은 조각으로 잘라 올리고, 모두의 화면은 몇 초마다 상태를 물어 새로 그린다. 진행자만 녹음·일시정지·
+  종료하고 애매한 점을 '확인함'으로 체크한다.
+{% endcomment %}
+<div class="page-head">
+  <div>
+    <h1><a href="{% url 'meeting_detail' meeting.id %}" class="crumb-link">뒤로 가기</a> <span class="crumb-sep">/</span> 실시간 회의</h1>
+    <div class="sub">{{ meeting.title }} · <span id="live-status-label">{% if session.is_active %}{% if is_host %}대기 중{% elif not started %}녹음 시작 전{% else %}{{ session.get_status_display }}{% endif %}{% else %}종료{% endif %}</span></div>
+  </div>
+</div>
+
+<div id="live-root" data-status="{{ session.status }}" data-host="{% if is_host %}1{% endif %}"
+  data-state-url="{% url 'live_state' meeting.id session.id %}"
+  data-chunk-url="{% url 'live_chunk' meeting.id session.id %}"
+  data-control-url="{% url 'live_control' meeting.id session.id %}"
+  data-flag-url="{% url 'live_flag' meeting.id session.id 0 %}"
+  data-chunk-seconds="{{ chunk_seconds }}" data-next-seq="{{ next_seq }}" data-recorded-ms="{{ recorded_ms }}" data-recording-elsewhere="{% if recording_elsewhere %}1{% endif %}">
+
+  {% if is_host %}
+  <div class="live-bar card elevated" id="live-controls"{% if not session.is_active %} hidden{% endif %}>
+    <button type="button" id="live-toggle" class="btn lg">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v4M9 21h6"/></svg>
+      <span id="live-toggle-label">{% if session.chunks.exists %}▶ 이어서 녹음{% else %}녹음 시작{% endif %}</span>
+    </button>
+    <span id="live-timer" class="record-state" aria-live="polite">
+      <span id="live-dot" class="record-dot paused"></span>
+      <span id="live-time">00:00</span>
+    </span>
+    {# 마이크에 소리가 들어오는지 한눈에 — 막대가 움직이지 않으면 마이크 선택이나 음량을 확인한다. #}
+    <span class="live-meter" title="마이크 입력 크기"><span id="live-level"></span></span>
+    <span class="live-bar-spacer"></span>
+    <input id="live-speakers" type="number" min="1" max="{{ max_speakers }}" step="1" inputmode="numeric" placeholder="인원"
+      aria-label="말한 사람 수(선택)" title="말한 사람 수(선택) — 등록된 녹음을 제출할 때 화자 분리에 씁니다">
+    <button type="button" id="live-end" class="btn secondary">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+      녹음 종료
+    </button>
+  </div>
+  <div id="live-host-info" class="notice" hidden></div>
+  <div id="live-host-error" class="error" hidden></div>
+  {% endif %}
+
+  <div id="live-ended" class="notice"{% if session.is_active %} hidden{% endif %}>
+    <span><b>실시간 녹음이 끝났습니다.</b> <span id="live-ended-detail">녹음을 하나로 합치는 중입니다.</span>
+      <a href="{% url 'meeting_detail' meeting.id %}">회의 화면으로 가기</a></span>
+  </div>
+
+  {% comment %}
+    회의 기록 — 녹음 조각을 Whisper로 옮긴 녹취가 회의록처럼 쌓인다(애매함 분석에 쓰는 바로 그 녹취). 왼쪽에 시각을 달고
+    같은 분에 나온 말을 한 칸에 모으되, 말이 끊긴 조각(과 그 안의 문장)마다 줄을 바꾼다.
+    DB에 남아 있어 화면을 떠났다 돌아와도 처음부터 다시 보인다. 높이는 화면의 3분의 1쯤에서 멈추고 안에서 스크롤한다.
+    (예전에는 맨 아래에 브라우저 음성 인식의 '말하는 중' 임시 자막을 띄웠는데, 문장이 계속 붙어 커지는 칸이 되어 뺐다.)
+  {% endcomment %}
+  <section class="live-caption-wrap" id="live-caption-wrap">
+    <div class="live-caption-head">
+      <b>회의 기록</b>
+      <span class="muted" id="live-pending"></span>
+    </div>
+    <div class="live-log-box">
+      <div id="live-log-scroll" class="live-log-scroll">
+        <ol id="live-log" class="plain live-log"></ol>
+        <div id="live-log-empty" class="live-log-empty">말하면 여기에 한 줄씩 쌓여요.</div>
+      </div>
+      <button type="button" id="live-log-jump" class="live-log-jump" hidden>최신 말 보기 ↓</button>
+    </div>
+  </section>
+
+  <section class="live-feed-wrap">
+    <div class="live-feed-head">
+      <h2 class="section-title" style="margin:0">애매한 점</h2>
+      <span id="live-progress" class="live-progress" aria-live="polite"></span>
+    </div>
+    {# 판단 딜레이 시간 — 마지막 분석을 시작하고 이만큼 지나야 다음 분석을 한다. 진행자만 바꾸고, 팀원 화면은 따라 움직인다. #}
+    <div class="live-delay" id="live-delay-row"{% if not session.is_active %} hidden{% endif %}>
+      <label for="live-delay">판단 딜레이 시간</label>
+      <input type="range" id="live-delay" min="{{ interval_min }}" max="{{ interval_max }}" step="{{ interval_step }}"
+        value="{{ interval }}"{% if not is_host %} disabled title="진행자가 정해요"{% endif %}>
+      <output id="live-delay-value" for="live-delay">{{ interval }}초</output>
+      <small class="live-delay-note">(딜레이 시간이 너무 짧으면 LLM 한도가 빨리 소모될 수 있습니다)</small>
+    </div>
+    <ul id="live-flags" class="plain live-feed" aria-live="polite"></ul>
+    <div id="live-flags-empty" class="live-empty">
+      <b>회의를 진행하세요.</b><br>
+      애매한 부분이 나오면 여기에 바로 알려 드릴게요.{% if is_host %} 정리했으면 '확인함'을 눌러 주세요.{% endif %}
+    </div>
+  </section>
+
+</div>
+
+<style>
+  /* .notice·.card가 display를 정해 두어서 hidden 속성이 먹지 않았다 — 이 화면에서는 hidden이 항상 이긴다. */
+  #live-root [hidden] { display:none !important; }
+  .live-bar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:14px 16px; position:sticky; top:8px; z-index:5; }
+  .live-bar-spacer { flex:1 1 auto; }
+  .live-bar #live-speakers { width:72px; margin:0; }
+  .live-meter { width:90px; height:8px; border-radius:999px; background:var(--surface-sunken); overflow:hidden; }
+  .live-meter span { display:block; height:100%; width:0; background:var(--success, #2f9e44); transition:width .1s linear; }
+  .live-caption-wrap { max-width:760px; margin:18px auto 0; }
+  .live-caption-head { display:flex; flex-wrap:wrap; gap:6px 12px; align-items:baseline; margin-bottom:6px; font-size:.88rem; }
+  .live-log-box { position:relative; }
+  .live-log-scroll { max-height:min(34vh, 300px); min-height:96px; overflow-y:auto; padding:6px 14px; border:1px solid var(--line);
+    border-radius:10px; background:var(--surface); overscroll-behavior:contain; }
+  /* 회의록처럼 — 말풍선 없이 왼쪽에 시각, 오른쪽에 그 분에 나온 말을 한 문단으로. */
+  .live-log { margin:0; }
+  .live-log-block { display:grid; grid-template-columns:3.4em 1fr; gap:0 12px; padding:7px 2px; border-bottom:1px solid var(--line); }
+  .live-log-block:last-child { border-bottom:0; }
+  .live-log-block .at { font-size:.78rem; color:var(--ink-soft); font-variant-numeric:tabular-nums; padding-top:.2em; }
+  .live-log-block .text { min-width:0; color:var(--ink); }
+  .live-log-block .line { margin:0; padding:1px 0; line-height:1.65; word-break:keep-all; overflow-wrap:anywhere; }
+  .live-delay { display:flex; flex-wrap:wrap; align-items:center; gap:4px 10px; margin:-2px 0 12px; font-size:.86rem; color:var(--ink-soft); }
+  .live-delay-note { flex:1 0 100%; font-size:.76rem; color:var(--ink-soft); }
+  .live-delay label { font-weight:700; white-space:nowrap; }
+  .live-delay input[type=range] { flex:1 1 auto; max-width:260px; margin:0; padding:0; accent-color:var(--accent); }
+  .live-delay output { min-width:3em; font-variant-numeric:tabular-nums; color:var(--ink); font-weight:700; }
+  /* 애매함 분석 상태 — 판단 중인지, 기다리는 중이면 몇 초 남았는지. */
+  .live-progress { display:inline-flex; align-items:center; gap:6px; font-size:.84rem; color:var(--ink-soft); }
+  .live-progress::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--line); flex:0 0 auto; }
+  .live-progress.busy { color:var(--accent); font-weight:700; }
+  .live-progress.busy::before { background:var(--accent); animation:live-pulse 1s ease-in-out infinite; }
+  .live-progress.waiting::before { background:var(--ink-soft); }
+  @keyframes live-pulse { 0%, 100% { opacity:1; } 50% { opacity:.25; } }
+  .live-log-empty { text-align:center; padding:22px 8px; color:var(--ink-soft); font-size:.92rem; }
+  .live-log-jump { position:absolute; right:12px; bottom:10px; width:auto; padding:5px 12px; border-radius:999px;
+    font-size:.82rem; box-shadow:0 2px 6px rgba(0,0,0,.15); }
+  .live-feed-wrap { max-width:760px; margin:22px auto 0; }
+  .live-feed-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; margin-bottom:10px; }
+  .live-feed { display:flex; flex-direction:column; gap:12px; }
+  .live-msg { display:flex; gap:12px; align-items:flex-start; }
+  .live-avatar { flex:0 0 36px; height:36px; border-radius:50%; background:var(--accent-soft); color:var(--accent);
+    display:flex; align-items:center; justify-content:center; font-weight:800; font-size:.8rem; }
+  .live-bubble { position:relative; flex:1 1 auto; min-width:0; background:var(--surface); border:1px solid var(--line); border-radius:4px 16px 16px 16px;
+    padding:14px 16px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+  /* 진행자만 보이는 지우기(×) — 잘못 짚은 애매한 점을 없앤다. 글자가 버튼 밑으로 들어가지 않게 오른쪽을 비워 둔다. */
+  .live-bubble.has-dismiss { padding-right:44px; }
+  .live-dismiss { position:absolute; top:8px; right:8px; width:28px; height:28px; padding:0; border:0; border-radius:50%;
+    background:transparent; color:var(--ink-soft); font-size:1.15rem; line-height:28px; text-align:center; cursor:pointer; }
+  .live-dismiss:hover, .live-dismiss:focus-visible { background:var(--surface-sunken); color:var(--ink); }
+  .live-bubble .topic { font-size:.8rem; font-weight:700; color:var(--accent); margin-bottom:2px; }
+  .live-bubble .phrase { font-size:1.15rem; font-weight:800; color:var(--ink); }
+  .live-bubble .reason { font-size:1.02rem; margin-top:4px; color:var(--ink); }
+  .live-bubble .meta-row { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:10px; font-size:.84rem; color:var(--ink-soft); }
+  .live-bubble label { display:inline-flex; align-items:center; gap:6px; font-weight:700; cursor:pointer; color:var(--ink); }
+  .live-bubble input { width:18px; height:18px; margin:0; }
+  .live-msg.resolved .live-bubble { opacity:.55; }
+  .live-msg.resolved .phrase, .live-msg.resolved .reason { text-decoration:line-through; }
+  .live-msg.fresh .live-bubble { border-color:var(--accent); }
+  .live-empty { text-align:center; padding:48px 16px; border:1px dashed var(--line); border-radius:16px; color:var(--ink-soft); font-size:1.02rem; line-height:1.7; }
+  @media (max-width: 600px) { .live-meter { display:none; } .live-bubble .phrase { font-size:1.05rem; } }
+</style>
+
+<script>
+(function () {
+  var root = document.getElementById("live-root");
+  var isHost = root.dataset.host === "1";
+  var status = root.dataset.status;
+  var csrf = "{{ csrf_token }}";
+  var logScroll = document.getElementById("live-log-scroll");
+  var logEl = document.getElementById("live-log");
+  var logEmpty = document.getElementById("live-log-empty");
+  var logJump = document.getElementById("live-log-jump");
+  var flagsEl = document.getElementById("live-flags");
+  var flagsEmpty = document.getElementById("live-flags-empty");
+  var pendingEl = document.getElementById("live-pending");
+  var progressEl = document.getElementById("live-progress");
+  var statusLabel = document.getElementById("live-status-label");
+  var endedBox = document.getElementById("live-ended");
+  var endedDetail = document.getElementById("live-ended-detail");
+  var STATUS_LABELS = { recording: "녹음 중", paused: "일시정지", ended: "종료" };
+  var nextSeq = parseInt(root.dataset.nextSeq, 10) || 0;
+  // 회의 기록 칸에 쌓은 마지막 조각 순번. 상태를 물을 때 보내서 그 뒤 줄만 받는다.
+  var linesUntil = -1;
+  var seenFlags = null;  // 처음 그릴 때 이미 있던 것은 '새 알림'으로 표시하지 않는다
+  var mode = "idle";  // 진행자 녹음 상태: idle | recording | paused | ending | ended
+  // 세션이 끝난 것을 알았을 때 진행자 화면이 녹음을 정리하는 함수(아래 진행자 부분에서 채운다).
+  var onEnded = function () {};
+
+  // keepalive면 화면이 닫히는 중에도 요청을 끝까지 보낸다(브라우저 제한상 본문이 약 64KB 이하일 때만).
+  function post(url, data, keepalive) {
+    var body = data instanceof FormData ? data : new FormData();
+    if (!(data instanceof FormData)) Object.keys(data || {}).forEach(function (k) { body.append(k, data[k]); });
+    return fetch(url, { method: "POST", body: body, headers: { "X-CSRFToken": csrf }, credentials: "same-origin",
+                        keepalive: !!keepalive });
+  }
+
+  // 애매함 분석 상태 표시(views._live_state의 analysis — live.analysis_status).
+  var PROGRESS = { busy: "판단 중", waiting: "다음 판단까지 대기 중", idle: "입력이 없음" };
+  function paintProgress(a, sessionStatus) {
+    var state = a.state || "idle";
+    progressEl.className = "live-progress " + state;
+    var label = PROGRESS[state] || "";
+    if (state === "waiting" && a.seconds) label += " · " + a.seconds + "초 남음";
+    progressEl.textContent = sessionStatus === "ended" ? "" : label;
+    progressEl.hidden = !progressEl.textContent;
+    progressEl.title = state === "busy" && a.model ? a.model + "이(가) 판단하고 있어요."
+      : a.interval ? "약 " + a.interval + "초마다 지금까지의 회의 기록을 보고 애매한 점을 살펴봐요." : "";
+  }
+
+  // 판단 딜레이 시간 슬라이더. 끄는 중에는 서버 값으로 덮지 않는다.
+  var delayInput = document.getElementById("live-delay");
+  var delayValue = document.getElementById("live-delay-value");
+  var delayDragging = false;
+  function paintDelay(seconds) {
+    if (typeof seconds !== "number" || delayDragging || document.activeElement === delayInput) return;
+    delayInput.value = seconds;
+    delayValue.textContent = seconds + "초";
+  }
+  if (isHost) {
+    delayInput.addEventListener("input", function () {
+      delayDragging = true;
+      delayValue.textContent = delayInput.value + "초";
+    });
+    delayInput.addEventListener("change", function () {
+      post(root.dataset.controlUrl, { action: "interval", seconds: delayInput.value }).then(function (r) {
+        return r.ok ? r.json() : null;
+      }).then(function (data) {
+        delayDragging = false;
+        if (data && typeof data.interval === "number") {
+          delayInput.value = data.interval;
+          delayValue.textContent = data.interval + "초";
+        }
+      }).catch(function () { delayDragging = false; });
+    });
+  }
+
+  function stateUrl() {
+    return root.dataset.stateUrl + "?after=" + linesUntil;
+  }
+
+  // ---- 회의 기록 (녹취가 대화창처럼 쌓인다) ----
+  function nearLogBottom() {
+    return logScroll.scrollHeight - logScroll.scrollTop - logScroll.clientHeight < 40;
+  }
+  function scrollLogToBottom() {
+    logScroll.scrollTop = logScroll.scrollHeight;
+    logJump.hidden = true;
+  }
+  // 말이 끊긴 조각마다 줄을 바꾸고, 한 조각에 문장이 여럿이면 문장부호(. ? ! …) 뒤에서 다시 나눈다.
+  function sentences(text) {
+    return text.replace(/([.?!…])\s+/g, "$1\n").split("\n").map(function (part) { return part.trim(); }).filter(Boolean);
+  }
+  // 같은 분에 나온 말은 그 분의 칸에 줄로 쌓고, 분이 바뀌면 시각을 단 새 칸을 연다.
+  function addToLog(text, at) {
+    var last = logEl.lastElementChild;
+    var body;
+    if (last && last.dataset.at === (at || "")) {
+      body = last.querySelector(".text");
+    } else {
+      var block = document.createElement("li");
+      block.className = "live-log-block";
+      block.dataset.at = at || "";
+      var time = document.createElement("span");
+      time.className = "at";
+      time.textContent = at || "";
+      body = document.createElement("div");
+      body.className = "text";
+      block.append(time, body);
+      logEl.appendChild(block);
+    }
+    sentences(text).forEach(function (sentence) {
+      var line = document.createElement("p");
+      line.className = "line";
+      line.textContent = sentence;
+      body.appendChild(line);
+    });
+  }
+  // 새 말은 맨 아래에 붙인다. 읽으려고 위로 올려 둔 사람은 그 자리에 두고 '최신 말 보기'만 띄운다.
+  function appendLines(lines, until) {
+    var follow = nearLogBottom();
+    lines.forEach(function (line) {
+      if (line.seq > linesUntil) addToLog(line.text, line.at);
+    });
+    linesUntil = Math.max(linesUntil, until);
+    logEmpty.hidden = logEl.children.length > 0;
+    if (!lines.length) return;
+    if (follow) scrollLogToBottom(); else logJump.hidden = false;
+  }
+  logScroll.addEventListener("scroll", function () { if (nearLogBottom()) logJump.hidden = true; });
+  logJump.addEventListener("click", scrollLogToBottom);
+
+  // ---- 애매한 점 (대화창) ----
+  function renderFlags(flags) {
+    var nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 120;
+    var fresh = [];
+    if (seenFlags) flags.forEach(function (f) { if (!seenFlags[f.id]) fresh.push(f.id); });
+    seenFlags = {};
+    flags.forEach(function (f) { seenFlags[f.id] = true; });
+    flagsEl.innerHTML = "";
+    flagsEmpty.hidden = flags.length > 0;
+    flags.forEach(function (flag) {
+      var item = document.createElement("li");
+      item.className = "live-msg" + (flag.resolved ? " resolved" : "") + (fresh.indexOf(flag.id) >= 0 ? " fresh" : "");
+      var avatar = document.createElement("span");
+      avatar.className = "live-avatar";
+      avatar.textContent = "AI";
+      var bubble = document.createElement("div");
+      bubble.className = "live-bubble";
+      if (flag.topic) {
+        var topic = document.createElement("div");
+        topic.className = "topic";
+        topic.textContent = flag.topic;
+        bubble.appendChild(topic);
+      }
+      var phrase = document.createElement("div");
+      phrase.className = "phrase";
+      phrase.textContent = "“" + flag.phrase + "”";
+      var reason = document.createElement("div");
+      reason.className = "reason";
+      reason.textContent = flag.reason;
+      var meta = document.createElement("div");
+      meta.className = "meta-row";
+      var time = document.createElement("span");
+      time.textContent = flag.at + resolvedLabel(flag.resolved, flag.auto, flag.settled_quote);
+      meta.appendChild(time);
+      if (isHost) {
+        var label = document.createElement("label");
+        var box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = flag.resolved;
+        box.addEventListener("change", function () { toggleFlag(flag.id, box, item, time, flag.at); });
+        label.append(box, "확인함");
+        meta.appendChild(label);
+      }
+      bubble.append(phrase, reason, meta);
+      if (isHost) {
+        var dismiss = document.createElement("button");
+        dismiss.type = "button";
+        dismiss.className = "live-dismiss";
+        dismiss.textContent = "×";
+        dismiss.title = "잘못 짚은 것이면 지우기";
+        dismiss.setAttribute("aria-label", "이 애매한 점 지우기: " + flag.phrase);
+        dismiss.addEventListener("click", function () { dismissFlag(flag.id, item); });
+        bubble.classList.add("has-dismiss");
+        bubble.appendChild(dismiss);
+      }
+      item.append(avatar, bubble);
+      flagsEl.appendChild(item);
+    });
+    if (fresh.length && nearBottom) window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+  }
+
+  function render(state) {
+    nextSeq = Math.max(nextSeq, state.next_seq);
+    appendLines(state.lines || [], typeof state.lines_until === "number" ? state.lines_until : linesUntil);
+    var notes = [];
+    if (state.pending) notes.push("글로 옮기는 중 " + state.pending + "조각");
+    if (state.failed) notes.push("옮기지 못한 조각 " + state.failed + "개(통합 전사본에는 포함돼요)");
+    pendingEl.textContent = notes.join(" · ");
+    if (!flagsEl.querySelector("input:focus")) renderFlags(state.flags);
+    if (isHost && mode !== "recording" && mode !== "ending" && typeof state.recorded_ms === "number") {
+      // 이 화면이 녹음하지 않는 동안에는 서버가 센 녹음 시간을 그대로 보인다(다른 탭에서 녹음 중이어도 맞게).
+      elapsedMs = state.recorded_ms;
+      paintTimer();
+    }
+    paintProgress(state.analysis || {}, state.status);
+    paintDelay((state.analysis || {}).interval);
+    if (!isHost || mode === "idle") {
+      status = state.status;
+      if (!isHost || status === "ended") {
+        // 녹음한 조각이 없으면 아직 시작 전이다 — '녹음 중'·'일시정지'로 보이지 않게.
+        statusLabel.textContent = status !== "ended" && state.started === false ? "녹음 시작 전" : STATUS_LABELS[status] || status;
+      }
+    }
+    if (state.status === "ended") {
+      // 진행자 화면도 끝난 것으로 그린다 — 다른 화면에서 끝냈거나 회의를 종료했으면 이 화면은 아직 일시정지로 알고 있다.
+      status = "ended";
+      statusLabel.textContent = STATUS_LABELS.ended;
+      if (isHost) onEnded();
+      endedBox.hidden = false;
+      // 쌓인 자막은 끝난 뒤에도 남겨 둔다. 판단 딜레이 시간은 끝나면 쓸 데가 없어 감춘다.
+      document.getElementById("live-delay-row").hidden = true;
+      var controls = document.getElementById("live-controls");
+      if (controls) controls.hidden = true;
+      endedDetail.textContent = state.error ? "녹음을 등록하지 못했습니다: " + state.error
+        : state.meeting_ended ? "회의가 종료되어 녹음을 회의 화면에서 통합 전사본과 회의록으로 만들고 있어요."
+        : state.recording_ready ? "녹음이 회의 화면의 '회의 파일'에 '실시간 녹음'으로 등록됐어요. 회의 화면에서 '제출하고 회의록 만들기'를 누르면 통합 전사본과 회의록을 만들고, 그 뒤 결정 확인에서 세세한 애매함을 다시 살펴봅니다."
+        : "녹음을 하나로 합치는 중입니다.";
+    }
+  }
+
+  function poll() {
+    fetch(stateUrl(), { credentials: "same-origin" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (state) { if (state) render(state); })
+      .catch(function () {})
+      .finally(function () { setTimeout(poll, status === "ended" ? 5000 : 1000); });
+  }
+
+  // 잘못 짚은 애매한 점을 지운다. 바로 화면에서 빼고, 서버가 거절하면 다시 그린다.
+  function dismissFlag(id, item) {
+    var url = root.dataset.flagUrl.replace(/\/0\/$/, "/" + id + "/");
+    item.hidden = true;
+    post(url, { dismissed: "1" }).then(function (r) {
+      if (!r.ok) throw new Error();
+      return fetch(stateUrl(), { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(render);
+    }).catch(function () { item.hidden = false; });
+  }
+
+  // 누르자마자 그 항목을 처리됨으로 그린다. 누른 체크박스에 초점이 남아 있으면 목록을 다시 그리지 않아서(누르는 중에 목록이
+  // 바뀌지 않게) 화면을 다른 곳을 누를 때까지 그대로였다. 서버가 거절하면 되돌린다.
+  // 처리됨 표시. 회의에서 뒤에 정해져 AI가 자동으로 체크한 것은 무엇으로 정해졌는지(근거가 된 말)를 함께 보인다.
+  function resolvedLabel(resolved, auto, quote) {
+    if (!resolved) return "";
+    return auto ? " · 회의에서 정해짐: “" + quote + "”" : " · (처리됨)";
+  }
+  function paintResolved(item, time, at, resolved) {
+    item.classList.toggle("resolved", resolved);
+    time.textContent = at + resolvedLabel(resolved, false, "");
+  }
+  function toggleFlag(id, box, item, time, at) {
+    var url = root.dataset.flagUrl.replace(/\/0\/$/, "/" + id + "/");
+    var resolved = box.checked;
+    paintResolved(item, time, at, resolved);
+    post(url, { resolved: resolved ? "1" : "0" }).then(function (r) {
+      if (!r.ok) throw new Error();
+      return fetch(stateUrl(), { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(render);
+    }).catch(function () {
+      box.checked = !resolved;
+      paintResolved(item, time, at, !resolved);
+    });
+  }
+
+  // ---- 녹음 (진행자) ----
+  if (isHost) {
+    var toggleBtn = document.getElementById("live-toggle");
+    var toggleLabel = document.getElementById("live-toggle-label");
+    var endBtn = document.getElementById("live-end");
+    var dot = document.getElementById("live-dot");
+    var timeEl = document.getElementById("live-time");
+    var levelEl = document.getElementById("live-level");
+    var hostError = document.getElementById("live-host-error");
+    // 조각은 말이 잠깐 끊기는 지점에서 자른다 — 소리가 PAUSE_MS 동안 작으면(한 번이라도 말한 조각이고 MIN_CHUNK_MS보다
+    // 길 때) 끊어 바로 올린다. 쉬지 않고 말해도 MAX_CHUNK_MS가 되면 끊는다. 문장 단위로 잘려 단어가 중간에 끊기지 않고
+    // 말한 뒤 몇 초면 녹취에 보인다. 소리를 못 재는 브라우저에서는 MAX_CHUNK_MS마다 자른다.
+    var MAX_CHUNK_MS = Math.max(5, parseInt(root.dataset.chunkSeconds, 10) || 15) * 1000;
+    var PAUSE_MS = 700, MIN_CHUNK_MS = 1500;
+    var chunkStartedAt = 0, lastLoudAt = 0;
+    // 조각 동안 소리 크기(RMS)가 이보다 한 번도 크지 않으면 조용한 조각으로 보고 전사하지 않는다(silent=1).
+    // Whisper는 조용한 조각에서 다른 언어나 "시청해 주셔서 감사합니다" 같은 말을 지어낸다.
+    var SILENT_RMS = 0.012;
+    var stream = null, recorder = null, chunkTimer = null, uploads = [];
+    // 지금까지 녹음된 시간은 서버가 조각 길이를 더해 알려 준다 — 화면을 떠났다 돌아와도 시간이 이어진다.
+    var elapsedMs = parseInt(root.dataset.recordedMs, 10) || 0, segmentStart = 0, tick = null;
+    var hostInfo = document.getElementById("live-host-info");
+    // 이 화면(탭)의 표시. 서버는 마지막으로 '이어서 녹음'을 누른 화면의 조각만 받는다 — 탭 두 개에서 동시에 녹음해
+    // 같은 소리가 두 번 올라가는 것을 막는다(views.live_chunk).
+    var recorderId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    function showInfo(message) { hostInfo.textContent = message; hostInfo.hidden = !message; }
+    var analyser = null, levelBuffer = null, chunkPeak = 0;
+
+    function showError(message) { hostError.textContent = message; hostError.hidden = !message; }
+    function pad(n) { return (n < 10 ? "0" : "") + n; }
+    function paintTimer() {
+      var ms = elapsedMs + (mode === "recording" ? Date.now() - segmentStart : 0);
+      var s = Math.floor(ms / 1000);
+      timeEl.textContent = (s >= 3600 ? Math.floor(s / 3600) + ":" : "") + pad(Math.floor(s / 60) % 60) + ":" + pad(s % 60);
+    }
+    function paint() {
+      var recording = mode === "recording";
+      dot.classList.toggle("paused", !recording);
+      toggleLabel.textContent = recording ? "⏸ 일시정지" : (elapsedMs || nextSeq ? "▶ 이어서 녹음" : "녹음 시작");
+      toggleBtn.classList.toggle("secondary", recording);
+      toggleBtn.disabled = endBtn.disabled = mode === "ending";
+      statusLabel.textContent = recording ? "녹음 중" : mode === "ending" ? "종료 중" : mode === "paused" ? "일시정지" : "대기 중";
+      paintTimer();
+    }
+
+    var meterContext = null;
+    // 소리 크기를 실제로 재고 있을 때만 조용한 조각을 건너뛴다. 화면을 열자마자 자동으로 이어서 녹음하면 브라우저가
+    // 오디오 처리(AudioContext)를 멈춰 두는데, 그때 크기가 늘 0으로 읽혀 모든 조각이 '조용함'으로 빠질 수 있다.
+    function meterWorking() { return !!(analyser && meterContext && meterContext.state === "running"); }
+    function startMeter() {
+      if (meterContext && meterContext.state === "suspended") meterContext.resume();
+      if (analyser || !(window.AudioContext || window.webkitAudioContext)) return;
+      var context = new (window.AudioContext || window.webkitAudioContext)();
+      meterContext = context;
+      if (context.state === "suspended") context.resume();
+      analyser = context.createAnalyser();
+      analyser.fftSize = 1024;
+      levelBuffer = new Float32Array(analyser.fftSize);
+      context.createMediaStreamSource(stream).connect(analyser);
+      setInterval(function () {
+        analyser.getFloatTimeDomainData(levelBuffer);
+        var sum = 0;
+        for (var i = 0; i < levelBuffer.length; i++) sum += levelBuffer[i] * levelBuffer[i];
+        var rms = Math.sqrt(sum / levelBuffer.length);
+        levelEl.style.width = (mode === "recording" ? Math.min(100, rms * 600) : 0) + "%";
+        if (mode !== "recording" || !recorder || recorder.state !== "recording" || !meterWorking()) return;
+        var now = Date.now();
+        chunkPeak = Math.max(chunkPeak, rms);
+        if (rms >= SILENT_RMS) lastLoudAt = now;
+        if (chunkPeak >= SILENT_RMS && now - lastLoudAt >= PAUSE_MS && now - chunkStartedAt >= MIN_CHUNK_MS) {
+          clearTimeout(chunkTimer);
+          recorder.stop();  // stop 이벤트에서 올리고 다음 조각을 바로 시작한다
+        }
+      }, 100);
+    }
+
+    function mimeType() {
+      var options = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+      for (var i = 0; i < options.length; i++) {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(options[i])) return options[i];
+      }
+      return "";
+    }
+    function extension(type) { return /ogg/.test(type) ? "ogg" : /mp4/.test(type) ? "m4a" : "webm"; }
+
+    function upload(blob, seq, silent, durationMs) {
+      var tries = 0;
+      function send() {
+        var form = new FormData();
+        form.append("seq", String(seq));
+        form.append("recorder", recorderId);
+        if (silent) form.append("silent", "1");
+        form.append("duration_ms", String(Math.max(0, Math.round(durationMs || 0))));
+        form.append("chunk", blob, "chunk_" + seq + "." + extension(blob.type));
+        // 나가는 중이면 마지막 조각을 keepalive로 보낸다 — 작으면 화면이 닫혀도 끝까지 올라간다.
+        return post(root.dataset.chunkUrl, form, leaving && blob.size < 60000).then(function (r) {
+          if (r.status === 409) {
+            return r.json().catch(function () { return {}; }).then(function (data) {
+              if (data.error === "other_recorder") takenOver();
+            });  // 이미 끝난 세션이거나 다른 화면이 녹음을 맡았다
+          }
+          if (!r.ok) throw new Error("HTTP " + r.status);
+        }).catch(function (error) {
+          tries += 1;
+          if (tries >= 3) { showError("녹음 조각 하나를 올리지 못했습니다(" + error.message + "). 네트워크를 확인해 주세요."); return; }
+          return new Promise(function (resolve) { setTimeout(resolve, 1500 * tries); }).then(send);
+        });
+      }
+      var job = send();
+      uploads.push(job);
+      return job;
+    }
+
+    // 조각마다 녹음기를 새로 만든다. 하나의 녹음기에서 시간 단위로 잘라낸 데이터는 첫 조각에만 머리말이 있어 따로
+    // 읽을 수 없기 때문이다. 조각 사이 이음새는 수 밀리초다.
+    function startChunk() {
+      var parts = [];
+      var type = mimeType();
+      var options = { audioBitsPerSecond: 64000 };
+      if (type) options.mimeType = type;
+      var rec = new MediaRecorder(stream, options);
+      var startedAt = Date.now();
+      chunkStartedAt = lastLoudAt = startedAt;
+      recorder = rec;
+      chunkPeak = 0;
+      rec.addEventListener("dataavailable", function (e) { if (e.data && e.data.size) parts.push(e.data); });
+      rec.addEventListener("stop", function () {
+        var blob = new Blob(parts, { type: rec.mimeType || "audio/webm" });
+        if (blob.size > 0) upload(blob, nextSeq++, meterWorking() ? chunkPeak < SILENT_RMS : false, Date.now() - startedAt);
+        if (mode === "recording") startChunk();
+        else if (mode === "ending") finishEnd();
+      });
+      rec.start();
+      chunkTimer = setTimeout(function () { if (rec.state === "recording") rec.stop(); }, MAX_CHUNK_MS);
+    }
+
+    function startRecording() {
+      showError("");
+      showInfo("");
+      var constraints = { audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
+      var getStream = stream ? Promise.resolve(stream) : navigator.mediaDevices.getUserMedia(constraints);
+      getStream.then(function (s) {
+        stream = s;
+        startMeter();
+        return post(root.dataset.controlUrl, { action: "resume", recorder: recorderId });
+      }).then(function () {
+        mode = "recording";
+        segmentStart = Date.now();
+        startChunk();
+        if (!tick) tick = setInterval(paintTimer, 1000);
+        paint();
+      }).catch(function (error) {
+        showError("마이크를 쓸 수 없습니다: " + (error && error.message ? error.message : error) + " — localhost 또는 https 주소에서 열어 주세요.");
+      });
+    }
+
+    // 다른 화면(탭)에서 '이어서 녹음'을 눌렀다 — 이 화면은 녹음을 멈춘다.
+    function takenOver() {
+      if (mode !== "recording") return;
+      elapsedMs += Date.now() - segmentStart;
+      mode = "paused";
+      stopCurrentChunk();
+      paint();
+      showInfo("다른 화면(탭)에서 이 회의를 녹음하기 시작해서 여기서는 멈췄어요.");
+    }
+
+    function stopCurrentChunk() {
+      clearTimeout(chunkTimer);
+      if (recorder && recorder.state === "recording") { recorder.stop(); return true; }
+      return false;
+    }
+
+    function pauseRecording() {
+      elapsedMs += Date.now() - segmentStart;
+      mode = "paused";
+      stopCurrentChunk();
+      post(root.dataset.controlUrl, { action: "pause", recorder: recorderId }, leaving);
+      paint();
+    }
+
+    // 화면을 나가려고 하면(뒤로 가기·다른 링크·새로고침·탭 닫기) 확인 창이 뜨는 그 순간 녹음을 일시정지한다. 나가기를
+    // 취소하고 남아도 일시정지된 채로 있고, '이어서 녹음'을 누르면 이어진다. 그대로 나가도 서버에는 이미 일시정지로 남는다.
+    var leaving = false;
+    function pauseForLeaving() {
+      if (mode !== "recording") return;
+      leaving = true;
+      pauseRecording();
+      showInfo("화면을 나가려고 해서 녹음을 일시정지했어요. 계속하려면 '이어서 녹음'을 누르세요.");
+      setTimeout(function () { leaving = false; }, 3000);  // 나가기를 취소하고 남았다면 다시 평소 요청으로
+    }
+
+    function finishEnd() {
+      Promise.all(uploads).then(function () {
+        return post(root.dataset.controlUrl, { action: "end", speaker_count: document.getElementById("live-speakers").value });
+      }).then(function (r) {
+        if (!r.ok) return r.json().then(function (data) { throw new Error(data.error || ("HTTP " + r.status)); });
+        if (stream) stream.getTracks().forEach(function (track) { track.stop(); });
+        clearInterval(tick);
+        window.location.reload();
+      }).catch(function (error) {
+        mode = "paused";
+        paint();
+        showError("종료하지 못했습니다: " + error.message);
+      });
+    }
+
+    toggleBtn.addEventListener("click", function () {
+      if (mode === "recording") pauseRecording(); else startRecording();
+    });
+    endBtn.addEventListener("click", function () {
+      if (!confirm("실시간 녹음을 끝낼까요? 지금까지의 녹음을 하나로 합쳐 회의 화면의 회의 파일에 등록합니다. 끝낸 뒤에는 이어서 녹음할 수 없습니다.")) return;
+      if (mode === "recording") elapsedMs += Date.now() - segmentStart;
+      mode = "ending";
+      paint();
+      if (!stopCurrentChunk()) finishEnd();  // 녹음 중이면 마지막 조각을 올린 뒤(stop 이벤트) 끝낸다
+    });
+    window.addEventListener("beforeunload", function (e) {
+      if (mode === "recording") pauseForLeaving();
+      // 일시정지한 뒤에도 묻는다 — 마지막 조각이 아직 올라가는 중일 수 있고, 실수로 나가는 것을 막는다.
+      if (mode === "paused" && leaving || mode === "ending") { e.preventDefault(); e.returnValue = ""; }
+    });
+    if (!navigator.mediaDevices || !window.MediaRecorder) {
+      toggleBtn.disabled = true;
+      showError("이 브라우저는 녹음을 지원하지 않습니다. 최신 크롬·엣지·사파리에서 열어 주세요.");
+    }
+    // 이미 녹음한 적이 있는 세션이면 일시정지 상태로 연다. 녹음 중에 화면을 떠났다면 서버가 일시정지로 돌려 두었다
+    // (views.live_session). 녹음 시간은 지금까지의 녹음 길이에서 이어지고, '이어서 녹음'을 누르면 다음 조각부터 쌓인다.
+    // 끝난 세션이면(녹음 종료 뒤 새로 고침) 일시정지로 그리지 않는다 — 상태 글자와 안내가 '일시정지'로 남았다.
+    onEnded = function () {
+      if (mode === "ended") return;
+      if (mode === "recording") stopCurrentChunk();
+      mode = "ended";
+      if (stream) stream.getTracks().forEach(function (track) { track.stop(); });
+      clearInterval(tick);
+      dot.classList.add("paused");
+      showInfo("");
+    };
+    if (status === "ended") {
+      onEnded();
+    } else if (nextSeq > 0) {
+      mode = "paused";
+      paint();
+      if (root.dataset.recordingElsewhere === "1") {
+        showInfo("다른 화면(탭)에서 녹음 중이거나 방금 녹음이 끊겼어요. 여기서 '이어서 녹음'을 누르면 이 화면에서 이어서 녹음하고, 다른 화면의 녹음은 멈춥니다.");
+      } else {
+        showInfo("일시정지 상태입니다. '이어서 녹음'을 누르면 " + timeEl.textContent + "부터 이어서 녹음합니다.");
+      }
+    }
+    // 녹음 중에 화면을 떠나면(뒤로 가기·새로고침·탭 닫기) 일시정지 신호를 보낸다. 화면이 닫히는 중이라 일반 요청은
+    // 끊길 수 있어 sendBeacon을 쓴다. 신호가 못 가도 서버가 조각이 끊긴 것을 보고 일시정지로 돌린다(views._live_state).
+    window.addEventListener("pagehide", function () {
+      if (mode !== "recording" || !navigator.sendBeacon) return;
+      var form = new FormData();
+      form.append("action", "pause");
+      form.append("recorder", recorderId);
+      form.append("csrfmiddlewaretoken", csrf);
+      navigator.sendBeacon(root.dataset.controlUrl, form);
+    });
+  }
+
+  poll();
+})();
+</script>
+{% endblock %}

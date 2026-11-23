@@ -27,6 +27,18 @@
   </div>
   {% endif %}
   {% if error %}<div class="error">{{ error|linebreaksbr }}</div>{% endif %}
+  {% if live_banner %}
+  {# 진행자에게는 일시정지일 때만, 팀원에게는 녹음 중·일시정지일 때 띄운다(views._participant_context). 일시정지면 점이 깜빡이지 않는다. #}
+  <div class="notice" style="border-color:var(--danger);background:var(--surface)" data-live-banner>
+    <span class="record-dot{% if live_paused %} paused{% endif %}" style="flex:0 0 auto;margin-top:6px"></span>
+    {% if live_paused %}
+    <span><b>실시간 회의 일시정지</b> — {% if meeting.host_id == user.id %}녹음이 멈춰 있어요. 이어서 녹음하거나 녹음을 종료해 주세요.{% else %}진행자가 녹음을 잠시 멈췄어요.{% endif %}
+    {% else %}
+    <span><b>실시간 회의 녹음 중</b> — 들어와서 회의 기록과 애매한 점을 함께 볼 수 있어요.
+    {% endif %}
+      <a href="{% url 'live_session' meeting.id live_active.id %}">{% if meeting.host_id == user.id %}세션으로 돌아가기{% else %}참여하기{% endif %}</a></span>
+  </div>
+  {% endif %}
 
   {# 읽지 않은 결정 알림 — 진행자가 결정을 공개했거나 공개 뒤에 고쳤다. 결정 확인 화면을 열면 사라진다. #}
   {% if decision_notice %}
@@ -66,7 +78,8 @@
   {% endif %}
 
   {% if meeting.recordings.all %}
-    <h2 class="section-title">업로드된 파일 ({{ meeting.recordings.count }})</h2>
+    {# 이 회의에 등록된 파일 전부 — 실시간 녹음을 끝내며 합친 녹음과, 아래에서 골라 제출한 녹음·텍스트 파일. 줄마다 종류를 붙인다. #}
+    <h2 class="section-title">회의 파일 ({{ meeting.recordings.count }})</h2>
     <ul class="plain" style="margin-bottom:8px">
     {% for rec in meeting.recordings.all %}
       <li class="item" style="flex-direction:column;align-items:stretch;gap:12px">
@@ -81,10 +94,22 @@
             </span>
             <div class="item-text">
               <span class="title">{{ rec.filename }}</span>
+              <span class="badge kind">{% if rec.id in live_recording_ids %}실시간 녹음{% elif rec.is_text %}텍스트 파일{% else %}녹음 파일{% endif %}</span>
               {% if rec.status == "processing" %}<span class="badge processing">{% if rec.is_text %}읽는 중{% else %}글로 옮기는 중{% endif %}</span>
               {% elif rec.status == "done" %}<span class="badge done">완료</span>
+              {% elif rec.status == "ready" %}<span class="badge">등록됨 · 제출하면 전사</span>
               {% else %}<span class="badge failed">실패</span>{% endif %}
               <div class="meta">{{ rec.created_at|date:"Y.m.d H:i" }}{% if rec.speaker_count %} · 말한 사람 {{ rec.speaker_count }}명{% endif %}</div>
+              {# 아직 전사하지 않았거나(등록됨) 다시 시도할(실패) 녹음은 말한 사람 수를 고칠 수 있다 — 실시간 녹음에서 적은 수도 여기서 바꾼다. #}
+              {% if meeting.host_id == user.id and not meeting.ended and not rec.is_text %}{% if rec.status == "ready" or rec.status == "failed" %}
+              <form method="post" action="{% url 'recording_speakers' meeting.id rec.id %}" class="speakers-edit">{% csrf_token %}
+                <label>말한 사람
+                  <input type="number" name="speaker_count" min="1" max="20" step="1" inputmode="numeric"
+                    value="{{ rec.speaker_count|default_if_none:'' }}" placeholder="자동" aria-label="{{ rec.filename }} 말한 사람 수">명</label>
+                <button type="submit" class="btn sm secondary">저장</button>
+                <span class="muted">비우면 자동으로 짐작해요</span>
+              </form>
+              {% endif %}{% endif %}
               {% if rec.status == "failed" and rec.error_message %}<div class="meta" style="color:var(--danger)">사유: {{ rec.error_message }}</div>{% endif %}
             </div>
           </div>
@@ -119,40 +144,36 @@
   <h2 class="section-title">회의 파일 올리기</h2>
   {% if stt_status %}<p class="muted" style="margin:-4px 0 10px">{{ stt_status }}</p>{% endif %}
   <form method="post" enctype="multipart/form-data">{% csrf_token %}
-    {# 마이크 녹음이 이 화면의 주요 행동이다 — 파일 업로드보다 위에, 더 크고 강조 색으로 둔다. #}
+    {% comment %}
+      실시간 녹음이 이 화면의 주요 행동이다 — 파일 업로드보다 위에, 더 크고 강조 색으로 둔다. 누르면 실시간 세션
+      화면으로 넘어가 녹음하며 바로 전사하고, 애매한 점을 회의 중에 짚는다(meetalign.live). 진행자만 시작할 수 있고,
+      팀원은 진행 중인 세션에 들어가 함께 본다. 버튼이 업로드 폼 안에 있어서 formaction으로 다른 주소에 보낸다.
+    {% endcomment %}
     <div class="record-cta">
-      <button type="button" id="record-toggle" class="btn lg">
+      {% if meeting.host_id == user.id %}
+      <button type="submit" id="live-start" class="btn lg" formaction="{% url 'live_start' meeting.id %}" formnovalidate>
         <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v4M9 21h6"/></svg>
-        <span id="record-toggle-label">마이크로 녹음하기</span>
+        {% if live_started %}실시간 녹음 이어가기{% else %}실시간 녹음 시작{% endif %}
       </button>
-      {# 녹음이 시작되면 보인다. 녹음 버튼은 일시정지·이어서 녹음을 맡고, 끝내는 것은 이 버튼이다. #}
-      <button type="button" id="record-stop" class="btn lg secondary" style="display:none">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
-        녹음 끝내기
-      </button>
-      {# 녹음 중임을 멀리서도 알 수 있게 빨간 점 + 경과 시간. 일시정지하면 점이 멈춘다. #}
-      <span id="record-timer" class="record-state" style="display:none" aria-live="polite">
-        <span id="record-dot" class="record-dot"></span>
-        <span id="record-time">00:00</span>
-        <span id="record-paused-label" hidden>일시정지됨</span>
-      </span>
+      {% elif live_active %}
+      <a id="live-join" class="btn lg" href="{% url 'live_session' meeting.id live_active.id %}">실시간 회의 참여하기</a>
+      {% endif %}
     </div>
-    <audio id="record-preview" controls style="display:none;width:100%;margin-bottom:10px"></audio>
+    <p class="muted" style="margin:-4px 0 12px">{% if meeting.host_id == user.id %}녹음하면서 바로 글로 옮기고, 애매한 부분을 회의 중에 짚어 줍니다. 마이크는 localhost 또는 https 주소에서만 동작합니다.{% elif live_active and not live_started %}진행자가 실시간 회의를 열었어요. 녹음이 시작되면 들어가서 회의 기록과 애매한 점을 함께 볼 수 있어요.{% elif live_active %}진행자가 실시간으로 녹음 중입니다. 들어가면 전사 내용과 애매한 점을 함께 볼 수 있어요.{% else %}실시간 녹음은 진행자가 시작합니다. 녹음이나 텍스트 파일은 아래에서 올릴 수 있어요.{% endif %}</p>
     {% comment %}
       두 칸 모두 파일을 고를 때마다 아래 목록에 쌓이고, × 로 뺄 수 있다(아래 upload-stack 스크립트). 제출하면
       녹음을 글로 옮기고, 텍스트 파일은 '텍스트 파일' 머리말을 붙여 녹취 원문 맨 앞에 둔다.
     {% endcomment %}
     <div class="field">
       <label for="recording">녹음 파일 올리기</label>
-      <input id="recording" type="file" name="recording" multiple accept="audio/*,video/*" data-upload-stack="recording-stack" data-speaker-count>
-      <ul id="recording-stack" class="upload-stack" hidden></ul>
+      <input id="recording" type="file" name="recording" multiple accept="audio/*,video/*" data-upload-stack="recording-stack" data-speaker-count data-kind="녹음 파일">
+      <ul id="recording-stack" class="plain upload-stack" hidden></ul>
       <p class="muted" style="margin:4px 0 0">녹음마다 실제로 말한 사람 수를 적으면 화자를 더 정확하게 나눕니다. 모르면 비워 두세요.</p>
-      <p class="muted" style="margin:4px 0 0">마이크 녹음은 localhost 또는 https 주소에서만 동작합니다. 일반 http로 다른 기기에서 접속했다면 파일을 올려 주세요.</p>
     </div>
     <div class="field">
       <label for="text_file">텍스트 파일 올리기</label>
-      <input id="text_file" type="file" name="text_file" multiple accept=".txt,.md,text/plain,text/markdown" data-upload-stack="text-stack">
-      <ul id="text-stack" class="upload-stack" hidden></ul>
+      <input id="text_file" type="file" name="text_file" multiple accept=".txt,.md,text/plain,text/markdown" data-upload-stack="text-stack" data-kind="텍스트 파일">
+      <ul id="text-stack" class="plain upload-stack" hidden></ul>
       <p class="muted" style="margin:4px 0 0">회의 메모나 정리한 글(.txt, .md)은 음성 인식 없이 녹음 전사본 앞에 붙여 회의록을 만듭니다.</p>
     </div>
     <div class="row">
@@ -169,14 +190,18 @@
     </div>
   </form>
   <style>
-    .upload-stack { list-style:none; margin:8px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
-    .upload-stack li { display:flex; align-items:center; gap:10px; padding:7px 10px; border:1px solid var(--line);
-      border-radius:8px; background:var(--surface-sunken); font-size:.9rem; }
-    .upload-stack .name { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .upload-stack .size { color:var(--ink-soft); font-size:.8rem; white-space:nowrap; }
-    .upload-stack .remove { width:auto; padding:2px 9px; line-height:1.4; border-radius:6px; }
-    .upload-stack .speakers { display:inline-flex; align-items:center; gap:4px; color:var(--ink-soft); font-size:.8rem; white-space:nowrap; }
-    .upload-stack .speakers input { width:64px; padding:3px 6px; margin:0; }
+    /* 고른 파일 목록 — 위 '회의 파일' 목록과 같은 모양(아이콘·이름·종류·상태·크기). 아직 올리기 전이라 점선 테두리. */
+    .upload-stack { margin:8px 0 0; display:flex; flex-direction:column; gap:8px; }
+    .upload-stack .item { border-style:dashed; justify-content:space-between; gap:12px; }
+    .upload-stack .item:hover { transform:none; }
+    .upload-stack .title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; display:inline-block; vertical-align:bottom; }
+    .upload-stack .item-main { flex:1 1 auto; }
+    .upload-stack .remove { width:auto; padding:2px 9px; line-height:1.4; border-radius:6px; flex:0 0 auto; }
+    .badge.kind { background:var(--surface-sunken); color:var(--ink-soft); }
+    .speakers-edit { display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; margin-top:6px; font-size:.82rem; color:var(--ink-soft); }
+    .speakers-edit label { display:inline-flex; align-items:center; gap:4px; margin:0; font-weight:600; }
+    .speakers-edit input { width:64px; padding:3px 6px; margin:0; }
+    .speakers-edit .muted { font-size:.78rem; }
   </style>
   <script>
   // 파일 칸(data-upload-stack)마다 고른 파일을 목록에 쌓는다. 브라우저 기본 동작은 새로 고르면 앞서 고른 파일을
@@ -188,6 +213,9 @@
   (function () {
     if (typeof DataTransfer === "undefined") return;  // 지원하지 않는 브라우저는 기본 동작(마지막 선택만) 그대로
     var stacks = new Map();
+    // 위 '회의 파일' 목록과 같은 아이콘(녹음 · 텍스트).
+    var MIC_ICON = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v4M9 21h6"/></svg>';
+    var TEXT_ICON = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></svg>';
 
     function sizeText(bytes) {
       if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + "MB";
@@ -204,27 +232,33 @@
       list.hidden = entries.length === 0;
       entries.forEach(function (entry, index) {
         var file = entry.file;
+        var recording = input.hasAttribute("data-speaker-count");
         var item = document.createElement("li");
+        item.className = "item";
+        var main = document.createElement("div");
+        main.className = "item-main";
+        var icon = document.createElement("span");
+        icon.className = "item-icon";
+        icon.innerHTML = recording ? MIC_ICON : TEXT_ICON;  // 고정된 그림 — 파일 이름은 넣지 않는다
+        var text = document.createElement("div");
+        text.className = "item-text";
         var name = document.createElement("span");
-        name.className = "name";
+        name.className = "title";
         name.textContent = file.name;
         name.title = file.name;
-        var size = document.createElement("span");
-        size.className = "size";
-        size.textContent = sizeText(file.size);
-        var remove = document.createElement("button");
-        remove.type = "button";
-        remove.className = "btn sm secondary remove";
-        remove.textContent = "×";
-        remove.setAttribute("aria-label", file.name + " 빼기");
-        remove.addEventListener("click", function () {
-          entries.splice(index, 1);
-          sync(input);
-        });
-        item.append(name, size);
-        if (input.hasAttribute("data-speaker-count")) {
+        var kind = document.createElement("span");
+        kind.className = "badge kind";
+        kind.textContent = input.dataset.kind || "";
+        var state = document.createElement("span");
+        state.className = "badge";
+        state.textContent = "올리기 전 · 제출하면 " + (recording ? "전사" : "회의록에 붙여요");
+        var meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = sizeText(file.size);
+        text.append(name, " ", kind, " ", state, meta);
+        if (recording) {
           var speakers = document.createElement("label");
-          speakers.className = "speakers";
+          speakers.className = "speakers-edit";
           var count = document.createElement("input");
           count.type = "number";
           count.name = "speaker_counts";
@@ -237,9 +271,20 @@
           count.setAttribute("aria-label", file.name + " 말한 사람 수");
           count.addEventListener("input", function () { entry.count = count.value; });
           speakers.append("말한 사람", count, "명");
-          item.appendChild(speakers);
+          text.appendChild(speakers);
         }
-        item.appendChild(remove);
+        main.append(icon, text);
+        var remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "btn sm secondary remove";
+        remove.textContent = "×";
+        remove.setAttribute("aria-label", file.name + " 빼기");
+        remove.title = "목록에서 빼기";
+        remove.addEventListener("click", function () {
+          entries.splice(index, 1);
+          sync(input);
+        });
+        item.append(main, remove);
         list.appendChild(item);
       });
     }
@@ -264,164 +309,6 @@
       });
     });
 
-    // 마이크 녹음이 끝나면 녹음 칸에 쌓는다(아래 녹음 스크립트).
-    window.meetalignStageFile = function (input, file) {
-      if (stacks.has(input)) add(input, [file]);
-    };
-  })();
-  </script>
-  <script>
-  (function () {
-    var toggleBtn = document.getElementById("record-toggle");
-    var toggleLabel = document.getElementById("record-toggle-label");
-    var stopBtn = document.getElementById("record-stop");
-    var timerEl = document.getElementById("record-timer");
-    var timeEl = document.getElementById("record-time");
-    var dotEl = document.getElementById("record-dot");
-    var pausedLabel = document.getElementById("record-paused-label");
-    var preview = document.getElementById("record-preview");
-    var fileInput = document.getElementById("recording");
-    var submitBtn = document.getElementById("record-submit");
-    if (!toggleBtn || !navigator.mediaDevices || !window.MediaRecorder) {
-      if (toggleBtn) toggleBtn.style.display = "none";
-      if (stopBtn) stopBtn.style.display = "none";
-      return;
-    }
-
-    // 일시정지를 지원하지 않는 브라우저에서는 중지 버튼을 띄우지 않고, 녹음 버튼이 예전처럼 중지까지 겸한다.
-    var canPause = typeof MediaRecorder.prototype.pause === "function" &&
-                   typeof MediaRecorder.prototype.resume === "function";
-
-    var mediaRecorder = null;
-    var chunks = [];
-    var timerInterval = null;
-    // 타이머는 벽시계가 아니라 실제로 녹음된 길이를 센다. elapsedMs는 지금까지 녹음된 누적 시간이고,
-    // segmentStart는 현재 녹음 중인 구간이 시작된 시각이다. 일시정지한 시간은 어디에도 더해지지 않는다.
-    var elapsedMs = 0;
-    var segmentStart = 0;
-
-    function pad(n) {
-      return (n < 10 ? "0" : "") + n;
-    }
-
-    function formatTime(totalSeconds) {
-      return pad(Math.floor(totalSeconds / 60)) + ":" + pad(totalSeconds % 60);
-    }
-
-    function isActive() {
-      return mediaRecorder && (mediaRecorder.state === "recording" || mediaRecorder.state === "paused");
-    }
-
-    function recordedMs() {
-      if (mediaRecorder && mediaRecorder.state === "recording") {
-        return elapsedMs + (Date.now() - segmentStart);
-      }
-      return elapsedMs;
-    }
-
-    function paintTimer() {
-      var paused = mediaRecorder && mediaRecorder.state === "paused";
-      timeEl.textContent = formatTime(Math.floor(recordedMs() / 1000));
-      // 일시정지 중에는 점이 깜빡이지 않고 "일시정지됨"이 뜬다 — 녹음 중과 눈으로 구분되게.
-      dotEl.classList.toggle("paused", !!paused);
-      pausedLabel.hidden = !paused;
-    }
-
-    function paintButtons() {
-      if (!isActive()) {
-        stopBtn.style.display = "none";
-        toggleBtn.classList.remove("secondary");
-        return;
-      }
-      stopBtn.style.display = canPause ? "inline-flex" : "none";
-      // 녹음 중에는 '끝내기'가 주요 행동이다 — 강조 색을 그쪽으로 넘긴다.
-      toggleBtn.classList.toggle("secondary", canPause);
-      if (mediaRecorder.state === "paused") {
-        toggleLabel.textContent = "▶ 이어서 녹음";
-      } else {
-        toggleLabel.textContent = canPause ? "⏸ 일시정지" : "■ 녹음 중지";
-      }
-    }
-
-    function start() {
-      navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
-        chunks = [];
-        elapsedMs = 0;
-        mediaRecorder = new MediaRecorder(stream);
-        segmentStart = Date.now();
-        timerInterval = setInterval(paintTimer, 1000);
-
-        mediaRecorder.addEventListener("dataavailable", function (e) {
-          if (e.data.size > 0) chunks.push(e.data);
-        });
-        mediaRecorder.addEventListener("stop", function () {
-          stream.getTracks().forEach(function (track) { track.stop(); });
-          clearInterval(timerInterval);
-          timerInterval = null;
-          timerEl.style.display = "none";
-          var blob = new Blob(chunks, { type: mediaRecorder.mimeType || "audio/webm" });
-          // 녹음할 때마다 녹음 칸 목록에 하나씩 쌓인다. 이름이 겹치지 않게 녹음을 끝낸 시각을 붙인다.
-          var now = new Date();
-          var name = "recording-" + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds()) + ".webm";
-          var file = new File([blob], name, { type: blob.type });
-          if (window.meetalignStageFile) {
-            window.meetalignStageFile(fileInput, file);
-          } else {
-            var dataTransfer = new DataTransfer();
-            dataTransfer.items.add(file);
-            fileInput.files = dataTransfer.files;
-          }
-          preview.src = URL.createObjectURL(blob);
-          preview.style.display = "block";
-          toggleLabel.textContent = "하나 더 녹음하기";
-          toggleBtn.classList.remove("secondary");
-          stopBtn.style.display = "none";
-        });
-
-        mediaRecorder.start();
-        preview.style.display = "none";
-        timerEl.style.display = "inline-flex";
-        paintTimer();
-        paintButtons();
-      }).catch(function (err) {
-        alert("마이크 접근 권한이 필요합니다: " + err.message);
-      });
-    }
-
-    toggleBtn.addEventListener("click", function () {
-      if (mediaRecorder && mediaRecorder.state === "recording") {
-        if (!canPause) {
-          mediaRecorder.stop();
-          return;
-        }
-        elapsedMs += Date.now() - segmentStart;
-        mediaRecorder.pause();
-        paintButtons();
-        paintTimer();
-        return;
-      }
-      if (mediaRecorder && mediaRecorder.state === "paused") {
-        segmentStart = Date.now();
-        mediaRecorder.resume();
-        paintButtons();
-        paintTimer();
-        return;
-      }
-      start();
-    });
-
-    stopBtn.addEventListener("click", function () {
-      if (isActive()) mediaRecorder.stop();
-    });
-
-    // 녹음 중이나 일시정지 중에는 파일이 아직 만들어지지 않았다. 그대로 제출하면 빈 채로 올라간다.
-    if (submitBtn) {
-      submitBtn.addEventListener("click", function (e) {
-        if (!isActive()) return;
-        e.preventDefault();
-        alert("녹음을 먼저 중지해 주세요. 중지해야 녹음 파일이 만들어집니다.");
-      });
-    }
   })();
   </script>
   {% endif %}

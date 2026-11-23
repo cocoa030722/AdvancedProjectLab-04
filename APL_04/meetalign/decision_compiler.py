@@ -216,6 +216,31 @@ def _json_array(raw):
     return data if isinstance(data, list) else None
 
 
+# 애매함 점검표. 회의 뒤 결정 추출(_compile_prompt)과 회의 중 실시간 분석(live.analyze_prompt)이 같이 쓴다 — 회의 중에
+# 짚는 기준과 회의 뒤에 묻는 기준이 같아야, 회의 중에 처리한 애매함을 결정 확인에서 다른 이유로 다시 묻지 않는다.
+# 고칠 때는 두 프롬프트를 함께 확인한다.
+AMBIGUITY_CHECKLIST = (
+        "1. 기한이 없거나 막연하다: \"최대한 빨리\", \"되는 대로\", \"그때\", \"나중에\", \"쯤\", \"다음 주쯤\" 등\n"
+        "2. 정하지 않고 미뤘다: \"단톡에서 정해요\", \"이따 정해요\", \"봐서 정해요\" — 정할 때까지 팀원마다 "
+        "다르게 준비한다\n"
+        "3. 담당자나 범위가 불분명하다: \"각자\", \"편한 대로\", \"누가 하나\", 어디까지 하는지 안 정함\n"
+        "4. 선택지가 둘 이상 남았다: \"A 아니면 B\"\n"
+        "5. 회의 앞부분에 나온 제약과 충돌한다: 누군가 말한 불가능한 시간·사정이 나중에 정한 일정과 겹치는데 "
+        "아무도 짚지 않았다. 원문 전체에서 각자 말한 가능/불가능 시간을 먼저 모아 두고 대조하라.\n"
+        "6. 대답이 확답이 아니다: \"일단 알겠어요\", \"아마도\", \"해 볼게요\"\n"
+        "7. 그 밖에 위에 없더라도, 팀원이 회의를 마치고 각자 다르게 이해하거나 다르게 행동할 수 있는 점: 같은 말을 "
+        "다르게 받아들일 수 있다(예: \"한 장 정도\"가 슬라이드인지 문서인지), 가리키는 대상이 불분명하다(\"아까 그거\"), "
+        "완료 기준이 없다, 사람마다 말한 내용이 엇갈렸는데 정리하지 않았다, 조건이 풀려야 확정되는 결정이다(\"면접 "
+        "없으면 금요일\"). 7번은 실제로 행동이 갈릴 때만 붙이고, 말투만 다른 정도로는 붙이지 마라.\n"
+)
+
+
+def review_hint_lines(lines, extra_phrases=()):
+    """모호 표현이 든 말만 추린다 — LLM에 '반드시 검토하라'고 짚어 주기만 하고 판정은 맡긴다(_review_hints 참고)."""
+    phrases = AMBIGUOUS_PHRASES + REFERENT_PHRASES + tuple(extra_phrases)
+    return [line for line in lines if any(phrase in line for phrase in phrases)]
+
+
 def _review_hints(source):
     """전사본에서 모호 표현이 있는 문장만 추려 LLM이 놓치지 않게 짚어준다.
 
@@ -224,9 +249,7 @@ def _review_hints(source):
     표현을 섞어도 과도하게 틀어막는(false positive) 비용이 없다 — LLM이 '결정이 아니다'로
     걸러내면 그만이다.
     """
-    sentences = re.split(r"(?<=[.!?])\s+", source.strip())
-    hint_phrases = AMBIGUOUS_PHRASES + REFERENT_PHRASES
-    return [s for s in sentences if any(phrase in s for phrase in hint_phrases)]
+    return review_hint_lines(re.split(r"(?<=[.!?])\s+", source.strip()))
 
 
 # candidate의 빈칸을 어떻게 채울지. 예전에는 "원문에 없는 날짜·이름을 지어내지 마라"로 막았는데,
@@ -272,6 +295,7 @@ def collect_meeting_info(meeting):
     AI가 "회의정보에서 가져왔다"고 주장한 값의 대조(_info_text).
     """
     at = timezone.localtime(meeting.created_at)
+    from . import live  # live가 이 모듈을 쓰므로 위에서 부르면 순환 import다
     return {
         "date": "%d년 %d월 %d일 (%s)" % (at.year, at.month, at.day, "월화수목금토일"[at.weekday()]),
         "participants": _participant_names(meeting),
@@ -280,6 +304,8 @@ def collect_meeting_info(meeting):
             "%s — %s" % (decision.what, decision.undecided_reason)
             for decision in carryover_decisions(meeting)
         ],
+        # 실시간 세션에서 진행자가 '처리됨'으로 체크한 애매한 점. 같은 애매함으로 다시 묻지 않게 한다.
+        "resolved": live.resolved_flag_texts(meeting),
     }
 
 
@@ -305,6 +331,10 @@ def _meeting_info_block(meeting_info):
     if meeting_info["carryover"]:
         lines.append("- 지난 회의 미결정 안건(이번에 다시 다뤄질 수 있다):")
         lines.extend("  · %s" % row for row in meeting_info["carryover"])
+    if meeting_info.get("resolved"):
+        lines.append("- 회의 중 진행자가 이미 확인하고 처리한 애매한 점(이 애매함 때문에 다시 ambiguous로 판정하지 마라. "
+                     "같은 안건에 다른 애매함이 남아 있을 때만 판정한다):")
+        lines.extend("  · %s" % row for row in meeting_info["resolved"])
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -348,18 +378,7 @@ def _compile_prompt(source, meeting_info=None):
         "대기 시간이 길어질 수 있다는 이유만으로는 ambiguous: true로 분류하지 않는다. "
         "기한 차이로 팀원이 서로 다른 시점에 실제 후속 작업을 시작하거나, 다른 약속과 충돌한다는 "
         "원문 근거가 있을 때만 기한을 문제로 삼는다.\n"
-        "1. 기한이 없거나 막연하다: \"최대한 빨리\", \"되는 대로\", \"그때\", \"나중에\", \"쯤\", \"다음 주쯤\" 등\n"
-        "2. 정하지 않고 미뤘다: \"단톡에서 정해요\", \"이따 정해요\", \"봐서 정해요\" — 정할 때까지 팀원마다 "
-        "다르게 준비한다\n"
-        "3. 담당자나 범위가 불분명하다: \"각자\", \"편한 대로\", \"누가 하나\", 어디까지 하는지 안 정함\n"
-        "4. 선택지가 둘 이상 남았다: \"A 아니면 B\"\n"
-        "5. 회의 앞부분에 나온 제약과 충돌한다: 누군가 말한 불가능한 시간·사정이 나중에 정한 일정과 겹치는데 "
-        "아무도 짚지 않았다. 원문 전체에서 각자 말한 가능/불가능 시간을 먼저 모아 두고 대조하라.\n"
-        "6. 대답이 확답이 아니다: \"일단 알겠어요\", \"아마도\", \"해 볼게요\"\n"
-        "7. 그 밖에 위에 없더라도, 팀원이 회의를 마치고 각자 다르게 이해하거나 다르게 행동할 수 있는 점: 같은 말을 "
-        "다르게 받아들일 수 있다(예: \"한 장 정도\"가 슬라이드인지 문서인지), 가리키는 대상이 불분명하다(\"아까 그거\"), "
-        "완료 기준이 없다, 사람마다 말한 내용이 엇갈렸는데 정리하지 않았다, 조건이 풀려야 확정되는 결정이다(\"면접 "
-        "없으면 금요일\"). 7번은 실제로 행동이 갈릴 때만 붙이고, 말투만 다른 정도로는 붙이지 마라.\n"
+        + AMBIGUITY_CHECKLIST +
         "1~7에 해당하더라도 그 해석 차이가 담당·실행 시점·범위·완료 기준 등 팀원의 행동을 어떻게 바꿀지 "
         "구체적으로 설명할 수 있을 때만 ambiguous: true다. 표현이 느슨해도 실제로 할 일이 같다면 "
         "ambiguous: false다. 결론을 명시적으로 미룬 안건은 행동 차이가 아직 없어도 확인 대상으로 둔다.\n\n"
@@ -527,7 +546,10 @@ def _info_text(meeting_info):
     if not meeting_info:
         return ""
     parts = []
-    for value in meeting_info.values():
+    # 처리한 애매한 점은 값의 출처가 아니다 — 그 안의 표현을 '회의정보에서 가져왔다'로 인정하지 않는다.
+    for key, value in meeting_info.items():
+        if key == "resolved":
+            continue
         parts.extend(value if isinstance(value, (list, tuple)) else [value])
     return " / ".join(str(part) for part in parts if part)
 
@@ -654,7 +676,8 @@ def compile_meeting(meeting):
     ambiguous_count = 0
     few_candidates = 0
     try:
-        ambiguous_count, few_candidates = _save_items(meeting, items)
+        from . import live
+        ambiguous_count, few_candidates = _save_items(meeting, items, live.resolved_phrases(meeting))
     except IntegrityError:
         # 진행자가 추출 버튼을 두 번 눌렀을 때. 위의 exists() 검사는 LLM 호출(수 초) 앞에
         # 있으므로 두 요청이 모두 빈 상태를 보고 통과해 같은 order를 쓰려 한다. 먼저 저장한
@@ -690,13 +713,16 @@ def _looks_deferred(item):
     return any(phrase in item["evidence"] for phrase in DEFERRAL_PHRASES)
 
 
-def _save_items(meeting, items):
-    """응답 항목들을 Decision/Interpretation으로 저장하고 (확인 필요 수, 후보 없는 수)를 돌려준다."""
+def _save_items(meeting, items, resolved_phrases=()):
+    """응답 항목들을 Decision/Interpretation으로 저장하고 (확인 필요 수, 후보 없는 수)를 돌려준다.
+
+    resolved_phrases는 실시간 세션에서 진행자가 '처리됨'으로 체크한 애매한 표현이다(_resolve_item 참고).
+    """
     ambiguous_count = 0
     few_candidates = 0
     with transaction.atomic():
         for order, item in enumerate(items):
-            warnings, divergence_reason, final_text, candidates, draft_hint = _resolve_item(item)
+            warnings, divergence_reason, final_text, candidates, draft_hint = _resolve_item(item, resolved_phrases)
             decision = Decision.objects.create(
                 meeting=meeting, order=order, what=item["topic"],
                 warnings=warnings, divergence_reason=divergence_reason, impact=item["impact"],
@@ -720,7 +746,26 @@ def _save_items(meeting, items):
     return ambiguous_count, few_candidates
 
 
-def _resolve_item(item):
+def _drop_resolved(warnings, resolved_phrases):
+    """규칙 경고 중 회의 중에 이미 처리한 표현을 짚는 것은 뺀다.
+
+    경고 끝의 인용 표현(예: "…모호한 표현이 있어요: '다음 주쯤'")이 처리한 애매한 표현 안에 들어 있으면, 진행자가
+    회의 중에 그 자리에서 확인하고 넘어간 것이다. 날짜·숫자 충돌처럼 인용이 없는 경고는 그대로 둔다.
+    """
+    if not resolved_phrases:
+        return warnings
+    squashed = [decision_checks.squash(phrase) for phrase in resolved_phrases]
+    kept = []
+    for warning in warnings:
+        match = _QUOTED_PHRASE.search(warning)
+        quoted = decision_checks.squash(match.group(1)) if match else ""
+        if quoted and any(quoted in phrase for phrase in squashed):
+            continue
+        kept.append(warning)
+    return kept
+
+
+def _resolve_item(item, resolved_phrases=()):
     """응답 항목 하나 → (warnings, divergence_reason, final_text, candidates, draft_hint).
 
     네 갈래다.
@@ -750,7 +795,7 @@ def _resolve_item(item):
             return [], "근거를 원문에서 확인하지 못했어요", "", [], _draft_hint_text(unverified)
         candidates = [{"text": unverified, "evidence": "", "recommended": False}] if unverified else []
         return [], "근거를 원문에서 확인하지 못했어요", "", candidates, ""
-    warnings = safety_warnings(item["final"], item["evidence"])
+    warnings = _drop_resolved(safety_warnings(item["final"], item["evidence"]), resolved_phrases)
     if not warnings:
         return [], "", item["final"], [], ""
     draft_hint = (

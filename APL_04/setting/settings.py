@@ -170,6 +170,8 @@ BACKGROUND_RECORDING = True
 # 결정 사항 추출도 요청 안에서 기다리지 않고 백그라운드에서 돌린다(meetalign.tasks.start_decision_compile).
 # 테스트에서는 결과를 바로 확인하도록 끈다 — 켜고 시험하는 테스트는 override_settings로 다시 켠다.
 BACKGROUND_DECISIONS = not (len(sys.argv) > 1 and sys.argv[1] == 'test')
+# 실시간 세션의 조각 전사·애매함 분석·종료 뒤 녹음 합치기도 백그라운드에서 돈다(meetalign.live). 테스트에서는 끈다.
+BACKGROUND_LIVE = not (len(sys.argv) > 1 and sys.argv[1] == 'test')
 
 LOGIN_URL = 'login'
 LOGIN_REDIRECT_URL = 'index'

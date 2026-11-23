@@ -61,6 +61,9 @@ class Recording(models.Model):
     STATUS_PROCESSING = "processing"
     STATUS_DONE = "done"
     STATUS_FAILED = "failed"
+    # 실시간 세션을 끝내면 합친 녹음이 이 상태로 등록된다 — 아직 전사하지 않았다. 회의 화면에서 '제출하고 회의록
+    # 만들기'를 누르면 다른 업로드와 함께 처리된다(views.meeting_detail).
+    STATUS_READY = "ready"
 
     meeting = models.ForeignKey(Meeting, on_delete=models.CASCADE, related_name="recordings")
     file = models.FileField(upload_to="recordings/")
@@ -403,3 +406,99 @@ class Notification(models.Model):
 
     def __str__(self):
         return "%s → %s: %s" % (self.meeting_id, self.user_id, self.kind)
+
+
+# ---------------------------------------------------------------------------
+# 실시간 회의 세션.
+#
+# 진행자가 회의 화면에서 '실시간 녹음'을 누르면 세션이 열린다. 브라우저가 녹음을 짧은 조각(LiveChunk)으로
+# 잘라 올리고, 서버가 조각마다 바로 전사해 이어 붙인다. 몇 조각마다 AI가 새 녹취를 읽고 애매한 점(LiveFlag)을
+# 올리며, 팀원은 같은 화면에 들어와 함께 본다. 종료하면 조각 녹음을 하나로 합쳐 일반 녹음(Recording)으로 넘기고,
+# 그 뒤는 녹음을 올렸을 때와 같다(화자 분리를 포함한 통합 전사 → 회의록 → 결정 추출). meetalign.live 참고.
+# ---------------------------------------------------------------------------
+
+
+class LiveSession(models.Model):
+    STATUS_RECORDING = "recording"
+    STATUS_PAUSED = "paused"
+    STATUS_ENDED = "ended"
+    STATUS_CHOICES = [(STATUS_RECORDING, "녹음 중"), (STATUS_PAUSED, "일시정지"), (STATUS_ENDED, "종료")]
+
+    meeting = models.ForeignKey(Meeting, on_delete=models.CASCADE, related_name="live_sessions")
+    started_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default=STATUS_RECORDING)
+    started_at = models.DateTimeField(auto_now_add=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    # 예전에 AI가 고쳐 쓰던 '지금까지 회의 상태' 요약. 지금은 분석마다 녹취 전체를 보내서 쓰지 않는다(meetalign.live).
+    state_summary = models.TextField(blank=True, default="")
+    # 이 순번까지의 조각은 애매함 분석을 마쳤다. 다음 분석은 그 뒤 조각부터 읽는다.
+    analyzed_seq = models.IntegerField(default=-1)
+    # 진행자가 화면에서 정한 판단 딜레이 시간(분석 간격, 초). 비어 있으면 LIVE_ANALYZE_INTERVAL_SECONDS(live.analyze_interval).
+    analyze_interval = models.PositiveSmallIntegerField(null=True, blank=True)
+    # 종료할 때 진행자가 적은 말한 사람 수. 합친 녹음(Recording.speaker_count)으로 넘긴다.
+    speaker_count = models.PositiveSmallIntegerField(null=True, blank=True)
+    # 종료 뒤 조각을 합쳐 만든 녹음. 합치기가 실패하면 비어 있고 사유가 error에 남는다.
+    recording = models.ForeignKey("Recording", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    error = models.CharField(max_length=300, blank=True, default="")
+
+    class Meta:
+        ordering = ["-started_at", "-id"]
+
+    @property
+    def is_active(self):
+        return self.status != self.STATUS_ENDED
+
+    def __str__(self):
+        return "%s 실시간 세션 #%s" % (self.meeting, self.pk)
+
+
+class LiveChunk(models.Model):
+    STATUS_PENDING = "pending"
+    STATUS_DONE = "done"
+    STATUS_FAILED = "failed"
+
+    session = models.ForeignKey(LiveSession, on_delete=models.CASCADE, related_name="chunks")
+    # 브라우저가 매긴 순번(0부터). 조각은 동시에 올라와 순서가 뒤섞일 수 있어서 이 번호로 이어 붙인다.
+    seq = models.PositiveIntegerField()
+    file = models.FileField(upload_to="live_chunks/")
+    transcript = models.TextField(blank=True, default="")
+    status = models.CharField(max_length=10, default=STATUS_PENDING)
+    # 브라우저가 잰 이 조각의 녹음 길이(밀리초). 다 더하면 지금까지 녹음된 시간이라, 화면을 떠났다 돌아와도 녹음 시간이
+    # 00:00부터가 아니라 이어서 보인다.
+    duration_ms = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["seq"]
+        constraints = [models.UniqueConstraint(fields=["session", "seq"], name="unique_live_chunk_seq")]
+
+
+class LiveFlag(models.Model):
+    """실시간 세션에서 AI가 올린 애매한 점 하나. 진행자가 체크하면 '처리됨'이 되고, 회의 뒤 결정 추출은 처리된
+    애매함을 다시 문제 삼지 않는다(decision_compiler — 회의 정보의 '회의 중 처리한 애매한 점')."""
+
+    session = models.ForeignKey(LiveSession, on_delete=models.CASCADE, related_name="flags")
+    # 어느 안건의 무슨 문제인지 짧게("자료조사 기한"). 같은 안건의 같은 문제를 다른 표현으로 다시 올리지 않게 묶는다.
+    # 예전 것과 규칙이 못 정한 것은 비어 있다.
+    topic = models.CharField(max_length=60, blank=True, default="")
+    # 녹취에 나온 애매한 표현(그대로 인용)과 어떤 애매함인지 한 줄.
+    phrase = models.CharField(max_length=300)
+    reason = models.TextField()
+    resolved = models.BooleanField(default=False)
+    resolved_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    # 회의에서 뒤에 정해져 AI가 자동으로 '확인함'으로 바꾼 것인가(진행자가 직접 체크했으면 False). 자동 확인은 가벼운 모델의
+    # 판단이라, 회의 뒤 결정 추출의 '처리한 애매한 점'으로 넘기지 않는다 — 결정 확인이 큰 모델로 다시 본다.
+    resolved_auto = models.BooleanField(default=False)
+    # 자동 확인의 근거가 된 말(녹취 그대로). 진행자가 자동 확인을 되돌려도 남겨 두어, 같은 것을 다시 자동 확인하지 않는다.
+    settled_quote = models.CharField(max_length=300, blank=True, default="")
+    # 진행자가 잘못 짚었다고 지운 것(화면의 ×). 지우지 않고 남겨 두는 이유: 다음 분석에 "잘못 짚은 것"으로 알려 같은
+    # 애매함을 다시 올리지 않게 한다. 화면에도, 회의 뒤 결정 추출의 '처리한 애매한 점'에도 넣지 않는다.
+    dismissed = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return self.phrase[:30]
