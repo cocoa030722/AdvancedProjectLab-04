@@ -537,6 +537,7 @@ def _live_state(session, after=-1):
     flags = list(session.flags.filter(dismissed=False))
     _pause_if_stalled(session, chunks)
     lines_until = _lines_until(chunks)
+    finishing = live.is_finishing(session.id)
     return {
         "status": session.status,
         # 녹음한 조각이 있는가 — 없으면 화면은 '녹음 중'·'일시정지' 대신 '녹음 시작 전'을 보인다.
@@ -561,6 +562,9 @@ def _live_state(session, after=-1):
         # 애매함 분석 진행 — 화면이 "판단 중", "대기 중 · n초 남음" 같은 표시를 보여 준다(live.analysis_status).
         "analysis": {**live.analysis_status(session), "interval": live.analyze_interval(session)},
         "recording_ready": bool(session.recording_id),
+        "recording_finishing": finishing,
+        "can_retry_merge": not session.is_active and not session.recording_id and not finishing
+                           and any(chunk.file for chunk in chunks),
         # 회의 종료로 세션이 끝났으면 합친 녹음은 이미 처리 중이다 — 화면이 '제출하라'고 안내하지 않게.
         "meeting_ended": Meeting.objects.filter(pk=session.meeting_id, ended=True).exists(),
         "error": session.error,
@@ -618,6 +622,11 @@ def live_control(request, meeting_id, session_id):
     meeting, session = _live_session(request, meeting_id, session_id)
     _live_host_only(meeting, request.user)
     action = request.POST.get("action")
+    if action == "retry_merge":
+        if session.is_active or session.recording_id or not session.chunks.exclude(file="").exists():
+            return JsonResponse({"error": "다시 합칠 녹음이 없습니다."}, status=409)
+        live.finish(session)
+        return JsonResponse({"status": session.status})
     if not session.is_active:
         return JsonResponse({"status": session.status})
     recorder = request.POST.get("recorder", "")
