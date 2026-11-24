@@ -627,7 +627,7 @@ def _finish(session_id):
         with tempfile.TemporaryDirectory(prefix="meetalign-live-") as out_dir:
             merged = os.path.join(out_dir, name)
             try:
-                services.merge_audio_to_wav(paths, merged)
+                _, skipped = services.merge_audio_to_wav(paths, merged)
             except RuntimeError as error:
                 LiveSession.objects.filter(pk=session_id).update(error=str(error)[:300])
                 return
@@ -636,7 +636,10 @@ def _finish(session_id):
                 recording = Recording(meeting=session.meeting, status=Recording.STATUS_READY,
                                       speaker_count=session.speaker_count)
                 recording.file.save(name, File(handle), save=True)
-        LiveSession.objects.filter(pk=session_id).update(recording=recording, error="")
+        warning = "읽지 못한 녹음 조각 %d개가 빠졌습니다." % skipped if skipped else ""
+        LiveSession.objects.filter(pk=session_id).update(recording=recording, error=warning)
+        if skipped:
+            return  # 일부만 등록된 경우 복구에 쓸 원본 조각을 보관한다.
         # 합친 녹음이 생겼으니 조각 파일은 지운다(녹취 글은 남긴다 — 회의 중 화면 기록).
         for chunk in session.chunks.all():
             if chunk.file:

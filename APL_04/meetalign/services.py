@@ -611,21 +611,24 @@ def merge_audio_to_wav(paths, out_path):
     """여러 녹음 조각을 순서대로 이어 16kHz 모노 WAV 하나로 만든다(실시간 세션 종료 뒤 통합 전사용).
 
     PyAV로 어떤 형식이든 읽는다. 읽지 못하는 조각은 건너뛰고 기록만 남긴다 — 조각 하나가 깨졌다고 회의 전체
-    녹음을 잃지 않게. 합친 길이(초)를 돌려준다. PyAV가 없거나 하나도 읽지 못하면 RuntimeError.
+    녹음을 잃지 않게. 합친 길이(초)와 읽지 못한 조각 수를 돌려준다. PyAV가 없거나 하나도 읽지 못하면 RuntimeError.
     """
     try:
         import av
     except ImportError as error:
         raise RuntimeError("녹음 조각을 합치려면 PyAV가 필요합니다(pip install av)") from error
     written = 0
+    skipped = 0
     with wave.open(out_path, "wb") as out:
         out.setnchannels(1)
         out.setsampwidth(2)
         out.setframerate(CHUNK_SAMPLE_RATE)
         for path in paths:
+            before = written
             try:
                 with av.open(path) as container:
                     if not container.streams.audio:
+                        skipped += 1
                         continue
                     resampler = av.AudioResampler(format="s16", layout="mono", rate=CHUNK_SAMPLE_RATE)
                     frames = list(container.decode(container.streams.audio[0]))
@@ -634,11 +637,14 @@ def merge_audio_to_wav(paths, out_path):
                             pcm = bytes(converted.planes[0])[:converted.samples * 2]
                             out.writeframes(pcm)
                             written += len(pcm)
+                if written == before:
+                    skipped += 1
             except Exception as error:  # 깨진 조각 하나 때문에 전체를 잃지 않는다
+                skipped += 1
                 logger.warning("녹음 조각을 읽지 못해 건너뜁니다(%s): %s", os.path.basename(path), error)
     if not written:
         raise RuntimeError("합칠 수 있는 녹음 조각이 없습니다")
-    return written / CHUNK_BYTES_PER_SECOND
+    return written / CHUNK_BYTES_PER_SECOND, skipped
 
 
 def _format_minutes(seconds):
