@@ -332,8 +332,8 @@ def _meeting_info_block(meeting_info):
         lines.append("- 지난 회의 미결정 안건(이번에 다시 다뤄질 수 있다):")
         lines.extend("  · %s" % row for row in meeting_info["carryover"])
     if meeting_info.get("resolved"):
-        lines.append("- 회의 중 진행자가 이미 확인하고 처리한 애매한 점(이 애매함 때문에 다시 ambiguous로 판정하지 마라. "
-                     "같은 안건에 다른 애매함이 남아 있을 때만 판정한다):")
+        lines.append("- 회의 중 진행자가 이미 확인하고 처리한 애매한 점(안건과 원문 구절이 모두 일치할 때만 다시 묻지 마라. "
+                     "같은 안건의 다른 애매함이나 같은 표현을 쓴 다른 안건은 따로 판단하라):")
         lines.extend("  · %s" % row for row in meeting_info["resolved"])
     return "\n" + "\n".join(lines) + "\n"
 
@@ -677,7 +677,7 @@ def compile_meeting(meeting):
     few_candidates = 0
     try:
         from . import live
-        ambiguous_count, few_candidates = _save_items(meeting, items, live.resolved_phrases(meeting))
+        ambiguous_count, few_candidates = _save_items(meeting, items, live.resolved_warning_quotes(meeting))
     except IntegrityError:
         # 진행자가 추출 버튼을 두 번 눌렀을 때. 위의 exists() 검사는 LLM 호출(수 초) 앞에
         # 있으므로 두 요청이 모두 빈 상태를 보고 통과해 같은 order를 쓰려 한다. 먼저 저장한
@@ -713,16 +713,16 @@ def _looks_deferred(item):
     return any(phrase in item["evidence"] for phrase in DEFERRAL_PHRASES)
 
 
-def _save_items(meeting, items, resolved_phrases=()):
+def _save_items(meeting, items, resolved_quotes=()):
     """응답 항목들을 Decision/Interpretation으로 저장하고 (확인 필요 수, 후보 없는 수)를 돌려준다.
 
-    resolved_phrases는 실시간 세션에서 진행자가 '처리됨'으로 체크한 애매한 표현이다(_resolve_item 참고).
+    resolved_quotes는 진행자가 '처리됨'을 누른 안건과 그 인용 구절이다.
     """
     ambiguous_count = 0
     few_candidates = 0
     with transaction.atomic():
         for order, item in enumerate(items):
-            warnings, divergence_reason, final_text, candidates, draft_hint = _resolve_item(item, resolved_phrases)
+            warnings, divergence_reason, final_text, candidates, draft_hint = _resolve_item(item, resolved_quotes)
             decision = Decision.objects.create(
                 meeting=meeting, order=order, what=item["topic"],
                 warnings=warnings, divergence_reason=divergence_reason, impact=item["impact"],
@@ -746,15 +746,18 @@ def _save_items(meeting, items, resolved_phrases=()):
     return ambiguous_count, few_candidates
 
 
-def _drop_resolved(warnings, resolved_phrases):
-    """규칙 경고 중 회의 중에 이미 처리한 표현을 짚는 것은 뺀다.
-
-    경고 끝의 인용 표현(예: "…모호한 표현이 있어요: '다음 주쯤'")이 처리한 애매한 표현 안에 들어 있으면, 진행자가
-    회의 중에 그 자리에서 확인하고 넘어간 것이다. 날짜·숫자 충돌처럼 인용이 없는 경고는 그대로 둔다.
-    """
-    if not resolved_phrases:
+def _drop_resolved(warnings, item, resolved_quotes):
+    """같은 안건의 같은 원문에서 진행자가 처리한 문구만 경고에서 뺀다."""
+    if not warnings or not resolved_quotes:
         return warnings
-    squashed = [decision_checks.squash(phrase) for phrase in resolved_phrases]
+    topic = decision_checks.squash(item["topic"])
+    evidence = decision_checks.squash_transcript(item["evidence"])
+    squashed = [
+        decision_checks.squash_transcript(quote)
+        for resolved_topic, quote in resolved_quotes
+        if decision_checks.squash(resolved_topic) == topic
+        and decision_checks.quote_in_source(quote, evidence)
+    ]
     kept = []
     for warning in warnings:
         match = _QUOTED_PHRASE.search(warning)
@@ -765,7 +768,7 @@ def _drop_resolved(warnings, resolved_phrases):
     return kept
 
 
-def _resolve_item(item, resolved_phrases=()):
+def _resolve_item(item, resolved_quotes=()):
     """응답 항목 하나 → (warnings, divergence_reason, final_text, candidates, draft_hint).
 
     네 갈래다.
@@ -795,7 +798,7 @@ def _resolve_item(item, resolved_phrases=()):
             return [], "근거를 원문에서 확인하지 못했어요", "", [], _draft_hint_text(unverified)
         candidates = [{"text": unverified, "evidence": "", "recommended": False}] if unverified else []
         return [], "근거를 원문에서 확인하지 못했어요", "", candidates, ""
-    warnings = _drop_resolved(safety_warnings(item["final"], item["evidence"]), resolved_phrases)
+    warnings = _drop_resolved(safety_warnings(item["final"], item["evidence"]), item, resolved_quotes)
     if not warnings:
         return [], "", item["final"], [], ""
     draft_hint = (

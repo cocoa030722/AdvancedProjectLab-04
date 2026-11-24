@@ -709,13 +709,13 @@ def resolved_flag_texts(meeting):
     """회의 중 진행자가 '처리됨'으로 체크한 애매한 점 — 결정 추출이 다시 문제 삼지 않게 넘긴다. 잘못 짚었다고 지운 것은
     처리한 것이 아니라서 넣지 않는다."""
     return [
-        "%s — %s" % (flag.phrase, flag.reason)
+        "%s%s — %s" % ("[%s] " % flag.topic if flag.topic else "", flag.phrase, flag.reason)
         for flag in _resolved(meeting).order_by("created_at", "id")
     ]
 
 
-def resolved_phrases(meeting):
-    return list(_resolved(meeting).values_list("phrase", flat=True))
+def resolved_warning_quotes(meeting):
+    return list(_resolved(meeting).exclude(topic="").values_list("topic", "phrase"))
 
 
 def _resolved(meeting):
