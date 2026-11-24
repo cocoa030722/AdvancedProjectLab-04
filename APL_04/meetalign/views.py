@@ -472,16 +472,8 @@ def live_session(request, meeting_id, session_id):
     meeting, session = _live_session(request, meeting_id, session_id)
     last_chunk = session.chunks.order_by("-seq").first()
     last = last_chunk.seq if last_chunk else None
-    recording_elsewhere = False
-    if session.status == LiveSession.STATUS_RECORDING and last_chunk is not None:
-        recent = (timezone.now() - last_chunk.created_at).total_seconds() <= live.chunk_seconds() * 2 + 5
-        if recent:
-            # 다른 화면(탭)이 지금도 조각을 올리고 있다 — 그 녹음을 멈추지 않는다.
-            recording_elsewhere = True
-        else:
-            # 진행자가 녹음 중에 화면을 떠났다. 녹음은 화면이 열려 있을 때만 되므로 일시정지로 돌려 둔다.
-            LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_PAUSED)
-            session.status = LiveSession.STATUS_PAUSED
+    _pause_if_stalled(session)
+    recording_elsewhere = session.status == LiveSession.STATUS_RECORDING and last_chunk is not None
     return render(request, "meetalign/live.html", {
         "meeting": meeting, "session": session, "is_host": meeting.host_id == request.user.id,
         "started": last_chunk is not None,

@@ -6628,6 +6628,18 @@ class LiveSessionTests(TestCase):
 
     # ---- 시작과 권한 ----
 
+    def test_viewing_a_just_resumed_session_does_not_pause_it(self):
+        session = self._start()
+        self._chunk(session, 0, "첫 발언")
+        session.chunks.update(created_at=timezone.now() - timedelta(minutes=2))
+        url = self._url("live_control", session)
+        self.client.post(url, {"action": "pause"})
+        self.client.post(url, {"action": "resume"})
+
+        self.assertEqual(self.member_client.get(self._url("live_session", session)).status_code, 200)
+        session.refresh_from_db()
+        self.assertEqual(session.status, LiveSession.STATUS_RECORDING)
+
     def test_host_starts_a_session_and_lands_on_the_live_page(self):
         r = self.client.post(reverse("live_start", args=[self.meeting.id]))
         session = self.meeting.live_sessions.get()
