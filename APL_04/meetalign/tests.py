@@ -7125,7 +7125,7 @@ class LiveSessionTests(TestCase):
         # 지운 것은 처리한 것이 아니다 — 결정 추출에 '처리한 애매한 점'으로 넘기지 않는다.
         LiveFlag.objects.filter(pk=flag.pk).update(resolved=True)
         self.assertEqual(live.resolved_flag_texts(self.meeting), [])
-        self.assertEqual(live.resolved_phrases(self.meeting), [])
+        self.assertEqual(live.resolved_warning_quotes(self.meeting), [])
 
     def test_ticking_a_flag_repaints_it_at_once(self):
         """누른 체크박스에 초점이 남아 목록을 다시 그리지 않아, 처리됨 표시가 다른 곳을 누를 때까지 안 보였다."""
@@ -7187,7 +7187,7 @@ class LiveSessionTests(TestCase):
         self.client.post(url, {"resolved": "1"})  # 진행자가 직접 체크하면 결정 추출에 '처리함'으로 넘긴다
         flag.refresh_from_db()
         self.assertEqual((flag.resolved, flag.resolved_auto, flag.resolved_by), (True, False, self.host))
-        self.assertEqual(live.resolved_flag_texts(self.meeting), ["이따 단톡에서 정해요 — 장소를 정해 주세요"])
+        self.assertEqual(live.resolved_flag_texts(self.meeting), ["[회의 장소] 이따 단톡에서 정해요 — 장소를 정해 주세요"])
 
     def test_settled_is_read_from_broken_json_too(self):
         flag = LiveFlag(id=7, phrase="p", reason="r")
@@ -7383,11 +7383,17 @@ class LiveSessionTests(TestCase):
         # 처리한 표현은 '회의정보' 출처로 인정하지 않는다.
         self.assertNotIn("다음 주쯤", decision_compiler._info_text(info))
 
-    def test_rule_warnings_about_a_resolved_phrase_are_dropped(self):
-        warnings = ["확정 문장에 모호한 표현이 있어요: '쯤'", "확정 문장에 다른 날짜가 섞여 있어요: 5일, 7일"]
-        self.assertEqual(decision_compiler._drop_resolved(warnings, ["다음 주쯤"]),
-                         ["확정 문장에 다른 날짜가 섞여 있어요: 5일, 7일"])
-        self.assertEqual(decision_compiler._drop_resolved(warnings, []), warnings)
+    def test_resolved_warning_only_applies_to_the_same_topic_and_evidence(self):
+        vague = "확정 문장에 모호한 표현이 있어요: '쯤'"
+        clash = "확정 문장에 다른 날짜가 섞여 있어요: 5일, 7일"
+        warnings = [vague, clash]
+        resolved = [("서버 배포", "다음 주쯤")]
+        item = {"topic": "서버 배포", "evidence": "서버 배포는 다음 주쯤 합니다."}
+        self.assertEqual(decision_compiler._drop_resolved(warnings, item, resolved), [clash])
+        self.assertEqual(decision_compiler._drop_resolved(
+            warnings, dict(item, topic="문서 검토"), resolved), warnings)
+        self.assertEqual(decision_compiler._drop_resolved(
+            warnings, dict(item, evidence="서버 배포는 오후쯤 합니다."), resolved), warnings)
 
     # ---- 종료 ----
 
