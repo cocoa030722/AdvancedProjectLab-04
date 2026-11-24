@@ -374,7 +374,7 @@
       document.getElementById("live-delay-row").hidden = true;
       var controls = document.getElementById("live-controls");
       if (controls) controls.hidden = true;
-      endedDetail.textContent = state.error ? "녹음을 등록하지 못했습니다: " + state.error
+      endedDetail.textContent = state.error ? (state.recording_ready ? "녹음을 일부 등록했습니다. " : "녹음을 등록하지 못했습니다. ") + state.error
         : state.meeting_ended ? "회의가 종료되어 녹음을 회의 화면에서 통합 전사본과 회의록으로 만들고 있어요."
         : state.recording_ready ? "녹음이 회의 화면의 '회의 파일'에 '실시간 녹음'으로 등록됐어요. 회의 화면에서 '제출하고 회의록 만들기'를 누르면 통합 전사본과 회의록을 만들고, 그 뒤 결정 확인에서 세세한 애매함을 다시 살펴봅니다."
         : "녹음을 하나로 합치는 중입니다.";

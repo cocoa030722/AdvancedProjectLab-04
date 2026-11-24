@@ -252,11 +252,12 @@ def _participant_context(meeting, user):
     live_paused = live_started and live_active.status == LiveSession.STATUS_PAUSED
     is_host = meeting.host_id == user.id
     live_banner = live_started and (live_paused or not is_host)
+    live_recordings = dict(meeting.live_sessions.exclude(recording=None).values_list("recording_id", "error"))
     context = {"live_active": live_active, "live_started": live_started, "live_paused": live_paused,
                "live_banner": live_banner, "host_id": meeting.host_id,
                # 회의 파일 목록에서 '실시간 녹음'으로 표시할 녹음(실시간 세션을 끝내며 조각을 합친 것).
-               "live_recording_ids": set(meeting.live_sessions.exclude(recording=None)
-                                         .values_list("recording_id", flat=True))}
+               "live_recording_ids": set(live_recordings),
+               "live_partial_recording_ids": {recording_id for recording_id, warning in live_recordings.items() if warning}}
     if meeting.host_id != user.id:
         return {"team_members": [], "participant_ids": set(), **context}
     return {

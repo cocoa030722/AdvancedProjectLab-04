@@ -95,6 +95,7 @@
             <div class="item-text">
               <span class="title">{{ rec.filename }}</span>
               <span class="badge kind">{% if rec.id in live_recording_ids %}실시간 녹음{% elif rec.is_text %}텍스트 파일{% else %}녹음 파일{% endif %}</span>
+              {% if rec.id in live_partial_recording_ids %}<span class="badge failed">녹음 일부 누락</span>{% endif %}
               {% if rec.status == "processing" %}<span class="badge processing">{% if rec.is_text %}읽는 중{% else %}글로 옮기는 중{% endif %}</span>
               {% elif rec.status == "done" %}<span class="badge done">완료</span>
               {% elif rec.status == "ready" %}<span class="badge">등록됨 · 제출하면 전사</span>

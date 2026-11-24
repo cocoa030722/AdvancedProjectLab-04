@@ -7566,8 +7566,9 @@ class LiveSessionTests(TestCase):
             handle.write(_wav_bytes(0.5))
         with open(broken, "wb") as handle:
             handle.write(b"not audio")
-        seconds = services.merge_audio_to_wav([good, broken, good], os.path.join(folder, "out.wav"))
+        seconds, skipped = services.merge_audio_to_wav([good, broken, good], os.path.join(folder, "out.wav"))
         self.assertAlmostEqual(seconds, 1.0, places=1)
+        self.assertEqual(skipped, 1)
         with self.assertRaises(RuntimeError):
             services.merge_audio_to_wav([broken], os.path.join(folder, "none.wav"))
 
