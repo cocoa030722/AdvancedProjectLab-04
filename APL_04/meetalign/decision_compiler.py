@@ -412,7 +412,7 @@ def _compile_prompt(source, meeting_info=None):
 def _generate_parsed(prompt, parser, what_failed):
     """프롬프트를 보내고 파싱까지 성공할 때까지 최대 (1 + PARSE_RETRIES)번 시도한다.
 
-    - 연결 실패(OSError)와 응답 언어 오류는 None을 돌려준다 → 호출자가 가짜 응답으로 대체.
+    - 연결 실패(OSError)와 응답 언어 오류는 원인을 알리고 추출을 중단한다.
     - 연결은 됐는데 형식이 재시도 후에도 안 맞으면 DecisionCompileError를 올린다 — 읽을 수
       있는 결정이 하나도 없으면 화면에 보여줄 게 없으므로 회의 단위로 실패시키고 진행자에게
       사유를 띄운다. 항목 하나의 형식이 틀린 경우는 parse_items가 그 항목만 비워서 넘긴다.
@@ -420,10 +420,10 @@ def _generate_parsed(prompt, parser, what_failed):
     for _ in range(PARSE_RETRIES + 1):
         try:
             raw = services._generate_clean(prompt)
-        except OSError:
-            return None
+        except OSError as error:
+            raise DecisionCompileError("AI에 연결하지 못했습니다. 잠시 뒤 다시 시도해 주세요.") from error
         if raw is None:
-            return None
+            raise DecisionCompileError("AI 응답의 언어를 확인해 주세요. 잠시 뒤 다시 시도해 주세요.")
         parsed = parser(raw)
         if parsed:
             return parsed
@@ -433,20 +433,20 @@ def _generate_parsed(prompt, parser, what_failed):
 
 
 def compile_specs(source, meeting=None):
-    """녹취 원문 → [응답 항목, ...]. LLM이 없거나 연결이 안 되면 가짜 응답을 돌려준다.
+    """녹취 원문 → [응답 항목, ...]. LLM을 설정하지 않은 시연 환경에서는 가짜 응답을 돌려준다.
 
     meeting을 주면 회의 정보(날짜·참석자·마감일·이월 안건)를 프롬프트에 함께 보내고, AI가 채운
     값의 출처를 그 정보와 대조한다.
     """
     meeting_info = collect_meeting_info(meeting) if meeting is not None else None
-    if not (services._enabled() and source):
+    if not services._enabled():
         return parse_items(json.dumps(FAKE_DECISIONS))
+    if not source.strip():
+        raise DecisionCompileError("결정을 추출할 녹취 원문이 없습니다.")
     items = _generate_parsed(
         _compile_prompt(source, meeting_info),
         lambda raw: parse_items(raw, source_text=source, meeting_info=meeting_info), "결정",
     )
-    if items is None:
-        return parse_items(json.dumps(FAKE_DECISIONS))
     # 확인이 필요한 항목의 추천 문장은 별도 호출로 쓰고(decision_recommend), 진행자에게 내보내기 전에
     # 되짚는다(검증 → 1회 재생성 → 폐기). 가짜 응답 경로에는 붙이지 않는다 — LLM이 없어 쓸 수 없고,
     # 가짜 모드는 화면 시연용이라 FAKE_DECISIONS에 추천 문장이 이미 들어 있다.
