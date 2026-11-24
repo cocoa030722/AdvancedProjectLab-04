@@ -168,6 +168,13 @@ def _text_warnings(text, where, phrases=AMBIGUOUS_PHRASES):
     return found
 
 
+# 원문이 미확정이라고 명시하면 그 말을 인용한 문장을 공개 전에 확인한다.
+_UNSETTLED_EVIDENCE = re.compile(
+    r"(?:정해지지|확정되지|정하지|확정하지|합의하지)\s*(?:않|못)"
+    r"|(?:담당자?|기한|일정|범위|기준)\s*(?:(?:은|는|이|가)\s*)?미정"
+)
+
+
 def safety_warnings(final_text, evidence):
     """AI가 '명확'이라고 한 항목을 되짚는 규칙 안전망. 사유 목록을 돌려준다.
 
@@ -188,6 +195,8 @@ def safety_warnings(final_text, evidence):
         _text_warnings(final_text, "확정 문장", AMBIGUOUS_PHRASES + REFERENT_PHRASES)
         + _text_warnings(evidence, "원문")
     )
+    if _UNSETTLED_EVIDENCE.search(evidence):
+        found.append("원문에서 아직 정해지지 않았다고 했어요. 확정 문장을 확인해 주세요.")
     seen = []
     phrases_taken = set()
     for warning in found:

@@ -2023,6 +2023,17 @@ class DecisionWarningTests(TestCase):
 
     # ---- 확정 문장에 남은 지시어(REFERENT_PHRASES) ----
 
+    def test_safety_flags_a_final_with_explicitly_unsettled_evidence(self):
+        for evidence in ("QA 담당은 아직 정해지지 않았습니다.", "QA 담당은 미정입니다."):
+            self.assertEqual(
+                decision_compiler.safety_warnings("민수가 QA를 맡는다.", evidence),
+                ["원문에서 아직 정해지지 않았다고 했어요. 확정 문장을 확인해 주세요."],
+            )
+        self.assertEqual(
+            decision_compiler.safety_warnings("민수가 QA를 맡는다.", "민수가 QA를 맡기로 했습니다."),
+            [],
+        )
+
     def test_safety_catches_a_referent_left_in_the_final_text(self):
         """담당자는 … 해당 분에게 넘긴다"처럼, 확정 문장이 실제로 이름을 못 정한 경우."""
         self.assertEqual(
