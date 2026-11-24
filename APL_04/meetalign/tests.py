@@ -7414,6 +7414,22 @@ class LiveSessionTests(TestCase):
         self.assertContains(self.client.get(self._url("live_session", session)), "실시간 녹음이 끝났습니다")
         self.assertContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "등록됨 · 제출하면 전사")
 
+    def test_host_can_retry_a_failed_live_recording_merge(self):
+        session = self._start()
+        self._chunk(session, 0, "첫 발언")
+        url = self._url("live_control", session)
+        with patch.object(services, "merge_audio_to_wav", side_effect=RuntimeError("합치기 실패")):
+            self.client.post(url, {"action": "end"})
+        self.assertTrue(self._state(session)["can_retry_merge"])
+
+        self.assertEqual(self.client.post(url, {"action": "retry_merge"}).status_code, 200)
+        state = self._state(session)
+        self.assertTrue(state["recording_ready"])
+        self.assertFalse(state["can_retry_merge"])
+        self.assertEqual(state["error"], "")
+        self.assertEqual(self.client.post(url, {"action": "retry_merge"}).status_code, 409)
+        self.assertEqual(self.meeting.recordings.count(), 1)
+
     def test_submitting_processes_the_registered_recording_with_new_uploads(self):
         session = self._start()
         self._chunk(session, 0, "앞")

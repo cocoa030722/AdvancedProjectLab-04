@@ -650,6 +650,11 @@ def _finish(session_id):
             _finishing.discard(session_id)
 
 
+def is_finishing(session_id):
+    with _lock:
+        return session_id in _finishing
+
+
 def finish(session, wait=False):
     """세션을 끝내고 조각을 합쳐 녹음으로 등록한다. 이미 합치는 중이거나 합쳤으면 아무것도 하지 않는다.
     wait면 백그라운드로 넘기지 않고 이 자리에서 합친다(회의 종료 — views._end_live_sessions)."""

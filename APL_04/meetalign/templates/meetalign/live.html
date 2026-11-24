@@ -47,6 +47,7 @@
   <div id="live-ended" class="notice"{% if session.is_active %} hidden{% endif %}>
     <span><b>실시간 녹음이 끝났습니다.</b> <span id="live-ended-detail">녹음을 하나로 합치는 중입니다.</span>
       <a href="{% url 'meeting_detail' meeting.id %}">회의 화면으로 가기</a></span>
+  {% if is_host %}<button type="button" id="live-retry-merge" class="btn sm secondary" hidden>녹음 다시 합치기</button>{% endif %}
   </div>
 
   {% comment %}
@@ -169,6 +170,7 @@
   var statusLabel = document.getElementById("live-status-label");
   var endedBox = document.getElementById("live-ended");
   var endedDetail = document.getElementById("live-ended-detail");
+  var retryMerge = document.getElementById("live-retry-merge");
   var STATUS_LABELS = { recording: "녹음 중", paused: "일시정지", ended: "종료" };
   var nextSeq = parseInt(root.dataset.nextSeq, 10) || 0;
   // 회의 기록 칸에 쌓은 마지막 조각 순번. 상태를 물을 때 보내서 그 뒤 줄만 받는다.
@@ -184,6 +186,22 @@
     if (!(data instanceof FormData)) Object.keys(data || {}).forEach(function (k) { body.append(k, data[k]); });
     return fetch(url, { method: "POST", body: body, headers: { "X-CSRFToken": csrf }, credentials: "same-origin",
                         keepalive: !!keepalive });
+  }
+
+  if (retryMerge) {
+    retryMerge.addEventListener("click", function () {
+      retryMerge.disabled = true;
+      post(root.dataset.controlUrl, { action: "retry_merge" }).then(function (response) {
+        if (!response.ok) throw new Error("retry failed");
+        return fetch(stateUrl(), { credentials: "same-origin" });
+      }).then(function (response) {
+        if (response.ok) return response.json().then(render);
+      }).catch(function () {
+        endedDetail.textContent = "녹음을 다시 합치지 못했습니다. 잠시 뒤 다시 시도해 주세요.";
+      }).finally(function () {
+        retryMerge.disabled = false;
+      });
+    });
   }
 
   // 애매함 분석 상태 표시(views._live_state의 analysis — live.analysis_status).
@@ -365,6 +383,7 @@
       }
     }
     if (state.status === "ended") {
+      if (retryMerge) retryMerge.hidden = !state.can_retry_merge;
       // 진행자 화면도 끝난 것으로 그린다 — 다른 화면에서 끝냈거나 회의를 종료했으면 이 화면은 아직 일시정지로 알고 있다.
       status = "ended";
       statusLabel.textContent = STATUS_LABELS.ended;
@@ -378,6 +397,7 @@
         : state.meeting_ended ? "회의가 종료되어 녹음을 회의 화면에서 통합 전사본과 회의록으로 만들고 있어요."
         : state.recording_ready ? "녹음이 회의 화면의 '회의 파일'에 '실시간 녹음'으로 등록됐어요. 회의 화면에서 '제출하고 회의록 만들기'를 누르면 통합 전사본과 회의록을 만들고, 그 뒤 결정 확인에서 세세한 애매함을 다시 살펴봅니다."
         : "녹음을 하나로 합치는 중입니다.";
+      if (state.recording_finishing) endedDetail.textContent = "녹음을 하나로 합치는 중입니다.";
     }
   }
 
