@@ -2605,11 +2605,19 @@ class DecisionCompileTests(TestCase):
             with self.assertRaises(decision_compiler.DecisionCompileError):
                 decision_compiler.compile_meeting(self.meeting)
 
-    def test_connection_failure_falls_back_to_the_fake_response(self):
-        # 연결 실패는 실패 표시 대신 가짜 응답으로 흐름을 잇는다.
-        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", side_effect=OSError("연결 실패")):
-            summary = decision_compiler.compile_meeting(self.meeting)
-        self.assertEqual(summary["decisions"], len(decision_compiler.FAKE_DECISIONS))
+    def test_connection_failure_leaves_no_decisions(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(
+                services, "_generate", side_effect=OSError("연결 실패")):
+            with self.assertRaisesMessage(decision_compiler.DecisionCompileError, "AI에 연결하지 못했습니다"):
+                decision_compiler.compile_meeting(self.meeting)
+        self.assertFalse(self.meeting.decisions.exists())
+
+    def test_unusable_language_leaves_no_decisions(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(
+                services, "_generate_clean", return_value=None):
+            with self.assertRaisesMessage(decision_compiler.DecisionCompileError, "AI 응답의 언어"):
+                decision_compiler.compile_meeting(self.meeting)
+        self.assertFalse(self.meeting.decisions.exists())
 
     def test_fake_mode_runs_the_whole_flow_without_any_llm(self):
         with patch.dict(os.environ, {}, clear=True):
