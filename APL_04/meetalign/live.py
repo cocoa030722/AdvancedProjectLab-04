@@ -627,7 +627,7 @@ def _finish(session_id):
         with tempfile.TemporaryDirectory(prefix="meetalign-live-") as out_dir:
             merged = os.path.join(out_dir, name)
             try:
-                services.merge_audio_to_wav(paths, merged)
+                _, skipped = services.merge_audio_to_wav(paths, merged)
             except RuntimeError as error:
                 LiveSession.objects.filter(pk=session_id).update(error=str(error)[:300])
                 return
@@ -636,7 +636,10 @@ def _finish(session_id):
                 recording = Recording(meeting=session.meeting, status=Recording.STATUS_READY,
                                       speaker_count=session.speaker_count)
                 recording.file.save(name, File(handle), save=True)
-        LiveSession.objects.filter(pk=session_id).update(recording=recording, error="")
+        warning = "읽지 못한 녹음 조각 %d개가 빠졌습니다." % skipped if skipped else ""
+        LiveSession.objects.filter(pk=session_id).update(recording=recording, error=warning)
+        if skipped:
+            return  # 일부만 등록된 경우 복구에 쓸 원본 조각을 보관한다.
         # 합친 녹음이 생겼으니 조각 파일은 지운다(녹취 글은 남긴다 — 회의 중 화면 기록).
         for chunk in session.chunks.all():
             if chunk.file:
@@ -648,6 +651,11 @@ def _finish(session_id):
     finally:
         with _lock:
             _finishing.discard(session_id)
+
+
+def is_finishing(session_id):
+    with _lock:
+        return session_id in _finishing
 
 
 def finish(session, wait=False):
@@ -706,13 +714,13 @@ def resolved_flag_texts(meeting):
     """회의 중 진행자가 '처리됨'으로 체크한 애매한 점 — 결정 추출이 다시 문제 삼지 않게 넘긴다. 잘못 짚었다고 지운 것은
     처리한 것이 아니라서 넣지 않는다."""
     return [
-        "%s — %s" % (flag.phrase, flag.reason)
+        "%s%s — %s" % ("[%s] " % flag.topic if flag.topic else "", flag.phrase, flag.reason)
         for flag in _resolved(meeting).order_by("created_at", "id")
     ]
 
 
-def resolved_phrases(meeting):
-    return list(_resolved(meeting).values_list("phrase", flat=True))
+def resolved_warning_quotes(meeting):
+    return list(_resolved(meeting).exclude(topic="").values_list("topic", "phrase"))
 
 
 def _resolved(meeting):

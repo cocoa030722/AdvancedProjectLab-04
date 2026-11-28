@@ -1,10 +1,14 @@
+import mimetypes
 import os
+import re
 
 from django.contrib.auth import login, logout
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db import transaction
-from django.http import FileResponse, Http404, HttpResponse, HttpResponseBadRequest, JsonResponse
+from django.http import (
+    FileResponse, Http404, HttpResponse, HttpResponseBadRequest, JsonResponse, StreamingHttpResponse,
+)
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.shortcuts import get_object_or_404, redirect, render
@@ -252,11 +256,12 @@ def _participant_context(meeting, user):
     live_paused = live_started and live_active.status == LiveSession.STATUS_PAUSED
     is_host = meeting.host_id == user.id
     live_banner = live_started and (live_paused or not is_host)
+    live_recordings = dict(meeting.live_sessions.exclude(recording=None).values_list("recording_id", "error"))
     context = {"live_active": live_active, "live_started": live_started, "live_paused": live_paused,
                "live_banner": live_banner, "host_id": meeting.host_id,
                # 회의 파일 목록에서 '실시간 녹음'으로 표시할 녹음(실시간 세션을 끝내며 조각을 합친 것).
-               "live_recording_ids": set(meeting.live_sessions.exclude(recording=None)
-                                         .values_list("recording_id", flat=True))}
+               "live_recording_ids": set(live_recordings),
+               "live_partial_recording_ids": {recording_id for recording_id, warning in live_recordings.items() if warning}}
     if meeting.host_id != user.id:
         return {"team_members": [], "participant_ids": set(), **context}
     return {
@@ -372,11 +377,51 @@ def meeting_result(request, meeting_id):
     return render(request, "meetalign/meeting_result.html", {"meeting": meeting})
 
 
+# 파일의 일부만 달라는 요청(Range: bytes=0-1 같은). 아이폰·아이패드 사파리는 소리 파일을 재생하기 전에 꼭 한 번
+# 물어보고, 전체를 한 번에 주면 재생하지 않고 플레이어에 '오류'를 띄운다. Django의 FileResponse는 이 요청을 모르므로
+# 여기서 잘라서 돌려준다. 되감기(중간부터 듣기)도 이 응답으로 동작한다.
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+def _file_part(handle, length, block=64 * 1024):
+    """파일에서 length 바이트만 조금씩 읽어 보낸다 — 긴 녹음을 통째로 메모리에 올리지 않게."""
+    while length > 0:
+        data = handle.read(min(block, length))
+        if not data:
+            break
+        length -= len(data)
+        yield data
+
+
 @login_required
 def recording_file(request, meeting_id, recording_id):
     meeting = _meeting(request, meeting_id)
     recording = get_object_or_404(Recording, pk=recording_id, meeting=meeting)
-    return FileResponse(recording.file.open("rb"), filename=recording.filename)
+    size = recording.file.size
+    match = RANGE_RE.match(request.headers.get("Range", "").strip())
+    if not match:
+        response = FileResponse(recording.file.open("rb"), filename=recording.filename)
+        response["Accept-Ranges"] = "bytes"  # 범위로 달라고 해도 된다고 브라우저에 알린다
+        return response
+    first, last = match.group(1), match.group(2)
+    if first:
+        start, end = int(first), min(int(last), size - 1) if last else size - 1
+    else:
+        start, end = max(0, size - int(last or 0)), size - 1  # bytes=-500 — 끝에서 500바이트
+    if start >= size or start > end:
+        response = HttpResponse(status=416)
+        response["Content-Range"] = "bytes */%d" % size
+        return response
+    handle = recording.file.open("rb")
+    handle.seek(start)
+    response = StreamingHttpResponse(
+        _file_part(handle, end - start + 1), status=206,
+        content_type=mimetypes.guess_type(recording.filename)[0] or "application/octet-stream",
+    )
+    response["Content-Length"] = end - start + 1
+    response["Content-Range"] = "bytes %d-%d/%d" % (start, end, size)
+    response["Accept-Ranges"] = "bytes"
+    return response
 
 
 @login_required
@@ -471,16 +516,8 @@ def live_session(request, meeting_id, session_id):
     meeting, session = _live_session(request, meeting_id, session_id)
     last_chunk = session.chunks.order_by("-seq").first()
     last = last_chunk.seq if last_chunk else None
-    recording_elsewhere = False
-    if session.status == LiveSession.STATUS_RECORDING and last_chunk is not None:
-        recent = (timezone.now() - last_chunk.created_at).total_seconds() <= live.chunk_seconds() * 2 + 5
-        if recent:
-            # 다른 화면(탭)이 지금도 조각을 올리고 있다 — 그 녹음을 멈추지 않는다.
-            recording_elsewhere = True
-        else:
-            # 진행자가 녹음 중에 화면을 떠났다. 녹음은 화면이 열려 있을 때만 되므로 일시정지로 돌려 둔다.
-            LiveSession.objects.filter(pk=session.pk).update(status=LiveSession.STATUS_PAUSED)
-            session.status = LiveSession.STATUS_PAUSED
+    _pause_if_stalled(session)
+    recording_elsewhere = session.status == LiveSession.STATUS_RECORDING and last_chunk is not None
     return render(request, "meetalign/live.html", {
         "meeting": meeting, "session": session, "is_host": meeting.host_id == request.user.id,
         "started": last_chunk is not None,
@@ -536,6 +573,7 @@ def _live_state(session, after=-1):
     flags = list(session.flags.filter(dismissed=False))
     _pause_if_stalled(session, chunks)
     lines_until = _lines_until(chunks)
+    finishing = live.is_finishing(session.id)
     return {
         "status": session.status,
         # 녹음한 조각이 있는가 — 없으면 화면은 '녹음 중'·'일시정지' 대신 '녹음 시작 전'을 보인다.
@@ -560,6 +598,9 @@ def _live_state(session, after=-1):
         # 애매함 분석 진행 — 화면이 "판단 중", "대기 중 · n초 남음" 같은 표시를 보여 준다(live.analysis_status).
         "analysis": {**live.analysis_status(session), "interval": live.analyze_interval(session)},
         "recording_ready": bool(session.recording_id),
+        "recording_finishing": finishing,
+        "can_retry_merge": not session.is_active and not session.recording_id and not finishing
+                           and any(chunk.file for chunk in chunks),
         # 회의 종료로 세션이 끝났으면 합친 녹음은 이미 처리 중이다 — 화면이 '제출하라'고 안내하지 않게.
         "meeting_ended": Meeting.objects.filter(pk=session.meeting_id, ended=True).exists(),
         "error": session.error,
@@ -617,6 +658,11 @@ def live_control(request, meeting_id, session_id):
     meeting, session = _live_session(request, meeting_id, session_id)
     _live_host_only(meeting, request.user)
     action = request.POST.get("action")
+    if action == "retry_merge":
+        if session.is_active or session.recording_id or not session.chunks.exclude(file="").exists():
+            return JsonResponse({"error": "다시 합칠 녹음이 없습니다."}, status=409)
+        live.finish(session)
+        return JsonResponse({"status": session.status})
     if not session.is_active:
         return JsonResponse({"status": session.status})
     recorder = request.POST.get("recorder", "")

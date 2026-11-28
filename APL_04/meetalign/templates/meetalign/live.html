@@ -47,6 +47,7 @@
   <div id="live-ended" class="notice"{% if session.is_active %} hidden{% endif %}>
     <span><b>실시간 녹음이 끝났습니다.</b> <span id="live-ended-detail">녹음을 하나로 합치는 중입니다.</span>
       <a href="{% url 'meeting_detail' meeting.id %}">회의 화면으로 가기</a></span>
+  {% if is_host %}<button type="button" id="live-retry-merge" class="btn sm secondary" hidden>녹음 다시 합치기</button>{% endif %}
   </div>
 
   {% comment %}
@@ -169,6 +170,7 @@
   var statusLabel = document.getElementById("live-status-label");
   var endedBox = document.getElementById("live-ended");
   var endedDetail = document.getElementById("live-ended-detail");
+  var retryMerge = document.getElementById("live-retry-merge");
   var STATUS_LABELS = { recording: "녹음 중", paused: "일시정지", ended: "종료" };
   var nextSeq = parseInt(root.dataset.nextSeq, 10) || 0;
   // 회의 기록 칸에 쌓은 마지막 조각 순번. 상태를 물을 때 보내서 그 뒤 줄만 받는다.
@@ -184,6 +186,22 @@
     if (!(data instanceof FormData)) Object.keys(data || {}).forEach(function (k) { body.append(k, data[k]); });
     return fetch(url, { method: "POST", body: body, headers: { "X-CSRFToken": csrf }, credentials: "same-origin",
                         keepalive: !!keepalive });
+  }
+
+  if (retryMerge) {
+    retryMerge.addEventListener("click", function () {
+      retryMerge.disabled = true;
+      post(root.dataset.controlUrl, { action: "retry_merge" }).then(function (response) {
+        if (!response.ok) throw new Error("retry failed");
+        return fetch(stateUrl(), { credentials: "same-origin" });
+      }).then(function (response) {
+        if (response.ok) return response.json().then(render);
+      }).catch(function () {
+        endedDetail.textContent = "녹음을 다시 합치지 못했습니다. 잠시 뒤 다시 시도해 주세요.";
+      }).finally(function () {
+        retryMerge.disabled = false;
+      });
+    });
   }
 
   // 애매함 분석 상태 표시(views._live_state의 analysis — live.analysis_status).
@@ -365,6 +383,7 @@
       }
     }
     if (state.status === "ended") {
+      if (retryMerge) retryMerge.hidden = !state.can_retry_merge;
       // 진행자 화면도 끝난 것으로 그린다 — 다른 화면에서 끝냈거나 회의를 종료했으면 이 화면은 아직 일시정지로 알고 있다.
       status = "ended";
       statusLabel.textContent = STATUS_LABELS.ended;
@@ -374,10 +393,11 @@
       document.getElementById("live-delay-row").hidden = true;
       var controls = document.getElementById("live-controls");
       if (controls) controls.hidden = true;
-      endedDetail.textContent = state.error ? "녹음을 등록하지 못했습니다: " + state.error
+      endedDetail.textContent = state.error ? (state.recording_ready ? "녹음을 일부 등록했습니다. " : "녹음을 등록하지 못했습니다. ") + state.error
         : state.meeting_ended ? "회의가 종료되어 녹음을 회의 화면에서 통합 전사본과 회의록으로 만들고 있어요."
         : state.recording_ready ? "녹음이 회의 화면의 '회의 파일'에 '실시간 녹음'으로 등록됐어요. 회의 화면에서 '제출하고 회의록 만들기'를 누르면 통합 전사본과 회의록을 만들고, 그 뒤 결정 확인에서 세세한 애매함을 다시 살펴봅니다."
         : "녹음을 하나로 합치는 중입니다.";
+      if (state.recording_finishing) endedDetail.textContent = "녹음을 하나로 합치는 중입니다.";
     }
   }
 
@@ -441,7 +461,7 @@
     // 조각 동안 소리 크기(RMS)가 이보다 한 번도 크지 않으면 조용한 조각으로 보고 전사하지 않는다(silent=1).
     // Whisper는 조용한 조각에서 다른 언어나 "시청해 주셔서 감사합니다" 같은 말을 지어낸다.
     var SILENT_RMS = 0.012;
-    var stream = null, recorder = null, chunkTimer = null, uploads = [];
+    var stream = null, recorder = null, chunkTimer = null, uploads = new Map();
     // 지금까지 녹음된 시간은 서버가 조각 길이를 더해 알려 준다 — 화면을 떠났다 돌아와도 시간이 이어진다.
     var elapsedMs = parseInt(root.dataset.recordedMs, 10) || 0, segmentStart = 0, tick = null;
     var hostInfo = document.getElementById("live-host-info");
@@ -553,31 +573,46 @@
     function extension(type) { return /ogg/.test(type) ? "ogg" : /mp4/.test(type) ? "m4a" : "webm"; }
 
     function upload(blob, seq, silent, durationMs) {
-      var tries = 0;
-      function send() {
-        var form = new FormData();
-        form.append("seq", String(seq));
-        form.append("recorder", recorderId);
-        if (silent) form.append("silent", "1");
-        form.append("duration_ms", String(Math.max(0, Math.round(durationMs || 0))));
-        form.append("chunk", blob, "chunk_" + seq + "." + extension(blob.type));
-        // 나가는 중이면 마지막 조각을 keepalive로 보낸다 — 작으면 화면이 닫혀도 끝까지 올라간다.
-        return post(root.dataset.chunkUrl, form, leaving && blob.size < 60000).then(function (r) {
-          if (r.status === 409) {
-            return r.json().catch(function () { return {}; }).then(function (data) {
-              if (data.error === "other_recorder") takenOver();
-            });  // 이미 끝난 세션이거나 다른 화면이 녹음을 맡았다
-          }
-          if (!r.ok) throw new Error("HTTP " + r.status);
-        }).catch(function (error) {
-          tries += 1;
-          if (tries >= 3) { showError("녹음 조각 하나를 올리지 못했습니다(" + error.message + "). 네트워크를 확인해 주세요."); return; }
-          return new Promise(function (resolve) { setTimeout(resolve, 1500 * tries); }).then(send);
-        });
-      }
-      var job = send();
-      uploads.push(job);
-      return job;
+      var entry = { failed: false, job: null, retry: null };
+      entry.retry = function () {
+        var tries = 0;
+        entry.failed = false;
+        function fail(message) {
+          entry.failed = true;
+          showError("녹음 조각을 올리지 못했습니다. " + message);
+          return false;
+        }
+        function send() {
+          var form = new FormData();
+          form.append("seq", String(seq));
+          form.append("recorder", recorderId);
+          if (silent) form.append("silent", "1");
+          form.append("duration_ms", String(Math.max(0, Math.round(durationMs || 0))));
+          form.append("chunk", blob, "chunk_" + seq + "." + extension(blob.type));
+          // 나가는 중에는 작은 마지막 조각을 keepalive로 보낸다.
+          return post(root.dataset.chunkUrl, form, leaving && blob.size < 60000).then(function (r) {
+            if (r.status === 409) {
+              return r.json().catch(function () { return {}; }).then(function (data) {
+                if (data.error === "other_recorder") takenOver();
+                return fail(data.error === "other_recorder"
+                  ? "다른 탭이 녹음 중입니다. 이 탭에서 이어서 녹음한 뒤 다시 시도해 주세요."
+                  : "세션 상태를 확인해 주세요.");
+              });
+            }
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            uploads.delete(seq);
+            return true;
+          }).catch(function () {
+            tries += 1;
+            if (tries >= 3) return fail("연결을 확인하고 녹음 종료를 다시 눌러 주세요.");
+            return new Promise(function (resolve) { setTimeout(resolve, 1500 * tries); }).then(send);
+          });
+        }
+        entry.job = send();
+        return entry.job;
+      };
+      uploads.set(seq, entry);
+      return entry.retry();
     }
 
     // 조각마다 녹음기를 새로 만든다. 하나의 녹음기에서 시간 단위로 잘라낸 데이터는 첫 조각에만 머리말이 있어 따로
@@ -594,12 +629,19 @@
       chunkPeak = 0;
       rec.addEventListener("dataavailable", function (e) { if (e.data && e.data.size) parts.push(e.data); });
       rec.addEventListener("stop", function () {
+        if (recorder === rec) recorder = null;
         var blob = new Blob(parts, { type: rec.mimeType || "audio/webm" });
+<<<<<<< HEAD
         if (blob.size > 0) upload(blob, nextSeq++, meterWorking() ? chunkPeak < SILENT_RMS : false,
           // 조각은 MAX_CHUNK_MS보다 길 수 없다 — 절전에서 깨어나면 시계가 뛰어 길이가 부풀므로 묶어 둔다.
           Math.min(Date.now() - startedAt, MAX_CHUNK_MS + 2000));
         if (mode === "recording") startChunk();
         else if (mode === "ending") finishEnd();
+=======
+        if (blob.size > 0) upload(blob, nextSeq++, meterWorking() ? chunkPeak < SILENT_RMS : false, Date.now() - startedAt);
+        if (!recorder && mode === "recording") startChunk();
+        else if (!recorder && mode === "ending") finishEnd();
+>>>>>>> origin/main
       });
       rec.start();
       chunkTimer = setTimeout(function () { if (rec.state === "recording") rec.stop(); }, MAX_CHUNK_MS);
@@ -643,8 +685,10 @@
 
     function stopCurrentChunk() {
       clearTimeout(chunkTimer);
-      if (recorder && recorder.state === "recording") { recorder.stop(); return true; }
-      return false;
+      if (!recorder) return false;
+      if (recorder.state === "recording") recorder.stop();
+      // stop()이 상태를 먼저 바꿔도 마지막 조각을 받는 stop 이벤트까지 기다린다.
+      return true;
     }
 
     function pauseRecording() {
@@ -668,7 +712,13 @@
     }
 
     function finishEnd() {
-      Promise.all(uploads).then(function () {
+      var pending = Array.from(uploads.values(), function (entry) {
+        return entry.failed ? entry.retry() : entry.job;
+      });
+      Promise.all(pending).then(function (results) {
+        if (results.includes(false)) {
+          throw new Error("아직 올리지 못한 녹음 조각이 있어요. 이 탭에서 녹음 종료를 다시 눌러 주세요.");
+        }
         return post(root.dataset.controlUrl, { action: "end", speaker_count: document.getElementById("live-speakers").value });
       }).then(function (r) {
         if (!r.ok) return r.json().then(function (data) { throw new Error(data.error || ("HTTP " + r.status)); });
@@ -696,7 +746,7 @@
     window.addEventListener("beforeunload", function (e) {
       if (mode === "recording") pauseForLeaving();
       // 일시정지한 뒤에도 묻는다 — 마지막 조각이 아직 올라가는 중일 수 있고, 실수로 나가는 것을 막는다.
-      if (mode === "paused" && leaving || mode === "ending") { e.preventDefault(); e.returnValue = ""; }
+      if ((mode === "paused" && leaving) || mode === "ending" || uploads.size > 0) { e.preventDefault(); e.returnValue = ""; }
     });
     if (!navigator.mediaDevices || !window.MediaRecorder) {
       toggleBtn.disabled = true;

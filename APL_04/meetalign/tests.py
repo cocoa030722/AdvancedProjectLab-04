@@ -1743,6 +1743,22 @@ class StuckAndFileAccessTests(TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(b"".join(r.streaming_content), b"RIFFDATA")
 
+    def test_recording_file_answers_range_requests(self):
+        """아이폰 사파리는 소리를 재생하기 전에 파일의 일부만 달라고 물어본다 — 206으로 그 조각만 돌려줘야 재생한다.
+        전체를 한 번에 주면 플레이어에 '오류'가 뜬다."""
+        rec = self._make_recording("a.wav", b"RIFFDATA")
+        url = reverse("recording_file", args=[self.meeting.id, rec.id])
+        r = self.client.get(url, HTTP_RANGE="bytes=0-3")
+        self.assertEqual(r.status_code, 206)
+        self.assertEqual(b"".join(r.streaming_content), b"RIFF")
+        self.assertEqual(r["Content-Range"], "bytes 0-3/8")
+        self.assertEqual(r["Content-Length"], "4")
+        self.assertEqual(self.client.get(url, HTTP_RANGE="bytes=4-").status_code, 206)
+        self.assertEqual(b"".join(self.client.get(url, HTTP_RANGE="bytes=-4").streaming_content), b"DATA")
+        # 범위를 묻지 않는 브라우저에는 전체를 주되, 범위로 물어도 된다고 알린다.
+        self.assertEqual(self.client.get(url)["Accept-Ranges"], "bytes")
+        self.assertEqual(self.client.get(url, HTTP_RANGE="bytes=99-").status_code, 416)
+
     def test_outsider_cannot_download_recording(self):
         rec = self._make_recording("a.wav", b"RIFF")
         outsider = User.objects.create_user("c", password="pw12345!")
@@ -2022,6 +2038,17 @@ class DecisionWarningTests(TestCase):
         )
 
     # ---- 확정 문장에 남은 지시어(REFERENT_PHRASES) ----
+
+    def test_safety_flags_a_final_with_explicitly_unsettled_evidence(self):
+        for evidence in ("QA 담당은 아직 정해지지 않았습니다.", "QA 담당은 미정입니다."):
+            self.assertEqual(
+                decision_compiler.safety_warnings("민수가 QA를 맡는다.", evidence),
+                ["원문에서 아직 정해지지 않았다고 했어요. 확정 문장을 확인해 주세요."],
+            )
+        self.assertEqual(
+            decision_compiler.safety_warnings("민수가 QA를 맡는다.", "민수가 QA를 맡기로 했습니다."),
+            [],
+        )
 
     def test_safety_catches_a_referent_left_in_the_final_text(self):
         """담당자는 … 해당 분에게 넘긴다"처럼, 확정 문장이 실제로 이름을 못 정한 경우."""
@@ -2605,11 +2632,19 @@ class DecisionCompileTests(TestCase):
             with self.assertRaises(decision_compiler.DecisionCompileError):
                 decision_compiler.compile_meeting(self.meeting)
 
-    def test_connection_failure_falls_back_to_the_fake_response(self):
-        # 연결 실패는 실패 표시 대신 가짜 응답으로 흐름을 잇는다.
-        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(services, "_generate", side_effect=OSError("연결 실패")):
-            summary = decision_compiler.compile_meeting(self.meeting)
-        self.assertEqual(summary["decisions"], len(decision_compiler.FAKE_DECISIONS))
+    def test_connection_failure_leaves_no_decisions(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(
+                services, "_generate", side_effect=OSError("연결 실패")):
+            with self.assertRaisesMessage(decision_compiler.DecisionCompileError, "AI에 연결하지 못했습니다"):
+                decision_compiler.compile_meeting(self.meeting)
+        self.assertFalse(self.meeting.decisions.exists())
+
+    def test_unusable_language_leaves_no_decisions(self):
+        with patch.dict(os.environ, {"OLLAMA_MODEL": "m1"}), patch.object(
+                services, "_generate_clean", return_value=None):
+            with self.assertRaisesMessage(decision_compiler.DecisionCompileError, "AI 응답의 언어"):
+                decision_compiler.compile_meeting(self.meeting)
+        self.assertFalse(self.meeting.decisions.exists())
 
     def test_fake_mode_runs_the_whole_flow_without_any_llm(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -6609,6 +6644,18 @@ class LiveSessionTests(TestCase):
 
     # ---- 시작과 권한 ----
 
+    def test_viewing_a_just_resumed_session_does_not_pause_it(self):
+        session = self._start()
+        self._chunk(session, 0, "첫 발언")
+        session.chunks.update(created_at=timezone.now() - timedelta(minutes=2))
+        url = self._url("live_control", session)
+        self.client.post(url, {"action": "pause"})
+        self.client.post(url, {"action": "resume"})
+
+        self.assertEqual(self.member_client.get(self._url("live_session", session)).status_code, 200)
+        session.refresh_from_db()
+        self.assertEqual(session.status, LiveSession.STATUS_RECORDING)
+
     def test_host_starts_a_session_and_lands_on_the_live_page(self):
         r = self.client.post(reverse("live_start", args=[self.meeting.id]))
         session = self.meeting.live_sessions.get()
@@ -7125,7 +7172,7 @@ class LiveSessionTests(TestCase):
         # 지운 것은 처리한 것이 아니다 — 결정 추출에 '처리한 애매한 점'으로 넘기지 않는다.
         LiveFlag.objects.filter(pk=flag.pk).update(resolved=True)
         self.assertEqual(live.resolved_flag_texts(self.meeting), [])
-        self.assertEqual(live.resolved_phrases(self.meeting), [])
+        self.assertEqual(live.resolved_warning_quotes(self.meeting), [])
 
     def test_ticking_a_flag_repaints_it_at_once(self):
         """누른 체크박스에 초점이 남아 목록을 다시 그리지 않아, 처리됨 표시가 다른 곳을 누를 때까지 안 보였다."""
@@ -7187,7 +7234,7 @@ class LiveSessionTests(TestCase):
         self.client.post(url, {"resolved": "1"})  # 진행자가 직접 체크하면 결정 추출에 '처리함'으로 넘긴다
         flag.refresh_from_db()
         self.assertEqual((flag.resolved, flag.resolved_auto, flag.resolved_by), (True, False, self.host))
-        self.assertEqual(live.resolved_flag_texts(self.meeting), ["이따 단톡에서 정해요 — 장소를 정해 주세요"])
+        self.assertEqual(live.resolved_flag_texts(self.meeting), ["[회의 장소] 이따 단톡에서 정해요 — 장소를 정해 주세요"])
 
     def test_settled_is_read_from_broken_json_too(self):
         flag = LiveFlag(id=7, phrase="p", reason="r")
@@ -7383,11 +7430,17 @@ class LiveSessionTests(TestCase):
         # 처리한 표현은 '회의정보' 출처로 인정하지 않는다.
         self.assertNotIn("다음 주쯤", decision_compiler._info_text(info))
 
-    def test_rule_warnings_about_a_resolved_phrase_are_dropped(self):
-        warnings = ["확정 문장에 모호한 표현이 있어요: '쯤'", "확정 문장에 다른 날짜가 섞여 있어요: 5일, 7일"]
-        self.assertEqual(decision_compiler._drop_resolved(warnings, ["다음 주쯤"]),
-                         ["확정 문장에 다른 날짜가 섞여 있어요: 5일, 7일"])
-        self.assertEqual(decision_compiler._drop_resolved(warnings, []), warnings)
+    def test_resolved_warning_only_applies_to_the_same_topic_and_evidence(self):
+        vague = "확정 문장에 모호한 표현이 있어요: '쯤'"
+        clash = "확정 문장에 다른 날짜가 섞여 있어요: 5일, 7일"
+        warnings = [vague, clash]
+        resolved = [("서버 배포", "다음 주쯤")]
+        item = {"topic": "서버 배포", "evidence": "서버 배포는 다음 주쯤 합니다."}
+        self.assertEqual(decision_compiler._drop_resolved(warnings, item, resolved), [clash])
+        self.assertEqual(decision_compiler._drop_resolved(
+            warnings, dict(item, topic="문서 검토"), resolved), warnings)
+        self.assertEqual(decision_compiler._drop_resolved(
+            warnings, dict(item, evidence="서버 배포는 오후쯤 합니다."), resolved), warnings)
 
     # ---- 종료 ----
 
@@ -7413,6 +7466,22 @@ class LiveSessionTests(TestCase):
         self.assertEqual(_transcript(self._state(session)), "앞 뒤")  # 회의 중 녹취 글은 남는다
         self.assertContains(self.client.get(self._url("live_session", session)), "실시간 녹음이 끝났습니다")
         self.assertContains(self.client.get(reverse("meeting_detail", args=[self.meeting.id])), "등록됨 · 제출하면 전사")
+
+    def test_host_can_retry_a_failed_live_recording_merge(self):
+        session = self._start()
+        self._chunk(session, 0, "첫 발언")
+        url = self._url("live_control", session)
+        with patch.object(services, "merge_audio_to_wav", side_effect=RuntimeError("합치기 실패")):
+            self.client.post(url, {"action": "end"})
+        self.assertTrue(self._state(session)["can_retry_merge"])
+
+        self.assertEqual(self.client.post(url, {"action": "retry_merge"}).status_code, 200)
+        state = self._state(session)
+        self.assertTrue(state["recording_ready"])
+        self.assertFalse(state["can_retry_merge"])
+        self.assertEqual(state["error"], "")
+        self.assertEqual(self.client.post(url, {"action": "retry_merge"}).status_code, 409)
+        self.assertEqual(self.meeting.recordings.count(), 1)
 
     def test_submitting_processes_the_registered_recording_with_new_uploads(self):
         session = self._start()
@@ -7558,8 +7627,9 @@ class LiveSessionTests(TestCase):
             handle.write(_wav_bytes(0.5))
         with open(broken, "wb") as handle:
             handle.write(b"not audio")
-        seconds = services.merge_audio_to_wav([good, broken, good], os.path.join(folder, "out.wav"))
+        seconds, skipped = services.merge_audio_to_wav([good, broken, good], os.path.join(folder, "out.wav"))
         self.assertAlmostEqual(seconds, 1.0, places=1)
+        self.assertEqual(skipped, 1)
         with self.assertRaises(RuntimeError):
             services.merge_audio_to_wav([broken], os.path.join(folder, "none.wav"))
 
