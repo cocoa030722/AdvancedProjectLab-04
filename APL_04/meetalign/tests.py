@@ -1743,6 +1743,22 @@ class StuckAndFileAccessTests(TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(b"".join(r.streaming_content), b"RIFFDATA")
 
+    def test_recording_file_answers_range_requests(self):
+        """아이폰 사파리는 소리를 재생하기 전에 파일의 일부만 달라고 물어본다 — 206으로 그 조각만 돌려줘야 재생한다.
+        전체를 한 번에 주면 플레이어에 '오류'가 뜬다."""
+        rec = self._make_recording("a.wav", b"RIFFDATA")
+        url = reverse("recording_file", args=[self.meeting.id, rec.id])
+        r = self.client.get(url, HTTP_RANGE="bytes=0-3")
+        self.assertEqual(r.status_code, 206)
+        self.assertEqual(b"".join(r.streaming_content), b"RIFF")
+        self.assertEqual(r["Content-Range"], "bytes 0-3/8")
+        self.assertEqual(r["Content-Length"], "4")
+        self.assertEqual(self.client.get(url, HTTP_RANGE="bytes=4-").status_code, 206)
+        self.assertEqual(b"".join(self.client.get(url, HTTP_RANGE="bytes=-4").streaming_content), b"DATA")
+        # 범위를 묻지 않는 브라우저에는 전체를 주되, 범위로 물어도 된다고 알린다.
+        self.assertEqual(self.client.get(url)["Accept-Ranges"], "bytes")
+        self.assertEqual(self.client.get(url, HTTP_RANGE="bytes=99-").status_code, 416)
+
     def test_outsider_cannot_download_recording(self):
         rec = self._make_recording("a.wav", b"RIFF")
         outsider = User.objects.create_user("c", password="pw12345!")
