@@ -87,11 +87,11 @@
               data-clear-text data-advance-on-enter data-original="{{ row.decision.final_text }}">
           </div>
           <label style="display:flex;gap:9px;align-items:flex-start;padding:7px 0;font-weight:500">
-            <input type="radio" name="choice_{{ row.decision.id }}" value="{{ choice_undecided }}" style="width:auto;margin-top:3px" data-auto-advance>
+            <input type="radio" name="choice_{{ row.decision.id }}" value="{{ choice_undecided }}" style="margin-top:2px" data-auto-advance>
             <span><b>다음 회의로 넘김</b> — 이 회의에서 결론이 나지 않았다</span>
           </label>
           <label class="meta" style="display:flex;gap:9px;align-items:flex-start;padding:7px 0">
-            <input type="radio" name="choice_{{ row.decision.id }}" value="{{ choice_drop }}" style="width:auto;margin-top:3px" data-drop-value="{{ choice_drop }}" data-auto-advance>
+            <input type="radio" name="choice_{{ row.decision.id }}" value="{{ choice_drop }}" style="margin-top:2px" data-drop-value="{{ choice_drop }}" data-auto-advance>
             <span>이 결정 빼기 — 회의에 없던 결정이에요</span>
           </label>
           <button type="button" class="btn sm ghost" data-clear-choice="choice_{{ row.decision.id }}">선택 취소 — 위 문장으로 공개</button>

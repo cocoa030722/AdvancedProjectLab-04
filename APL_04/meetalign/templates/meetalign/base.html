@@ -183,6 +183,9 @@
   input:focus, textarea:focus { outline:none; border-color:var(--brand); box-shadow:0 0 0 4px var(--brand-soft); }
   input::placeholder, textarea::placeholder { color:#b7ada0; }
   textarea { resize:vertical; }
+  /* 라디오·체크박스는 줄어들지 않게 — 옆 글이 긴 선택지(AI 추천 문장)를 좁은 화면(휴대전화)에서 보면
+     옆 글에 밀려 눌러야 할 동그라미가 점처럼 납작해졌다. 크기도 손가락으로 보기 좋게 고정한다. */
+  input[type=radio], input[type=checkbox] { flex:none; width:19px; height:19px; accent-color:var(--brand); }
 
   .pw-wrap { position:relative; }
   .pw-wrap input { padding-right:44px; }
