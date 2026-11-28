@@ -458,6 +458,43 @@
       var s = Math.floor(ms / 1000);
       timeEl.textContent = (s >= 3600 ? Math.floor(s / 3600) + ":" : "") + pad(Math.floor(s / 60) % 60) + ":" + pad(s % 60);
     }
+    // 화면이 꺼지거나 절전에 들어가면 브라우저가 이 화면을 통째로 멈춘다 — 녹음기도 함께 멈춰 소리가 더 쌓이지
+    // 않는데, 경과 시간은 시계로 재서 깨어난 뒤 훌쩍 뛰어 '녹음 중'으로 보였다. 1초 타이머가 그만큼 늦게 돌아온
+    // 것으로 멈춤을 알아채고, 멈추기 직전까지만 녹음 시간으로 세고 일시정지로 돌린다. 이어서 녹음을 누르면
+    // 지금까지의 조각에 이어 붙는다 — 끝낼 때 세션의 조각을 전부 합쳐 녹음 하나로 만든다(live._finish).
+    var STALL_MS = 5000, lastTickAt = 0;
+    function watchTick() {
+      var now = Date.now(), gap = now - lastTickAt;
+      lastTickAt = now;
+      if (mode === "recording" && gap > STALL_MS) {
+        segmentStart = Math.min(now, segmentStart + gap);  // 멈춰 있던 동안은 녹음 시간에 넣지 않는다
+        pauseRecording();
+        showInfo("화면이 꺼지거나 절전으로 들어가 녹음이 " + Math.round(gap / 1000) + "초 동안 멈췄어요. "
+          + "그 사이의 말은 녹음되지 않았습니다. '이어서 녹음'을 누르면 지금까지의 녹음에 이어서 담깁니다.");
+        return;
+      }
+      paintTimer();
+    }
+
+    // 녹음 중에는 화면이 꺼지지 않게 잡아 둔다 — 화면이 꺼지면 위처럼 녹음이 멈추기 때문이다. 다른 앱에 갔다 오면
+    // 브라우저가 스스로 풀어 두므로 돌아올 때 다시 잡는다. 지원하지 않는 브라우저는 그냥 넘어간다(멈춤 감지가 받는다).
+    var wakeLock = null;
+    function keepScreenOn() {
+      if (!navigator.wakeLock || wakeLock) return;
+      navigator.wakeLock.request("screen").then(function (lock) {
+        wakeLock = lock;
+        lock.addEventListener("release", function () { wakeLock = null; });
+      }).catch(function () {});
+    }
+    function releaseScreen() {
+      if (!wakeLock) return;
+      wakeLock.release().catch(function () {});
+      wakeLock = null;
+    }
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible" && mode === "recording") keepScreenOn();
+    });
+
     function paint() {
       var recording = mode === "recording";
       dot.classList.toggle("paused", !recording);
@@ -468,12 +505,18 @@
       paintTimer();
     }
 
-    var meterContext = null;
+    var meterContext = null, meterStream = null;
     // 소리 크기를 실제로 재고 있을 때만 조용한 조각을 건너뛴다. 화면을 열자마자 자동으로 이어서 녹음하면 브라우저가
     // 오디오 처리(AudioContext)를 멈춰 두는데, 그때 크기가 늘 0으로 읽혀 모든 조각이 '조용함'으로 빠질 수 있다.
     function meterWorking() { return !!(analyser && meterContext && meterContext.state === "running"); }
     function startMeter() {
       if (meterContext && meterContext.state === "suspended") meterContext.resume();
+      // 마이크를 새로 받았으면(절전에서 깨어난 뒤 등) 소리 크기도 새 마이크에서 잰다 — 끊긴 마이크를 그대로 보면
+      // 크기가 늘 0으로 읽혀 모든 조각이 '조용함'으로 빠지고 하나도 전사되지 않는다.
+      if (analyser && meterStream !== stream) {
+        meterContext.createMediaStreamSource(stream).connect(analyser);
+        meterStream = stream;
+      }
       if (analyser || !(window.AudioContext || window.webkitAudioContext)) return;
       var context = new (window.AudioContext || window.webkitAudioContext)();
       meterContext = context;
@@ -482,6 +525,7 @@
       analyser.fftSize = 1024;
       levelBuffer = new Float32Array(analyser.fftSize);
       context.createMediaStreamSource(stream).connect(analyser);
+      meterStream = stream;
       setInterval(function () {
         analyser.getFloatTimeDomainData(levelBuffer);
         var sum = 0;
@@ -551,7 +595,9 @@
       rec.addEventListener("dataavailable", function (e) { if (e.data && e.data.size) parts.push(e.data); });
       rec.addEventListener("stop", function () {
         var blob = new Blob(parts, { type: rec.mimeType || "audio/webm" });
-        if (blob.size > 0) upload(blob, nextSeq++, meterWorking() ? chunkPeak < SILENT_RMS : false, Date.now() - startedAt);
+        if (blob.size > 0) upload(blob, nextSeq++, meterWorking() ? chunkPeak < SILENT_RMS : false,
+          // 조각은 MAX_CHUNK_MS보다 길 수 없다 — 절전에서 깨어나면 시계가 뛰어 길이가 부풀므로 묶어 둔다.
+          Math.min(Date.now() - startedAt, MAX_CHUNK_MS + 2000));
         if (mode === "recording") startChunk();
         else if (mode === "ending") finishEnd();
       });
@@ -563,7 +609,10 @@
       showError("");
       showInfo("");
       var constraints = { audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
-      var getStream = stream ? Promise.resolve(stream) : navigator.mediaDevices.getUserMedia(constraints);
+      // 절전·화면 꺼짐에서 깨어나면 마이크가 끊겨 있을 수 있다. 그대로 쓰면 녹음기가 도는 척만 하고 소리가
+      // 하나도 담기지 않으므로, 쓸 수 있는 마이크가 아니면 새로 받는다.
+      var usable = stream && stream.getAudioTracks().some(function (t) { return t.readyState === "live"; });
+      var getStream = usable ? Promise.resolve(stream) : navigator.mediaDevices.getUserMedia(constraints);
       getStream.then(function (s) {
         stream = s;
         startMeter();
@@ -572,7 +621,9 @@
         mode = "recording";
         segmentStart = Date.now();
         startChunk();
-        if (!tick) tick = setInterval(paintTimer, 1000);
+        keepScreenOn();
+        lastTickAt = Date.now();
+        if (!tick) tick = setInterval(watchTick, 1000);
         paint();
       }).catch(function (error) {
         showError("마이크를 쓸 수 없습니다: " + (error && error.message ? error.message : error) + " — localhost 또는 https 주소에서 열어 주세요.");
@@ -585,6 +636,7 @@
       elapsedMs += Date.now() - segmentStart;
       mode = "paused";
       stopCurrentChunk();
+      releaseScreen();
       paint();
       showInfo("다른 화면(탭)에서 이 회의를 녹음하기 시작해서 여기서는 멈췄어요.");
     }
@@ -599,6 +651,7 @@
       elapsedMs += Date.now() - segmentStart;
       mode = "paused";
       stopCurrentChunk();
+      releaseScreen();
       post(root.dataset.controlUrl, { action: "pause", recorder: recorderId }, leaving);
       paint();
     }
@@ -619,6 +672,7 @@
         return post(root.dataset.controlUrl, { action: "end", speaker_count: document.getElementById("live-speakers").value });
       }).then(function (r) {
         if (!r.ok) return r.json().then(function (data) { throw new Error(data.error || ("HTTP " + r.status)); });
+        releaseScreen();
         if (stream) stream.getTracks().forEach(function (track) { track.stop(); });
         clearInterval(tick);
         window.location.reload();
@@ -655,6 +709,7 @@
       if (mode === "ended") return;
       if (mode === "recording") stopCurrentChunk();
       mode = "ended";
+      releaseScreen();
       if (stream) stream.getTracks().forEach(function (track) { track.stop(); });
       clearInterval(tick);
       dot.classList.add("paused");
