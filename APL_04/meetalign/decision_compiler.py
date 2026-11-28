@@ -168,6 +168,13 @@ def _text_warnings(text, where, phrases=AMBIGUOUS_PHRASES):
     return found
 
 
+# 원문이 미확정이라고 명시하면 그 말을 인용한 문장을 공개 전에 확인한다.
+_UNSETTLED_EVIDENCE = re.compile(
+    r"(?:정해지지|확정되지|정하지|확정하지|합의하지)\s*(?:않|못)"
+    r"|(?:담당자?|기한|일정|범위|기준)\s*(?:(?:은|는|이|가)\s*)?미정"
+)
+
+
 def safety_warnings(final_text, evidence):
     """AI가 '명확'이라고 한 항목을 되짚는 규칙 안전망. 사유 목록을 돌려준다.
 
@@ -188,6 +195,8 @@ def safety_warnings(final_text, evidence):
         _text_warnings(final_text, "확정 문장", AMBIGUOUS_PHRASES + REFERENT_PHRASES)
         + _text_warnings(evidence, "원문")
     )
+    if _UNSETTLED_EVIDENCE.search(evidence):
+        found.append("원문에서 아직 정해지지 않았다고 했어요. 확정 문장을 확인해 주세요.")
     seen = []
     phrases_taken = set()
     for warning in found:
@@ -332,8 +341,8 @@ def _meeting_info_block(meeting_info):
         lines.append("- 지난 회의 미결정 안건(이번에 다시 다뤄질 수 있다):")
         lines.extend("  · %s" % row for row in meeting_info["carryover"])
     if meeting_info.get("resolved"):
-        lines.append("- 회의 중 진행자가 이미 확인하고 처리한 애매한 점(이 애매함 때문에 다시 ambiguous로 판정하지 마라. "
-                     "같은 안건에 다른 애매함이 남아 있을 때만 판정한다):")
+        lines.append("- 회의 중 진행자가 이미 확인하고 처리한 애매한 점(안건과 원문 구절이 모두 일치할 때만 다시 묻지 마라. "
+                     "같은 안건의 다른 애매함이나 같은 표현을 쓴 다른 안건은 따로 판단하라):")
         lines.extend("  · %s" % row for row in meeting_info["resolved"])
     return "\n" + "\n".join(lines) + "\n"
 
@@ -412,7 +421,7 @@ def _compile_prompt(source, meeting_info=None):
 def _generate_parsed(prompt, parser, what_failed):
     """프롬프트를 보내고 파싱까지 성공할 때까지 최대 (1 + PARSE_RETRIES)번 시도한다.
 
-    - 연결 실패(OSError)와 응답 언어 오류는 None을 돌려준다 → 호출자가 가짜 응답으로 대체.
+    - 연결 실패(OSError)와 응답 언어 오류는 원인을 알리고 추출을 중단한다.
     - 연결은 됐는데 형식이 재시도 후에도 안 맞으면 DecisionCompileError를 올린다 — 읽을 수
       있는 결정이 하나도 없으면 화면에 보여줄 게 없으므로 회의 단위로 실패시키고 진행자에게
       사유를 띄운다. 항목 하나의 형식이 틀린 경우는 parse_items가 그 항목만 비워서 넘긴다.
@@ -420,10 +429,10 @@ def _generate_parsed(prompt, parser, what_failed):
     for _ in range(PARSE_RETRIES + 1):
         try:
             raw = services._generate_clean(prompt)
-        except OSError:
-            return None
+        except OSError as error:
+            raise DecisionCompileError("AI에 연결하지 못했습니다. 잠시 뒤 다시 시도해 주세요.") from error
         if raw is None:
-            return None
+            raise DecisionCompileError("AI 응답의 언어를 확인해 주세요. 잠시 뒤 다시 시도해 주세요.")
         parsed = parser(raw)
         if parsed:
             return parsed
@@ -433,20 +442,20 @@ def _generate_parsed(prompt, parser, what_failed):
 
 
 def compile_specs(source, meeting=None):
-    """녹취 원문 → [응답 항목, ...]. LLM이 없거나 연결이 안 되면 가짜 응답을 돌려준다.
+    """녹취 원문 → [응답 항목, ...]. LLM을 설정하지 않은 시연 환경에서는 가짜 응답을 돌려준다.
 
     meeting을 주면 회의 정보(날짜·참석자·마감일·이월 안건)를 프롬프트에 함께 보내고, AI가 채운
     값의 출처를 그 정보와 대조한다.
     """
     meeting_info = collect_meeting_info(meeting) if meeting is not None else None
-    if not (services._enabled() and source):
+    if not services._enabled():
         return parse_items(json.dumps(FAKE_DECISIONS))
+    if not source.strip():
+        raise DecisionCompileError("결정을 추출할 녹취 원문이 없습니다.")
     items = _generate_parsed(
         _compile_prompt(source, meeting_info),
         lambda raw: parse_items(raw, source_text=source, meeting_info=meeting_info), "결정",
     )
-    if items is None:
-        return parse_items(json.dumps(FAKE_DECISIONS))
     # 확인이 필요한 항목의 추천 문장은 별도 호출로 쓰고(decision_recommend), 진행자에게 내보내기 전에
     # 되짚는다(검증 → 1회 재생성 → 폐기). 가짜 응답 경로에는 붙이지 않는다 — LLM이 없어 쓸 수 없고,
     # 가짜 모드는 화면 시연용이라 FAKE_DECISIONS에 추천 문장이 이미 들어 있다.
@@ -677,7 +686,7 @@ def compile_meeting(meeting):
     few_candidates = 0
     try:
         from . import live
-        ambiguous_count, few_candidates = _save_items(meeting, items, live.resolved_phrases(meeting))
+        ambiguous_count, few_candidates = _save_items(meeting, items, live.resolved_warning_quotes(meeting))
     except IntegrityError:
         # 진행자가 추출 버튼을 두 번 눌렀을 때. 위의 exists() 검사는 LLM 호출(수 초) 앞에
         # 있으므로 두 요청이 모두 빈 상태를 보고 통과해 같은 order를 쓰려 한다. 먼저 저장한
@@ -713,16 +722,16 @@ def _looks_deferred(item):
     return any(phrase in item["evidence"] for phrase in DEFERRAL_PHRASES)
 
 
-def _save_items(meeting, items, resolved_phrases=()):
+def _save_items(meeting, items, resolved_quotes=()):
     """응답 항목들을 Decision/Interpretation으로 저장하고 (확인 필요 수, 후보 없는 수)를 돌려준다.
 
-    resolved_phrases는 실시간 세션에서 진행자가 '처리됨'으로 체크한 애매한 표현이다(_resolve_item 참고).
+    resolved_quotes는 진행자가 '처리됨'을 누른 안건과 그 인용 구절이다.
     """
     ambiguous_count = 0
     few_candidates = 0
     with transaction.atomic():
         for order, item in enumerate(items):
-            warnings, divergence_reason, final_text, candidates, draft_hint = _resolve_item(item, resolved_phrases)
+            warnings, divergence_reason, final_text, candidates, draft_hint = _resolve_item(item, resolved_quotes)
             decision = Decision.objects.create(
                 meeting=meeting, order=order, what=item["topic"],
                 warnings=warnings, divergence_reason=divergence_reason, impact=item["impact"],
@@ -746,15 +755,18 @@ def _save_items(meeting, items, resolved_phrases=()):
     return ambiguous_count, few_candidates
 
 
-def _drop_resolved(warnings, resolved_phrases):
-    """규칙 경고 중 회의 중에 이미 처리한 표현을 짚는 것은 뺀다.
-
-    경고 끝의 인용 표현(예: "…모호한 표현이 있어요: '다음 주쯤'")이 처리한 애매한 표현 안에 들어 있으면, 진행자가
-    회의 중에 그 자리에서 확인하고 넘어간 것이다. 날짜·숫자 충돌처럼 인용이 없는 경고는 그대로 둔다.
-    """
-    if not resolved_phrases:
+def _drop_resolved(warnings, item, resolved_quotes):
+    """같은 안건의 같은 원문에서 진행자가 처리한 문구만 경고에서 뺀다."""
+    if not warnings or not resolved_quotes:
         return warnings
-    squashed = [decision_checks.squash(phrase) for phrase in resolved_phrases]
+    topic = decision_checks.squash(item["topic"])
+    evidence = decision_checks.squash_transcript(item["evidence"])
+    squashed = [
+        decision_checks.squash_transcript(quote)
+        for resolved_topic, quote in resolved_quotes
+        if decision_checks.squash(resolved_topic) == topic
+        and decision_checks.quote_in_source(quote, evidence)
+    ]
     kept = []
     for warning in warnings:
         match = _QUOTED_PHRASE.search(warning)
@@ -765,7 +777,7 @@ def _drop_resolved(warnings, resolved_phrases):
     return kept
 
 
-def _resolve_item(item, resolved_phrases=()):
+def _resolve_item(item, resolved_quotes=()):
     """응답 항목 하나 → (warnings, divergence_reason, final_text, candidates, draft_hint).
 
     네 갈래다.
@@ -795,7 +807,7 @@ def _resolve_item(item, resolved_phrases=()):
             return [], "근거를 원문에서 확인하지 못했어요", "", [], _draft_hint_text(unverified)
         candidates = [{"text": unverified, "evidence": "", "recommended": False}] if unverified else []
         return [], "근거를 원문에서 확인하지 못했어요", "", candidates, ""
-    warnings = _drop_resolved(safety_warnings(item["final"], item["evidence"]), resolved_phrases)
+    warnings = _drop_resolved(safety_warnings(item["final"], item["evidence"]), item, resolved_quotes)
     if not warnings:
         return [], "", item["final"], [], ""
     draft_hint = (
